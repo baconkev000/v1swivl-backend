@@ -339,3 +339,6 @@ FRONTEND_BASE_URL = os.environ.get(
 ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
 # settings.py
 LOGIN_REDIRECT_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000") + "/app"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "123")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/accounts/google/login/callback/")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "123")

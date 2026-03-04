@@ -34,6 +34,16 @@ urlpatterns = [
         accounts_views.gsc_connect_callback,
         name="gsc-connect-callback",
     ),
+    path(
+        "integrations/google-ads/start/",
+        accounts_views.ads_connect_start,
+        name="gads-connect-start",
+    ),
+    path(
+        "integrations/google-ads/callback/",
+        accounts_views.ads_connect_callback,
+        name="gads-connect-callback",
+    ),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
     # ...
@@ -51,6 +61,14 @@ urlpatterns += [
     path("api/business-profile/", accounts_views.business_profile, name="business-profile"),
     # Google Search Console integration status
     path("api/integrations/google-search-console/status/", accounts_views.gsc_status, name="gsc-status"),
+    # Google Ads integration status
+    path("api/integrations/google-ads/status/", accounts_views.ads_status, name="gads-status"),
+    # SEO overview metrics for dashboard (Google Search Console powered)
+    path("api/seo/overview/", accounts_views.seo_overview, name="seo-overview"),
+    # High-Intent Keywords dataset for SEO agent
+    path("api/seo/keywords/", accounts_views.seo_keywords, name="seo-keywords"),
+    # SEO agent chat
+    path("api/seo/chat/", accounts_views.seo_chat, name="seo-chat"),
     # API logout to clear Django/Google SSO session
     path("api/logout/", accounts_views.api_logout, name="api-logout"),
     path("api/schema/", SpectacularAPIView.as_view(), name="api-schema"),

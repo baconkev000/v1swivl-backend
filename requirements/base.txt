@@ -25,3 +25,4 @@ python-slugify==8.0.4
 redis==7.2.1
 
 PyJWT
+openai
