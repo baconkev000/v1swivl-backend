@@ -276,4 +276,4 @@ swivl/media/
 .envs/*
 !.envs/.local/
 .venv
-.envs/
+.envs
