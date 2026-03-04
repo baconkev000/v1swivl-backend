@@ -1,0 +1,5 @@
+# Backend dependencies. Prefer: uv sync (from repo root: backend/)
+# For pip: pip install -r requirements.txt
+# See requirements/base.txt, requirements/local.txt, requirements/production.txt
+
+-r requirements/base.txt

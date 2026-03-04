@@ -1,0 +1,4 @@
+# Production: same as base (use in Docker/production).
+# Install with: pip install -r requirements/production.txt
+
+-r base.txt
