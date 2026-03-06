@@ -16,8 +16,7 @@ services:
       - postgres
       - redis
     env_file:
-      - ./.envs/.production/.django
-      - ./.envs/.production/.postgres
+      - /home/deploy/app/swivl-backend/.env
     command: /start
 
   postgres:
@@ -29,7 +28,7 @@ services:
       - production_postgres_data:/var/lib/postgresql/18/docker
       - production_postgres_data_backups:/backups
     env_file:
-      - ./.envs/.production/.postgres
+      - /home/deploy/app/swivl-backend/.env
 
   traefik:
     build:
@@ -53,6 +52,6 @@ services:
       context: .
       dockerfile: ./compose/production/aws/Dockerfile
     env_file:
-      - ./.envs/.production/.django
+      - /home/deploy/app/swivl-backend/.env
     volumes:
       - production_postgres_data_backups:/backups:z
