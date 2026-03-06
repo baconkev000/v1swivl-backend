@@ -18,7 +18,7 @@ google-ads>=24.0.0
 gunicorn==25.1.0
 hiredis==3.3.0
 pillow==12.1.1
-psycopg[c]==3.3.3
+psycopg[binary]==3.3.3
 pyjwt[crypto]==2.11.0
 python-slugify==8.0.4
 redis==7.2.1
