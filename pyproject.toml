@@ -28,6 +28,7 @@ dependencies = [
   "google-ads>=24.0.0",
   "gunicorn==25.1.0",
   "hiredis==3.3.0",
+  "whitenoise==6.8.2",
   "pillow==12.1.1",
   "psycopg[c]==3.3.3",
   "pyjwt[crypto]==2.11.0",

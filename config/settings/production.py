@@ -68,8 +68,31 @@ SECURE_CONTENT_TYPE_NOSNIFF = env.bool(
 
 # STATIC & MEDIA
 # ------------------------
-# Using local filesystem storage (no S3). Static and media files are served from
-# STATIC_ROOT and MEDIA_ROOT as defined in base.py.
+# WhiteNoise (in base) serves static from STATIC_ROOT when DEBUG=False.
+# Using local filesystem storage (no S3). Media files from MEDIA_ROOT.
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
+
+# CORS & CSRF for production frontend and API
+# ------------------------------------------------------------------------------
+CORS_ALLOWED_ORIGINS = [
+    "https://getswivl.ai",
+    "https://www.getswivl.ai",
+    "http://localhost:3000",
+]
+CSRF_TRUSTED_ORIGINS = [
+    "https://api.getswivl.ai",
+    "https://getswivl.ai",
+    "https://www.getswivl.ai",
+    "http://localhost:3000",
+]
+
 # EMAIL
 # ------------------------------------------------------------------------------
 # https://docs.djangoproject.com/en/dev/ref/settings/#default-from-email
