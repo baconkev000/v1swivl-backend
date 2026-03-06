@@ -28,7 +28,7 @@ certificatesResolvers:
 http:
   routers:
     web-secure-router:
-      rule: 'Host(`getswivl.ai`) || Host(`www.getswivl.ai`)'
+      rule: 'Host(`getswivl.ai`) || Host(`www.getswivl.ai`) || Host(`api.getswivl.ai`)'
       entryPoints:
         - web-secure
       middlewares:
