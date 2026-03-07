@@ -1,4 +1,4 @@
-# Debug middleware: logs 500s to stderr (docker logs) and optionally to file
+# Request/response logging: every request and 4xx/5xx to stderr (docker logs)
 import json
 import sys
 import traceback
@@ -16,8 +16,13 @@ def _log(payload):
         pass
 
 
+def _stderr(line):
+    """Print to stderr so it shows in docker compose logs."""
+    print(line, file=sys.stderr, flush=True)
+
+
 class DebugLogMiddleware:
-    """Log request start and any uncaught exception; print traceback to stderr for docker logs."""
+    """Log every request+response status; on 500 print full traceback to stderr."""
 
     def __init__(self, get_response):
         self.get_response = get_response
@@ -41,7 +46,13 @@ class DebugLogMiddleware:
             pass
 
         try:
-            return self.get_response(request)
+            response = self.get_response(request)
+            status = response.status_code
+            # Log every request so 404/500 show up in docker logs
+            _stderr(f"[SWIVL] {request.method} {request.path} -> {status}")
+            if status >= 400:
+                _stderr(f"[SWIVL] {status} {request.method} {request.path}")
+            return response
         except Exception as exc:
             tb = traceback.format_exc()
             msg = f"{type(exc).__name__}: {exc}"
@@ -63,5 +74,7 @@ class DebugLogMiddleware:
                 })
             except Exception:
                 pass
-            print(f"\n[SWIVL 500] {msg}\n{tb}", file=sys.stderr, flush=True)
+            _stderr(f"\n[SWIVL 500] {request.method} {request.path}")
+            _stderr(f"[SWIVL 500] {msg}")
+            _stderr(tb)
             raise

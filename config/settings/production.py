@@ -147,6 +147,9 @@ LOGGING = {
         "verbose": {
             "format": "%(levelname)s %(asctime)s %(module)s %(process)d %(thread)d %(message)s",
         },
+        "request_error": {
+            "format": "%(levelname)s %(asctime)s %(message)s",
+        },
     },
     "handlers": {
         "mail_admins": {
@@ -159,13 +162,18 @@ LOGGING = {
             "class": "logging.StreamHandler",
             "formatter": "verbose",
         },
+        "console_request": {
+            "level": "ERROR",
+            "class": "logging.StreamHandler",
+            "formatter": "request_error",
+        },
     },
     "root": {"level": "INFO", "handlers": ["console"]},
     "loggers": {
         "django.request": {
-            "handlers": ["console", "mail_admins"],
+            "handlers": ["console_request", "mail_admins"],
             "level": "ERROR",
-            "propagate": True,
+            "propagate": False,
         },
         "django.security.DisallowedHost": {
             "level": "ERROR",
