@@ -3,13 +3,14 @@ from __future__ import annotations
 """
 Utility functions for Meta Ads integrations.
 
-These are intentionally lightweight scaffolds so that Meta Ads can be wired
-into the same integration/status surface area as Google Ads. The actual
-OAuth flow, token storage, and reporting logic can be implemented here
-later without changing the public API exposed from views.py.
+OAuth and token storage are handled in views.py; this module exposes
+connection status and will host Marketing API helpers for campaigns,
+ad sets, ads, creatives, audiences, insights, and (optionally) page posts.
 """
 
 from dataclasses import dataclass
+
+from django.utils import timezone
 
 
 @dataclass
@@ -24,14 +25,24 @@ class MetaAdsStatus:
 
 def get_meta_ads_status_for_user(user_id: int) -> MetaAdsStatus:
     """
-    Return whether the given user has an active Meta Ads connection.
-
-    For now this is a stub that always returns ``connected=False`` so that
-    the rest of the application can depend on a stable API surface. When
-    Meta Ads is fully implemented, this function should be updated to read
-    from the appropriate connection model and/or external API.
+    Return whether the given user has an active Meta Ads connection
+    (non-empty access token, optionally still valid if expires_at is set).
     """
+    from .models import MetaAdsConnection
 
-    # TODO: implement real Meta Ads connection lookup.
-    return MetaAdsStatus(connected=False)
+    try:
+        conn = MetaAdsConnection.objects.get(user_id=user_id)
+    except MetaAdsConnection.DoesNotExist:
+        return MetaAdsStatus(connected=False)
+
+    if not (conn.access_token and conn.access_token.strip()):
+        return MetaAdsStatus(connected=False)
+
+    # Optional: treat as disconnected if token is long expired (e.g. 7 days past)
+    if conn.expires_at:
+        from datetime import timedelta
+        if conn.expires_at < timezone.now() - timedelta(days=7):
+            return MetaAdsStatus(connected=False)
+
+    return MetaAdsStatus(connected=True)
 

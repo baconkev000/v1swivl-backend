@@ -130,6 +130,36 @@ class GoogleAdsConnection(models.Model):
         return f"GoogleAdsConnection(user={self.user!s})"
 
 
+class MetaAdsConnection(models.Model):
+    """
+    Tracks whether a user has granted this app access to Meta (Facebook) Marketing API.
+
+    Stores OAuth access token needed to manage ad campaigns, ad sets, ads, creatives,
+    audiences, and (optionally) page posts and insights. Token is long-lived (60 days);
+    refresh before expiry to keep the connection active.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="meta_ads_connection",
+    )
+
+    access_token = models.TextField(blank=True)
+    token_type = models.CharField(max_length=32, blank=True, default="Bearer")
+    expires_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Meta Ads connection"
+        verbose_name_plural = "Meta Ads connections"
+
+    def __str__(self) -> str:
+        return f"MetaAdsConnection(user={self.user!s})"
+
+
 class GoogleAdsMetricsCache(models.Model):
     """
     Cached Google Ads metrics per user. Used to avoid calling the Google Ads API

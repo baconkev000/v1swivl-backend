@@ -25,13 +25,19 @@ def _get_gbp_access_token(user) -> str | None:
     try:
         conn = GoogleBusinessProfileConnection.objects.get(user=user)
     except GoogleBusinessProfileConnection.DoesNotExist:
+        logger.info("[GBP] _get_gbp_access_token user_id=%s: no GoogleBusinessProfileConnection", user.id)
         return None
 
     now = datetime.now(timezone.utc)
     if conn.expires_at and conn.expires_at > now + timedelta(seconds=60) and conn.access_token:
+        logger.info("[GBP] _get_gbp_access_token user_id=%s: using existing access token", user.id)
         return conn.access_token
 
     if not (conn.refresh_token or "").strip():
+        logger.warning(
+            "[GBP] _get_gbp_access_token user_id=%s: connection exists but refresh_token is empty",
+            user.id,
+        )
         return conn.access_token or None
 
     import requests
@@ -48,14 +54,17 @@ def _get_gbp_access_token(user) -> str | None:
         timeout=10,
     )
     if resp.status_code != 200:
+        logger.warning("[GBP] _get_gbp_access_token user_id=%s token refresh failed status=%s", user.id, resp.status_code)
         return conn.access_token or None
 
     data = resp.json()
     access_token = data.get("access_token")
     expires_in = data.get("expires_in")
     if not access_token:
+        logger.warning("[GBP] _get_gbp_access_token user_id=%s refresh response had no access_token", user.id)
         return conn.access_token or None
 
+    logger.info("[GBP] _get_gbp_access_token user_id=%s refreshed access token", user.id)
     conn.access_token = access_token
     if isinstance(expires_in, int):
         conn.expires_at = now + timedelta(seconds=expires_in)
@@ -75,9 +84,10 @@ def fetch_gbp_overview(user) -> dict | None:
 
     access_token = _get_gbp_access_token(user)
     if not access_token:
-        logger.info("[GBP] No access token for user %s", user.id)
+        logger.warning("[GBP] No access token for user_id=%s (missing connection or refresh failed)", user.id)
         return None
 
+    logger.info("[GBP] user_id=%s has access token, calling Account Management API", user.id)
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
     # 1) List accounts (Account Management API)
@@ -88,53 +98,67 @@ def fetch_gbp_overview(user) -> dict | None:
             timeout=10,
         )
         if r.status_code != 200:
-            logger.warning("[GBP] Accounts list failed: %s %s", r.status_code, r.text[:200])
+            logger.warning(
+                "[GBP] Accounts list failed user_id=%s status=%s body=%s",
+                user.id,
+                r.status_code,
+                r.text[:500],
+            )
             return None
         data = r.json()
         accounts = data.get("accounts") or []
+        logger.info("[GBP] user_id=%s accounts response: count=%s", user.id, len(accounts))
         if not accounts:
-            logger.info("[GBP] No accounts found for user %s", user.id)
+            logger.warning("[GBP] No accounts found for user_id=%s raw_keys=%s", user.id, list(data.keys()))
             return None
         account_name = accounts[0].get("name")  # e.g. "accounts/123456789"
         if not account_name or not account_name.startswith("accounts/"):
+            logger.warning("[GBP] Invalid first account name for user_id=%s: %s", user.id, account_name)
             return None
         account_id = account_name.split("/")[-1]
+        logger.info("[GBP] user_id=%s using account_name=%s account_id=%s", user.id, account_name, account_id)
     except Exception as e:
-        logger.exception("[GBP] Error listing accounts: %s", e)
+        logger.exception("[GBP] Error listing accounts user_id=%s: %s", user.id, e)
         return None
 
     # 2) List locations (Business Information API)
     try:
-        r = requests.get(
-            f"https://mybusinessbusinessinformation.googleapis.com/v1/{account_name}/locations",
-            headers=headers,
-            timeout=10,
-        )
+        locations_url = f"https://mybusinessbusinessinformation.googleapis.com/v1/{account_name}/locations"
+        r = requests.get(locations_url, headers=headers, timeout=10)
         if r.status_code != 200:
-            logger.warning("[GBP] Locations list failed: %s %s", r.status_code, r.text[:200])
+            logger.warning(
+                "[GBP] Locations list failed user_id=%s status=%s body=%s",
+                user.id,
+                r.status_code,
+                r.text[:500],
+            )
             return None
         data = r.json()
         locations = data.get("locations") or []
+        logger.info("[GBP] user_id=%s locations response: count=%s", user.id, len(locations))
         if not locations:
-            logger.info("[GBP] No locations for account %s", account_id)
+            logger.warning("[GBP] No locations for user_id=%s account_id=%s raw_keys=%s", user.id, account_id, list(data.keys()))
             return None
         location = locations[0]
         location_name = location.get("name")  # e.g. "accounts/123/locations/456"
         if not location_name:
+            logger.warning("[GBP] First location has no name user_id=%s", user.id)
             return None
         parts = location_name.split("/")
         location_id = parts[-1] if len(parts) >= 4 else None
         if not location_id:
+            logger.warning("[GBP] Could not parse location_id from %s user_id=%s", location_name, user.id)
             return None
+        logger.info("[GBP] user_id=%s using location_name=%s location_id=%s", user.id, location_name, location_id)
     except Exception as e:
-        logger.exception("[GBP] Error listing locations: %s", e)
+        logger.exception("[GBP] Error listing locations user_id=%s: %s", user.id, e)
         return None
 
     # 3) List reviews (My Business API v4)
     try:
         all_reviews = []
         page_token = None
-        for _ in range(20):  # cap pages
+        for page_num in range(20):  # cap pages
             url = (
                 f"https://mybusiness.googleapis.com/v4/accounts/{account_id}/locations/{location_id}/reviews"
                 f"?pageSize=50"
@@ -143,24 +167,46 @@ def fetch_gbp_overview(user) -> dict | None:
                 url += f"&pageToken={page_token}"
             r = requests.get(url, headers=headers, timeout=10)
             if r.status_code != 200:
-                logger.warning("[GBP] Reviews list failed: %s %s", r.status_code, r.text[:200])
+                logger.warning(
+                    "[GBP] Reviews list failed user_id=%s status=%s body=%s",
+                    user.id,
+                    r.status_code,
+                    r.text[:500],
+                )
                 break
             data = r.json()
             reviews = data.get("reviews") or []
             all_reviews.extend(reviews)
+            logger.info(
+                "[GBP] user_id=%s reviews page=%s page_size=%s total_so_far=%s",
+                user.id,
+                page_num + 1,
+                len(reviews),
+                len(all_reviews),
+            )
             page_token = data.get("nextPageToken")
             if not page_token:
                 break
     except Exception as e:
-        logger.exception("[GBP] Error listing reviews: %s", e)
+        logger.exception("[GBP] Error listing reviews user_id=%s: %s", user.id, e)
         return None
 
+    logger.info("[GBP] user_id=%s location_id=%s total_reviews=%s", user.id, location_id, len(all_reviews))
+
     if not all_reviews:
-        logger.info("[GBP] No reviews for location %s", location_id)
+        logger.info("[GBP] No reviews for user_id=%s location_id=%s; returning zeros", user.id, location_id)
         # Still return a valid overview with zeros
         return _build_overview_from_reviews([], user)
 
-    return _build_overview_from_reviews(all_reviews, user)
+    result = _build_overview_from_reviews(all_reviews, user)
+    logger.info(
+        "[GBP] user_id=%s overview result: total_reviews=%s star_rating=%s response_rate_pct=%s",
+        user.id,
+        result.get("total_reviews"),
+        result.get("star_rating"),
+        result.get("response_rate_pct"),
+    )
+    return result
 
 
 def _build_overview_from_reviews(reviews: list, user) -> dict:

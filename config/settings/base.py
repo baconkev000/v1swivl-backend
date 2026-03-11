@@ -345,3 +345,9 @@ GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:80
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "123")
 GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "123")
 GOOGLE_ADS_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "123")
+DATAFORSEO_LOGIN = os.environ.get("DATAFORSEO_LOGIN", "123")
+DATAFORSEO_PASSWORD = os.environ.get("DATAFORSEO_PASSWORD", "123")
+
+# Meta (Facebook) – Ads app: OAuth login + Marketing API (connect button and ad campaigns)
+META_ADS_APP_ID = os.environ.get("META_ADS_APP_ID", "")
+META_ADS_APP_SECRET = os.environ.get("META_ADS_APP_SECRET", "")

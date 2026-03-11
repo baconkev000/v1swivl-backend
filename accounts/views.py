@@ -1,10 +1,11 @@
 import logging
 import secrets
-from urllib.parse import urlencode, unquote, quote
+from urllib.parse import urlencode, unquote, quote, urlparse
 from datetime import datetime, date, timedelta, timezone
 
 import requests
 from django.conf import settings
+from django.core.cache import cache
 from django.contrib.auth import get_user_model, login, logout as django_logout
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import redirect
@@ -20,6 +21,7 @@ from .models import (
     GoogleAdsMetricsCache,
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
+    MetaAdsConnection,
     SEOOverviewSnapshot,
     ReviewsOverviewSnapshot,
     AgentConversation,
@@ -28,16 +30,22 @@ from .models import (
 
 # Third-party API cache: only refetch from GSC, Google Ads, GBP if last fetch was >= this long ago.
 THIRD_PARTY_CACHE_TTL = timedelta(hours=1)
+# Google My Business Account Management API: 1 request per minute per project. Enforce per-user to avoid 429.
+GBP_API_MIN_INTERVAL_SECONDS = 60
 from .serializers import BusinessProfileSerializer
 from .google_ads_client import (
     classify_intent,
     fetch_ads_metrics_for_user,
     fetch_ads_metrics_for_user_result,
-    fetch_keyword_ideas_for_user,
 )
 from .meta_ads_utils import get_meta_ads_status_for_user
 from .tiktok_ads_utils import get_tiktok_ads_status_for_user
+from .dataforseo_utils import (
+    get_keyword_gap_keywords,
+    get_ranked_keywords_visibility,
+)
 from . import openai_utils
+from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -470,25 +478,143 @@ def agent_activity_feed(request: HttpRequest) -> Response:
     })
 
 
+# Meta (Facebook) Marketing API OAuth: scopes for campaigns, ad sets, ads, creatives, audiences, insights, pages.
+META_ADS_OAUTH_SCOPES = [
+    "ads_management",       # create and manage campaigns, ad sets, ads
+    "ads_read",             # read ad accounts and reports
+    "business_management",  # manage business assets and ad accounts
+    "pages_show_list",      # list pages (for Page Posts / Page Insights)
+    "pages_read_engagement",  # read page insights
+    "pages_manage_posts",   # optionally post content to pages
+]
+
+
 def meta_ads_connect_start(request: HttpRequest) -> HttpResponse:
     """
-    Start Meta Ads OAuth flow. Redirects to next URL until Meta OAuth is configured.
-    When META_APP_ID etc. are set, redirect to Meta login and use meta_ads_connect_callback.
+    Start Meta (Facebook) OAuth flow for Marketing API access.
+
+    Requires META_ADS_APP_ID and META_ADS_APP_SECRET. Redirect URI must be whitelisted in the Meta app
+    (e.g. https://yourdomain.com/integrations/meta-ads/callback/).
     """
-    if not request.user.is_authenticated:
-        return redirect(settings.FRONTEND_BASE_URL + "/login")
     next_url = request.GET.get("next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
-    # TODO: when Meta OAuth is configured, redirect to Meta and set session state/callback
-    return redirect(next_url)
+    frontend_base = (settings.FRONTEND_BASE_URL or "http://localhost:3000").rstrip("/")
+
+    if not request.user.is_authenticated:
+        # Send user to frontend login; after login they can hit Connect again with a session.
+        login_url = f"{frontend_base}/login?next={quote(next_url, safe='')}"
+        return redirect(login_url)
+
+    app_id = getattr(settings, "META_ADS_APP_ID", None)
+    app_secret = getattr(settings, "META_ADS_APP_SECRET", None)
+    if not app_id or not (app_secret and str(app_secret).strip()):
+        logger.warning("[Meta Ads] META_ADS_APP_ID or META_ADS_APP_SECRET not set; skipping OAuth redirect.")
+        sep = "&" if "?" in next_url else "?"
+        return redirect(f"{next_url}{sep}meta_ads_error=not_configured")
+
+    state = secrets.token_urlsafe(32)
+    request.session["meta_ads_state"] = state
+    request.session["meta_ads_next"] = next_url
+
+    redirect_uri = request.build_absolute_uri("/integrations/meta-ads/callback/")
+    params = {
+        "client_id": app_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "scope": ",".join(META_ADS_OAUTH_SCOPES),
+        "response_type": "code",
+    }
+
+    auth_url = "https://www.facebook.com/v18.0/dialog/oauth?" + urlencode(params)
+    return redirect(auth_url)
 
 
 def meta_ads_connect_callback(request: HttpRequest) -> HttpResponse:
     """
-    Handle Meta OAuth callback. Redirects to next URL until Meta OAuth is implemented.
+    Handle Meta OAuth callback: exchange code for short-lived token, then for
+    long-lived token (60 days), and store in MetaAdsConnection.
     """
+    stored_state = request.session.get("meta_ads_state")
     next_url = request.session.get("meta_ads_next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
     request.session.pop("meta_ads_state", None)
     request.session.pop("meta_ads_next", None)
+
+    state = request.GET.get("state")
+    if stored_state and state != stored_state:
+        return HttpResponseBadRequest("Invalid OAuth state")
+
+    code = request.GET.get("code")
+    if not code:
+        error = request.GET.get("error_description") or request.GET.get("error", "Missing authorization code")
+        logger.warning("[Meta Ads] OAuth callback error: %s", error)
+        return redirect(next_url)
+
+    app_id = getattr(settings, "META_ADS_APP_ID", None)
+    app_secret = getattr(settings, "META_ADS_APP_SECRET", None)
+    if not app_id or not app_secret:
+        return redirect(next_url)
+
+    redirect_uri = request.build_absolute_uri("/integrations/meta-ads/callback/")
+
+    # Exchange code for short-lived access token
+    token_url = "https://graph.facebook.com/v18.0/oauth/access_token"
+    token_params = {
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "redirect_uri": redirect_uri,
+        "code": code,
+    }
+    token_resp = requests.get(token_url, params=token_params, timeout=15)
+    if token_resp.status_code != 200:
+        logger.warning("[Meta Ads] Token exchange failed: %s %s", token_resp.status_code, token_resp.text[:300])
+        return redirect(next_url)
+
+    try:
+        short_data = token_resp.json()
+    except ValueError:
+        logger.warning("[Meta Ads] Token response not JSON: %s", token_resp.text[:200])
+        return redirect(next_url)
+
+    short_token = short_data.get("access_token")
+    if not short_token:
+        logger.warning("[Meta Ads] No access_token in response: %s", short_data)
+        return redirect(next_url)
+
+    # Exchange short-lived for long-lived token (60 days)
+    long_params = {
+        "grant_type": "fb_exchange_token",
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "fb_exchange_token": short_token,
+    }
+    long_resp = requests.get(token_url, params=long_params, timeout=15)
+    if long_resp.status_code != 200:
+        logger.warning("[Meta Ads] Long-lived token exchange failed: %s", long_resp.status_code)
+        # Still save short-lived token so connection works until it expires
+        access_token = short_token
+        expires_in = short_data.get("expires_in", 3600)
+    else:
+        try:
+            long_data = long_resp.json()
+            access_token = long_data.get("access_token") or short_token
+            expires_in = long_data.get("expires_in", 5184000)  # 60 days in seconds
+        except ValueError:
+            access_token = short_token
+            expires_in = short_data.get("expires_in", 3600)
+
+    expires_at = None
+    if isinstance(expires_in, int) and expires_in > 0:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+    if not request.user.is_authenticated:
+        return redirect(settings.FRONTEND_BASE_URL + "/login")
+
+    conn, _ = MetaAdsConnection.objects.get_or_create(user=request.user)
+    conn.access_token = access_token
+    conn.token_type = "Bearer"
+    conn.expires_at = expires_at
+    conn.save(update_fields=["access_token", "token_type", "expires_at", "updated_at"])
+
+    logger.info("[Meta Ads] Connection saved for user_id=%s, expires_at=%s", request.user.id, expires_at)
     return redirect(next_url)
 
 
@@ -810,13 +936,22 @@ def _gsc_query(
 @permission_classes([IsAuthenticated])
 def seo_overview(request: HttpRequest) -> Response:
     """
-    Return SEO overview metrics for the dashboard, powered by Google Search Console.
-    Uses a 1-hour cache: if we have fresh snapshot data, return it without calling GSC API.
+    Return SEO overview metrics for the dashboard, powered by DataForSEO Labs.
+
+    We treat DataForSEO's \"visibility\" metric as our primary signal (mapped to
+    organic_visitors for backwards compatibility with the frontend), and
+    keywords_count / top3_positions as supporting metrics.
+
+    Uses a 1-hour cache: if we have fresh snapshot data, return it without calling the API.
     """
+    # #region agent log
+    _debug.log("views.py:seo_overview:entry", "seo_overview called", {"user_id": getattr(request.user, "id", None), "query_refresh": request.GET.get("refresh")}, "H1")
+    # #endregion
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
     now = datetime.now(timezone.utc)
     cutoff = now - THIRD_PARTY_CACHE_TTL
+    cache_ttl = int(THIRD_PARTY_CACHE_TTL.total_seconds())
     force_refresh = request.GET.get("refresh") == "1"
 
     # Serve from cache if we have a snapshot for this period fetched within the last hour (unless refresh=1).
@@ -833,6 +968,9 @@ def seo_overview(request: HttpRequest) -> Response:
                     organic_growth_pct = 100.0 if organic_visitors > 0 else 0.0
                 else:
                     organic_growth_pct = ((organic_visitors - prev_clicks) / prev_clicks) * 100.0
+                # #region agent log
+                _debug.log("views.py:seo_overview:cache_hit", "returning from snapshot cache", {"organic_visitors": organic_visitors, "last_fetched_at": str(snapshot.last_fetched_at), "cutoff": str(cutoff)}, "H2")
+                # #endregion
                 return Response(
                     {
                         "organic_visitors": organic_visitors,
@@ -844,66 +982,131 @@ def seo_overview(request: HttpRequest) -> Response:
         except SEOOverviewSnapshot.DoesNotExist:
             pass
 
-    # Cache miss, stale, or refresh=1: call Google Search Console API.
-    profile = BusinessProfile.objects.filter(user=request.user).first()
-    site_url = (profile.website_url if profile else None) or getattr(
-        settings,
-        "GOOGLE_SITE_URL",
-        "",
-    )
-    if not site_url:
-        return Response(
-            {"detail": "No site URL configured for Search Console."},
-            status=400,
+    # #region agent log
+    _debug.log("views.py:seo_overview:cache_miss", "cache miss or force_refresh; calling DataForSEO", {}, "H2")
+    # #endregion
+    try:
+        # Cache miss, stale, or refresh=1: call DataForSEO Labs ranked_keywords API.
+        profile = BusinessProfile.objects.filter(user=request.user).first()
+        site_url = profile.website_url if profile and profile.website_url else ""
+        if not site_url:
+            return Response(
+                {"detail": "No website URL configured for SEO overview."},
+                status=400,
+            )
+
+        parsed = urlparse(site_url)
+        domain = (parsed.netloc or parsed.path or "").lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        if not domain:
+            return Response(
+                {"detail": "Could not determine domain from website URL."},
+                status=400,
+            )
+
+        # If the website domain has changed since the last fetch, force a fresh
+        # DataForSEO call instead of using cached snapshots.
+        domain_cache_key = f"seo_overview_domain:{request.user.id}"
+        previous_domain = cache.get(domain_cache_key)
+        if previous_domain and previous_domain != domain:
+            force_refresh = True
+        # Store/update the current domain stamp for future comparisons.
+        cache.set(domain_cache_key, domain, cache_ttl)
+
+        location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))  # default: US
+
+        logger.info(
+            "[seo_overview] user_id=%s calling DataForSEO ranked_keywords for domain=%s location_code=%s",
+            request.user.id,
+            domain,
+            location_code,
         )
-
-    access_token = _get_gsc_access_token(request.user)
-    if not access_token:
-        return Response(
-            {"detail": "Google Search Console is not connected."},
-            status=400,
+        # #region agent log
+        _debug.log("views.py:seo_overview:before_dataforseo", "domain and url sent", {"domain": domain, "site_url": site_url}, "H3")
+        # #endregion
+        visibility_data = get_ranked_keywords_visibility(
+            domain,
+            location_code=location_code,
+            language_code=getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en"),
         )
+        # #region agent log
+        _debug.log("views.py:seo_overview:after_dataforseo", "visibility_data result", {"is_none": visibility_data is None, "has_keys": list(visibility_data.keys()) if visibility_data else []}, "H4")
+        # #endregion
+        # When DataForSEO returns no result (e.g. new/small domain with no ranking data yet),
+        # return 200 with zeros so the dashboard still works instead of 502.
+        if not visibility_data:
+            # #region agent log
+            _debug.log("views.py:seo_overview:returning_zeros", "returning 200 with zeros (fix branch)", {"domain": domain}, "H1")
+            # #endregion
+            logger.info(
+                "[seo_overview] user_id=%s no DataForSEO result for domain=%s; returning zeros",
+                request.user.id,
+                domain,
+            )
+            try:
+                snapshot = SEOOverviewSnapshot.objects.get(
+                    user=request.user,
+                    period_start=start_current,
+                )
+                prev_vis = snapshot.organic_visitors or 0
+            except SEOOverviewSnapshot.DoesNotExist:
+                prev_vis = 0
+            organic_growth_pct = 0.0
+            return Response(
+                {
+                    "organic_visitors": 0,
+                    "keywords_ranking": 0,
+                    "top3_positions": 0,
+                    "organic_growth_pct": organic_growth_pct,
+                },
+            )
 
-    if start_current.month == 1:
-        prev_year = start_current.year - 1
-        prev_month = 12
-    else:
-        prev_year = start_current.year
-        prev_month = start_current.month - 1
-    start_prev = date(prev_year, prev_month, 1)
-    end_prev = start_current - timedelta(days=1)
+        current_visibility = int(round(visibility_data.get("visibility", 0.0) or 0.0))
+        keywords_ranking = int(visibility_data.get("keywords_count", 0) or 0)
+        top3_positions = int(visibility_data.get("top3_positions", 0) or 0)
 
-    rows_current = _gsc_query(access_token, site_url, start_current, today)
-    rows_prev = _gsc_query(access_token, site_url, start_prev, end_prev)
+        # Compute growth vs previous snapshot visibility (stored in organic_visitors).
+        try:
+            snapshot = SEOOverviewSnapshot.objects.get(
+                user=request.user,
+                period_start=start_current,
+            )
+            prev_vis = snapshot.organic_visitors or 0
+        except SEOOverviewSnapshot.DoesNotExist:
+            prev_vis = 0
 
-    organic_visitors = int(sum(float(r.get("clicks", 0)) for r in rows_current))
-    keywords_ranking = len(rows_current)
-    top3_positions = sum(1 for r in rows_current if float(r.get("position", 9999)) <= 3.0)
+        if prev_vis == 0:
+            organic_growth_pct = 100.0 if current_visibility > 0 else 0.0
+        else:
+            organic_growth_pct = ((current_visibility - prev_vis) / prev_vis) * 100.0
 
-    prev_clicks = int(sum(float(r.get("clicks", 0)) for r in rows_prev))
-    if prev_clicks == 0:
-        organic_growth_pct = 100.0 if organic_visitors > 0 else 0.0
-    else:
-        organic_growth_pct = ((organic_visitors - prev_clicks) / prev_clicks) * 100.0
+        snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
+            user=request.user,
+            period_start=start_current,
+        )
+        snapshot.organic_visitors = current_visibility
+        snapshot.prev_organic_visitors = prev_vis
+        snapshot.keywords_ranking = keywords_ranking
+        snapshot.top3_positions = top3_positions
+        snapshot.save()
 
-    snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
-        user=request.user,
-        period_start=start_current,
-    )
-    snapshot.organic_visitors = organic_visitors
-    snapshot.prev_organic_visitors = prev_clicks
-    snapshot.keywords_ranking = keywords_ranking
-    snapshot.top3_positions = top3_positions
-    snapshot.save()
-
-    return Response(
-        {
-            "organic_visitors": organic_visitors,
-            "keywords_ranking": keywords_ranking,
-            "top3_positions": top3_positions,
-            "organic_growth_pct": organic_growth_pct,
-        },
-    )
+        return Response(
+            {
+                # For backwards compatibility with the frontend naming, map current visibility
+                # to organic_visitors. The label in the UI can describe this as visibility.
+                "organic_visitors": current_visibility,
+                "keywords_ranking": keywords_ranking,
+                "top3_positions": top3_positions,
+                "organic_growth_pct": organic_growth_pct,
+            },
+        )
+    except Exception as e:
+        # #region agent log
+        _debug.log("views.py:seo_overview:exception", "exception in seo_overview", {"exc_type": type(e).__name__, "exc_msg": str(e)[:300]}, "H4")
+        # #endregion
+        raise
 
 
 @csrf_exempt
@@ -912,172 +1115,124 @@ def seo_overview(request: HttpRequest) -> Response:
 @permission_classes([IsAuthenticated])
 def seo_keywords(request: HttpRequest) -> Response:
     """
-    Return a unified High-Intent Keywords dataset combining:
-
-    - Google Search Console: query, clicks, impressions, ctr, position
-    - Google Ads KeywordPlanIdeaService: avg_monthly_searches, competition, competition_index, bid range
-    - Rule-based intent classification (HIGH / MEDIUM / LOW)
+    Return a High-Intent Keywords dataset for the SEO Agent using DataForSEO Labs
+    domain_intersection to surface keyword gaps vs competitors.
     """
+    force_refresh = request.GET.get("refresh") == "1"
+
     profile = BusinessProfile.objects.filter(user=request.user).first()
-    site_url = (profile.website_url if profile else None) or getattr(
+    site_url = profile.website_url if profile and profile.website_url else ""
+    if not site_url:
+        return Response({"keywords": []})
+
+    parsed = urlparse(site_url)
+    domain = (parsed.netloc or parsed.path or "").lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    if not domain:
+        return Response({"keywords": []})
+
+    # Use per-user cache so we only call DataForSEO at most once per hour,
+    # unless the caller explicitly asks for a refresh via ?refresh=1 or the
+    # business website domain has changed.
+    cache_key = f"seo_keywords:{request.user.id}"
+    domain_cache_key = f"seo_keywords_domain:{request.user.id}"
+    previous_domain = cache.get(domain_cache_key)
+    if previous_domain and previous_domain != domain:
+        force_refresh = True
+
+    if not force_refresh:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.info(
+                "[SEO keywords] Returning cached keyword gap items for user_id=%s (count=%s).",
+                request.user.id,
+                len(cached),
+            )
+            return Response({"keywords": cached})
+
+    # Competitor domains can be configured globally for now; later we can make this
+    # per-user if needed. Provide a sensible default set of common directories so
+    # competitor analysis works even if the env var is not set.
+    raw_competitors = getattr(
         settings,
-        "GOOGLE_SITE_URL",
-        "",
+        "DATAFORSEO_DEFAULT_COMPETITORS",
+        "yelp.com,angi.com,thumbtack.com,homeadvisor.com",
     )
+    competitor_domains = [c.strip() for c in raw_competitors.split(",") if c.strip()]
 
-    today = datetime.now(timezone.utc).date()
-
-    # If GSC is connected, use it to get per-site ranking & position deltas.
-    access_token = _get_gsc_access_token(request.user)
-    results: list[dict] = []
+    location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+    language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
 
     logger.info(
-        "[SEO keywords] user_id=%s, site_url=%s, has_gsc_token=%s",
+        "[SEO keywords] user_id=%s domain=%s competitors=%s location_code=%s",
         request.user.id,
-        site_url or "(none)",
-        bool(access_token),
+        domain,
+        ",".join(competitor_domains) or "(none)",
+        location_code,
     )
 
-    if site_url and access_token:
-        # Current period: last 30 days
-        start = today - timedelta(days=30)
-        prev_start = start - timedelta(days=30)
-        prev_end = start - timedelta(days=1)
+    gap_items = get_keyword_gap_keywords(
+        domain,
+        competitor_domains,
+        location_code=location_code,
+        language_code=language_code,
+    )
 
-        rows_current = _gsc_query(access_token, site_url, start, today)
-        rows_prev = _gsc_query(access_token, site_url, prev_start, prev_end)
-
-        # Index previous-period positions by query for quick lookup
-        prev_positions: dict[str, float] = {}
-        for row in rows_prev:
-            keys = row.get("keys") or []
-            if not keys:
-                continue
-            q = keys[0]
-            prev_positions[q] = float(row.get("position", 0))
-
-        # Sort by clicks descending and take top N.
-        sorted_rows = sorted(
-            rows_current,
-            key=lambda r: float(r.get("clicks", 0)),
-            reverse=True,
+    results: list[dict] = []
+    for item in gap_items:
+        kw = item.get("keyword")
+        if not kw:
+            continue
+        search_volume = item.get("search_volume")
+        competitors = item.get("competitors") or []
+        results.append(
+            {
+                "keyword": kw,
+                "avg_monthly_searches": int(search_volume) if search_volume is not None else None,
+                "intent": classify_intent(kw),
+                # For keyword gap items the site typically does not rank yet.
+                "current_position": 0,
+                "position_change": None,
+                "impressions": 0,
+                "clicks": 0,
+                "ctr": 0,
+                "competitors": [
+                    {
+                        "domain": c.get("domain") or "",
+                        "url": c.get("url") or "",
+                        "rank": c.get("rank"),
+                    }
+                    for c in competitors
+                    if c.get("url")
+                ],
+            },
         )
-        top_rows = sorted_rows[:50]
 
-        keywords = [r["keys"][0] for r in top_rows if r.get("keys")]
+    # Sort by highest opportunity: HIGH intent, then MEDIUM, then LOW, and by search volume desc.
+    def sort_key(item: dict) -> tuple[int, int]:
+        intent = item.get("intent") or "MEDIUM"
+        intent_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(intent, 1)
+        volume = item.get("avg_monthly_searches") or 0
+        return intent_rank, -volume
 
-        # Fetch Ads ideas with caching, using business context (industry / description)
-        # to improve suggestions.
-        industry = profile.industry if profile and profile.industry else None
-        description = profile.description if profile and profile.description else None
+    results.sort(key=sort_key)
+    top_results = results[:100]
 
-        ads_ideas = {}
-        try:
-            logger.info("[SEO keywords] GSC branch: calling fetch_keyword_ideas_for_user with %s keywords.", len(keywords))
-            ads_ideas = fetch_keyword_ideas_for_user(
-                request.user.id,
-                keywords,
-                industry=industry,
-                description=description,
-            )
-            logger.info("[SEO keywords] GSC branch: got %s ads_ideas.", len(ads_ideas))
-        except Exception as e:
-            logger.exception(
-                "[SEO keywords] GSC branch: fetch_keyword_ideas_for_user failed: %s. Using GSC-only data.",
-                e,
-            )
-            ads_ideas = {}
+    # Cache the computed keyword gaps for this user for the same window as other
+    # third-party data, so page loads reuse this instead of hitting DataForSEO.
+    cache_ttl = int(THIRD_PARTY_CACHE_TTL.total_seconds())
+    cache.set(cache_key, top_results, cache_ttl)
+    cache.set(domain_cache_key, domain, cache_ttl)
 
-        for row in top_rows:
-            query_keys = row.get("keys") or []
-            if not query_keys:
-                continue
-            query = query_keys[0]
+    logger.info(
+        "[SEO keywords] Returning %s fresh DataForSEO keyword gap items for user_id=%s.",
+        len(top_results),
+        request.user.id,
+    )
 
-            ads = ads_ideas.get(query)
-
-            clicks = float(row.get("clicks", 0))
-            impressions = float(row.get("impressions", 0))
-            ctr = float(row.get("ctr", 0))
-            position = float(row.get("position", 0))
-
-            prev_pos = prev_positions.get(query)
-            # Positive delta means improvement (moved up).
-            position_change = None
-            if prev_pos is not None:
-                position_change = prev_pos - position
-
-            results.append(
-                {
-                    "keyword": query,
-                    "avg_monthly_searches": (
-                        int(ads.avg_monthly_searches)
-                        if ads and ads.avg_monthly_searches is not None
-                        else None
-                    ),
-                    "intent": classify_intent(query),
-                    "current_position": position,
-                    "position_change": position_change,
-                    "impressions": int(impressions),
-                    "clicks": int(clicks),
-                    "ctr": ctr,
-                },
-            )
-
-    else:
-        # No GSC connection: use user's Google Ads connection to get
-        # Keyword Planner recommendations from business profile seeds.
-        logger.info("[SEO keywords] No-GSC branch: using Keyword Planner with profile seeds only.")
-        industry = profile.industry if profile and profile.industry else None
-        description = profile.description if profile and profile.description else None
-        if not industry and not description:
-            description = "services"  # fallback seed so API returns recommendations
-            logger.info("[SEO keywords] No-GSC branch: no industry/description, using fallback seed 'services'.")
-        ads_ideas = {}
-        try:
-            ads_ideas = fetch_keyword_ideas_for_user(
-                request.user.id,
-                [],  # no seed keywords; use industry/description only
-                industry=industry,
-                description=description,
-            )
-            logger.info("[SEO keywords] No-GSC branch: got %s ads_ideas.", len(ads_ideas))
-        except Exception as e:
-            logger.exception(
-                "[SEO keywords] No-GSC branch: fetch_keyword_ideas_for_user failed: %s. Returning empty keywords.",
-                e,
-            )
-            ads_ideas = {}
-
-        # Build list from recommendations; add intent and impact (competition, bid range).
-        idea_list = list(ads_ideas.values())
-        # Sort by intent (HIGH first) then by avg_monthly_searches descending.
-        def sort_key(idea):
-            intent = classify_intent(idea.keyword)
-            order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-            return (order.get(intent, 1), -(idea.avg_monthly_searches or 0))
-
-        idea_list.sort(key=sort_key)
-        for idea in idea_list[:50]:
-            results.append(
-                {
-                    "keyword": idea.keyword,
-                    "avg_monthly_searches": idea.avg_monthly_searches,
-                    "competition": idea.competition,
-                    "competition_index": idea.competition_index,
-                    "low_top_of_page_bid_micros": idea.low_top_of_page_bid_micros,
-                    "high_top_of_page_bid_micros": idea.high_top_of_page_bid_micros,
-                    "intent": classify_intent(idea.keyword),
-                    "current_position": None,
-                    "position_change": None,
-                    "impressions": 0,
-                    "clicks": 0,
-                    "ctr": 0.0,
-                },
-            )
-
-    logger.info("[SEO keywords] Returning %s keywords for user_id=%s.", len(results), request.user.id)
-    return Response({"keywords": results})
+    return Response({"keywords": top_results})
 
 
 def _reviews_overview_response_from_snapshot(snapshot: ReviewsOverviewSnapshot) -> Response:
@@ -1091,6 +1246,7 @@ def _reviews_overview_response_from_snapshot(snapshot: ReviewsOverviewSnapshot) 
         "industry_avg_response_pct": float(snapshot.industry_avg_response_pct or 45),
         "requests_sent": snapshot.requests_sent or 0,
         "conversion_pct": float(snapshot.conversion_pct or 0),
+        "connected": True,
     })
 
 
@@ -1105,9 +1261,17 @@ def reviews_overview(request: HttpRequest) -> Response:
     """
     from .gbp_client import fetch_gbp_overview
 
-    connected = GoogleBusinessProfileConnection.objects.filter(user=request.user).exclude(
-        refresh_token=""
-    ).exists()
+    user_id = request.user.id
+    gbp_qs = GoogleBusinessProfileConnection.objects.filter(user=request.user)
+    has_connection = gbp_qs.exists()
+    connected = gbp_qs.exclude(refresh_token="").exists()
+
+    logger.info(
+        "[reviews_overview] user_id=%s has_connection=%s connected=%s (non-empty refresh_token)",
+        user_id,
+        has_connection,
+        connected,
+    )
 
     if connected:
         now = datetime.now(timezone.utc)
@@ -1117,22 +1281,70 @@ def reviews_overview(request: HttpRequest) -> Response:
             try:
                 snapshot = ReviewsOverviewSnapshot.objects.get(user=request.user)
                 if snapshot.last_fetched_at >= cutoff:
+                    logger.info(
+                        "[reviews_overview] user_id=%s returning cached snapshot total_reviews=%s star_rating=%s",
+                        user_id,
+                        snapshot.total_reviews,
+                        snapshot.star_rating,
+                    )
                     return _reviews_overview_response_from_snapshot(snapshot)
             except ReviewsOverviewSnapshot.DoesNotExist:
-                pass
+                logger.info("[reviews_overview] user_id=%s no snapshot yet, will call API", user_id)
+
+        # At most one call per user per minute (Google My Business quota: requests per minute).
+        lock_key = f"gbp_api_lock:{user_id}"
+        if not cache.add(lock_key, "1", timeout=GBP_API_MIN_INTERVAL_SECONDS):
+            logger.info(
+                "[reviews_overview] user_id=%s rate limited (API called in last %ss), returning cached",
+                user_id,
+                GBP_API_MIN_INTERVAL_SECONDS,
+            )
+            try:
+                snapshot = ReviewsOverviewSnapshot.objects.get(user=request.user)
+                return _reviews_overview_response_from_snapshot(snapshot)
+            except ReviewsOverviewSnapshot.DoesNotExist:
+                return Response({
+                    "star_rating": 0,
+                    "previous_star_rating": 0,
+                    "total_reviews": 0,
+                    "new_reviews_this_month": 0,
+                    "response_rate_pct": 0,
+                    "industry_avg_response_pct": 45,
+                    "requests_sent": 0,
+                    "conversion_pct": 0,
+                    "connected": True,
+                })
 
         try:
+            logger.info("[reviews_overview] user_id=%s calling fetch_gbp_overview", user_id)
             data = fetch_gbp_overview(request.user)
             if data:
+                data["connected"] = True
+                logger.info(
+                    "[reviews_overview] user_id=%s API returned total_reviews=%s star_rating=%s",
+                    user_id,
+                    data.get("total_reviews"),
+                    data.get("star_rating"),
+                )
                 return Response(data)
+            logger.warning("[reviews_overview] user_id=%s fetch_gbp_overview returned None", user_id)
         except Exception as e:
             logger.exception("[reviews_overview] fetch_gbp_overview failed: %s", e)
 
     # Fallback: cached snapshot or defaults
     try:
         snapshot = ReviewsOverviewSnapshot.objects.get(user=request.user)
+        logger.info(
+            "[reviews_overview] user_id=%s fallback to existing snapshot total_reviews=%s",
+            user_id,
+            snapshot.total_reviews,
+        )
         return _reviews_overview_response_from_snapshot(snapshot)
     except ReviewsOverviewSnapshot.DoesNotExist:
+        logger.warning(
+            "[reviews_overview] user_id=%s no connection or API failed; returning zeros connected=False",
+            user_id,
+        )
         return Response({
             "star_rating": 0,
             "previous_star_rating": 0,
