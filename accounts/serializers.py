@@ -22,6 +22,8 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     technical_seo_score = serializers.SerializerMethodField()
     pages_audited = serializers.SerializerMethodField()
     onpage_issue_summaries = serializers.SerializerMethodField()
+    search_visibility_percent = serializers.SerializerMethodField()
+    missed_searches_monthly = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessProfile
@@ -43,6 +45,8 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "technical_seo_score",
             "pages_audited",
             "onpage_issue_summaries",
+            "search_visibility_percent",
+            "missed_searches_monthly",
             "created_at",
             "updated_at",
         ]
@@ -143,3 +147,17 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if not bundle:
             return None
         return bundle.get("onpage_issue_summaries") or {}
+
+    def get_search_visibility_percent(self, obj: BusinessProfile) -> int | None:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return None
+        val = bundle.get("search_visibility_percent")
+        return int(val) if val is not None else None
+
+    def get_missed_searches_monthly(self, obj: BusinessProfile) -> int | None:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return None
+        val = bundle.get("missed_searches_monthly")
+        return int(val) if val is not None else None

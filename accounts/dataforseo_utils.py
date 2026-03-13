@@ -635,37 +635,6 @@ def get_or_refresh_seo_score_for_user(
     """
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=1)
-
-    # 1) If we have a fresh snapshot, derive the score from it without hitting DataForSEO.
-    try:
-        snapshot = SEOOverviewSnapshot.objects.get(
-            user=user,
-            period_start=start_current,
-        )
-        if snapshot.last_fetched_at >= cutoff:
-            organic_visitors = snapshot.organic_visitors or 0
-            keywords_ranking = snapshot.keywords_ranking or 0
-            top3_positions = snapshot.top3_positions or 0
-            seo_score = compute_professional_seo_score(
-                estimated_traffic=organic_visitors,
-                keywords_count=keywords_ranking,
-                top3_positions=top3_positions,
-                top10_positions=top3_positions,  # best effort when we don't know top10
-                avg_keyword_difficulty=None,
-                competitor_avg_traffic=0.0,
-            )
-            return {
-                "seo_score": seo_score,
-                "organic_visitors": organic_visitors,
-                "keywords_ranking": keywords_ranking,
-                "top3_positions": top3_positions,
-            }
-    except SEOOverviewSnapshot.DoesNotExist:
-        snapshot = None
-
-    # 2) Otherwise, refresh from DataForSEO (same logic as seo_overview) and update snapshot.
     if not site_url:
         # #region agent log
         try:
@@ -773,6 +742,8 @@ def get_or_refresh_seo_score_for_user(
             "organic_visitors": 0,
             "keywords_ranking": 0,
             "top3_positions": 0,
+            "search_visibility_percent": 0,
+            "missed_searches_monthly": 0,
         }
 
     try:
@@ -843,6 +814,8 @@ def get_or_refresh_seo_score_for_user(
             "organic_visitors": 0,
             "keywords_ranking": 0,
             "top3_positions": 0,
+            "search_visibility_percent": 0,
+            "missed_searches_monthly": 0,
         }
 
     # Derive metrics from ranked keyword items.
@@ -851,6 +824,10 @@ def get_or_refresh_seo_score_for_user(
     top3_positions = 0
     top10_positions = 0
     difficulties: List[float] = []
+    total_search_volume = 0.0
+    total_traffic_share = 0.0
+    missed_searches_volume = 0.0
+    MIN_SEARCH_VOLUME = 10
 
     for item in items:
         rank = item.get("rank_absolute") or item.get("rank_group")
@@ -873,6 +850,17 @@ def get_or_refresh_seo_score_for_user(
         except (TypeError, ValueError):
             sv = 0.0
 
+        if sv > 0:
+            total_search_volume += sv
+
+        traffic_share_raw = item.get("traffic_share")
+        try:
+            traffic_share = float(traffic_share_raw) if traffic_share_raw is not None else 0.0
+        except (TypeError, ValueError):
+            traffic_share = 0.0
+        if traffic_share > 0:
+            total_traffic_share += traffic_share
+
         if rank_int is not None and rank_int > 0 and sv > 0:
             ctr = _ctr_for_position(rank_int)
             estimated_traffic += sv * ctr
@@ -882,11 +870,29 @@ def get_or_refresh_seo_score_for_user(
             if rank_int <= 10:
                 top10_positions += 1
 
+        # Missed searches: keywords where we're effectively not capturing traffic yet:
+        # - position is > 10, or no traffic_share, with sufficient volume.
+        if (
+            sv >= MIN_SEARCH_VOLUME
+            and (rank_int is None or rank_int > 10 or traffic_share <= 0.0)
+        ):
+            missed_searches_volume += sv
+
         diff = _extract_keyword_difficulty(kw_info)
         if diff is not None:
             difficulties.append(diff)
 
     avg_difficulty = sum(difficulties) / len(difficulties) if difficulties else None
+
+    # Search visibility and missed searches metrics
+    if total_search_volume > 0 and total_traffic_share > 0:
+        search_visibility_percent = int(round(
+            max(0.0, min(100.0, (total_traffic_share / total_search_volume) * 100.0))
+        ))
+    else:
+        search_visibility_percent = 0
+
+    missed_searches_monthly = int(round(missed_searches_volume)) if missed_searches_volume > 0 else 0
 
     # Competitor baseline from competitors_domain/live
     competitor_avg_traffic = _get_competitor_average_traffic(
@@ -940,5 +946,7 @@ def get_or_refresh_seo_score_for_user(
         "organic_visitors": int(round(estimated_traffic)),
         "keywords_ranking": keywords_ranking,
         "top3_positions": top3_positions,
+        "search_visibility_percent": search_visibility_percent,
+        "missed_searches_monthly": missed_searches_monthly,
     }
 
