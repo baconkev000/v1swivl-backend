@@ -246,6 +246,9 @@ class OnPageAuditSnapshot(models.Model):
     has_robots_txt = models.BooleanField(default=False)
     has_sitemap_xml = models.BooleanField(default=False)
 
+    # How many "important" pages were included in the last audit.
+    pages_audited = models.IntegerField(default=0)
+
     # Scores
     metadata_score = models.IntegerField(default=0)
     content_structure_score = models.IntegerField(default=0)

@@ -140,12 +140,15 @@ def run_onpage_audit_for_user(user, site_url: str | None) -> Optional[OnPageAudi
         logger.warning("[OnPageAudit] Could not extract task_id from task_post response for domain=%s", domain)
         return snapshot
 
-    # 2) Fetch pages
+    # 2) Fetch important pages only (cost-effective audit):
+    #    Use DataForSEO's ordering to fetch top pages by page_rank and limit to 20.
+    IMPORTANT_PAGE_LIMIT = 20
     pages_payload = [
         {
             "id": task_id,
-            "limit": 1000,
+            "limit": IMPORTANT_PAGE_LIMIT,
             "offset": 0,
+            "order_by": ["page_rank,desc"],
         },
     ]
     pages_data = _post("/v3/on_page/pages", pages_payload)
@@ -155,13 +158,37 @@ def run_onpage_audit_for_user(user, site_url: str | None) -> Optional[OnPageAudi
 
     try:
         tasks = pages_data.get("tasks") or []
+        if not tasks:
+            logger.warning(
+                "[OnPageAudit] pages: no tasks in response for task_id=%s domain=%s raw=%s",
+                task_id,
+                domain,
+                str(pages_data)[:300],
+            )
+            return snapshot
+
         results = tasks[0].get("result") or []
+        if not results:
+            logger.warning(
+                "[OnPageAudit] pages: no result items for task_id=%s domain=%s raw_task=%s",
+                task_id,
+                domain,
+                str(tasks[0])[:300],
+            )
+            return snapshot
+
         pages = results[0].get("items") or []
     except Exception as exc:
-        logger.exception("[OnPageAudit] Failed to parse pages for task_id=%s domain=%s: %s", task_id, domain, exc)
+        logger.exception(
+            "[OnPageAudit] Failed to parse pages for task_id=%s domain=%s: %s (raw=%s)",
+            task_id,
+            domain,
+            exc,
+            str(pages_data)[:300],
+        )
         return snapshot
 
-    # Counters
+    # Only audit the limited set of "important" pages.
     total_pages = len(pages)
     pages_missing_titles = 0
     pages_missing_descriptions = 0
@@ -331,6 +358,7 @@ def run_onpage_audit_for_user(user, site_url: str | None) -> Optional[OnPageAudi
     snapshot.onpage_seo_score = onpage_seo_score
     snapshot.technical_seo_score = technical_seo_score
     snapshot.issue_summaries = issue_summaries
+    snapshot.pages_audited = total_pages
     snapshot.save()
 
     logger.info(

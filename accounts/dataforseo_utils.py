@@ -14,6 +14,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
+import json
+import math
 import requests
 from django.conf import settings
 
@@ -23,6 +25,7 @@ from .onpage_audit import run_onpage_audit_for_user
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.dataforseo.com"
+DEBUG_LOG_PATH = "debug-098bfd.log"
 
 
 def _get_auth() -> Optional[tuple[str, str]]:
@@ -60,6 +63,21 @@ def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         )
     except Exception as exc:  # pragma: no cover - network failure
         logger.exception("[DataForSEO] POST %s failed: %s", path, exc)
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a") as f:
+                f.write(json.dumps({
+                    "sessionId": "098bfd",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1",
+                    "location": "accounts/dataforseo_utils.py:_post",
+                    "message": "HTTP error when calling DataForSEO",
+                    "data": {"path": path, "error": str(exc)},
+                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return None
 
     if resp.status_code != 200:
@@ -71,16 +89,178 @@ def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             resp.status_code,
             resp.text[:500],
         )
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a") as f:
+                f.write(json.dumps({
+                    "sessionId": "098bfd",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1",
+                    "location": "accounts/dataforseo_utils.py:_post",
+                    "message": "Non-200 from DataForSEO",
+                    "data": {
+                        "path": path,
+                        "status_code": resp.status_code,
+                        "body_preview": resp.text[:200],
+                    },
+                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return None
 
     try:
         data = resp.json()
     except ValueError:  # pragma: no cover - unexpected non-JSON
         logger.warning("[DataForSEO] POST %s returned non-JSON body.", path)
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a") as f:
+                f.write(json.dumps({
+                    "sessionId": "098bfd",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1",
+                    "location": "accounts/dataforseo_utils.py:_post",
+                    "message": "Non-JSON response from DataForSEO",
+                    "data": {"path": path, "body_preview": resp.text[:200]},
+                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return None
 
     # DataForSEO wraps results in tasks / result; callers will unpack further.
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps({
+                "sessionId": "098bfd",
+                "runId": "pre-fix",
+                "hypothesisId": "H1",
+                "location": "accounts/dataforseo_utils.py:_post",
+                "message": "DataForSEO response summary",
+                "data": {
+                    "path": path,
+                    "has_tasks": bool((data or {}).get("tasks")),
+                },
+                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+    # #endregion
     return data
+
+
+def _ctr_for_position(position: int) -> float:
+    """
+    Simple CTR curve approximating typical SERP click-through rates.
+    Position 1 ≈ 0.28, 2 ≈ 0.15, 3 ≈ 0.10, 4 ≈ 0.07, 5 ≈ 0.05, 6–10 decreasing.
+    """
+    if position <= 0:
+        return 0.0
+    if position == 1:
+        return 0.28
+    if position == 2:
+        return 0.15
+    if position == 3:
+        return 0.10
+    if position == 4:
+        return 0.07
+    if position == 5:
+        return 0.05
+    if 6 <= position <= 10:
+        # Linearly decay from 0.04 at 6 → 0.01 at 10
+        return max(0.01, 0.04 - (position - 6) * 0.0075)
+    if 11 <= position <= 20:
+        return 0.005
+    return 0.002
+
+
+def _extract_keyword_difficulty(keyword_info: Dict[str, Any]) -> Optional[float]:
+    """
+    Extract a difficulty / competition score from DataForSEO keyword_info.
+    Handles either 0–1 or 0–100 scales and normalises to 0–100.
+    """
+    if not keyword_info:
+        return None
+
+    for key in ("competition", "competition_level", "difficulty", "keyword_difficulty"):
+        if key in keyword_info and keyword_info[key] is not None:
+            try:
+                val = float(keyword_info[key])
+            except (TypeError, ValueError):
+                continue
+            # If looks like 0–1, scale to 0–100
+            if 0.0 <= val <= 1.0:
+                return val * 100.0
+            return max(0.0, min(100.0, val))
+
+    return None
+
+
+def _get_competitor_average_traffic(
+    target_domain: str,
+    *,
+    location_code: int,
+    language_code: str,
+) -> float:
+    """
+    Call competitors_domain/live to estimate the average organic traffic/visibility
+    of the top competitors for the given domain.
+    """
+    payload = [
+        {
+            "target": target_domain,
+            "location_code": int(location_code),
+            "language_code": language_code,
+        },
+    ]
+
+    data = _post("/v3/dataforseo_labs/google/competitors_domain/live", payload)
+    if not data:
+        return 0.0
+
+    try:
+        tasks = data.get("tasks") or []
+        if not tasks:
+            return 0.0
+        task = tasks[0]
+        results = task.get("result") or []
+        if not results:
+            return 0.0
+        result = results[0]
+        items = result.get("items") or []
+        if not items:
+            return 0.0
+
+        competitor_scores: List[float] = []
+        for item in items:
+            metrics = item.get("organic_metrics") or item
+            raw_vis = (
+                metrics.get("estimated_traffic")
+                or metrics.get("visibility")
+                or metrics.get("sum_search_volume")
+                or 0
+            )
+            try:
+                vis = float(raw_vis)
+            except (TypeError, ValueError):
+                vis = 0.0
+            if vis > 0:
+                competitor_scores.append(vis)
+
+        if not competitor_scores:
+            return 0.0
+
+        return sum(competitor_scores) / len(competitor_scores)
+    except Exception:
+        logger.exception(
+            "[DataForSEO] competitors_domain parsing failed for target_domain=%s",
+            target_domain,
+        )
+        return 0.0
 
 
 def get_ranked_keywords_visibility(
@@ -487,6 +667,21 @@ def get_or_refresh_seo_score_for_user(
 
     # 2) Otherwise, refresh from DataForSEO (same logic as seo_overview) and update snapshot.
     if not site_url:
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a") as f:
+                f.write(json.dumps({
+                    "sessionId": "098bfd",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H2",
+                    "location": "accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
+                    "message": "No site_url; skipping SEO score calculation",
+                    "data": {"user_id": getattr(user, "id", None)},
+                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return None
 
     parsed = urlparse(site_url)
@@ -494,6 +689,21 @@ def get_or_refresh_seo_score_for_user(
     if domain.startswith("www."):
         domain = domain[4:]
     if not domain:
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a") as f:
+                f.write(json.dumps({
+                    "sessionId": "098bfd",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H2",
+                    "location": "accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
+                    "message": "Could not normalise domain from site_url",
+                    "data": {"user_id": getattr(user, "id", None), "site_url": site_url},
+                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return None
 
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
@@ -509,8 +719,19 @@ def get_or_refresh_seo_score_for_user(
         },
     ]
 
+    logger.info(
+        "[SEO score] ranked_keywords request user_id=%s domain=%s payload=%s",
+        getattr(user, "id", None),
+        domain,
+        payload,
+    )
     ranked_data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
     if not ranked_data:
+        logger.warning(
+            "[SEO score] ranked_keywords returned no data for user_id=%s domain=%s",
+            getattr(user, "id", None),
+            domain,
+        )
         seo_score = compute_professional_seo_score(
             estimated_traffic=0.0,
             keywords_count=0,
@@ -529,6 +750,21 @@ def get_or_refresh_seo_score_for_user(
             + onpage_score * 0.3
             + technical_score * 0.2
         ))
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a") as f:
+                f.write(json.dumps({
+                    "sessionId": "098bfd",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H3",
+                    "location": "accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
+                    "message": "No ranked_data; using fallback SEO score",
+                    "data": {"user_id": getattr(user, "id", None), "domain": domain, "seo_score": seo_score},
+                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return {
             "seo_score": overall,
             "search_performance_score": search_performance_score,
@@ -549,8 +785,37 @@ def get_or_refresh_seo_score_for_user(
             raise ValueError("no results")
         result = results[0]
         items = result.get("items") or []
-    except Exception:
+        logger.info(
+            "[SEO score] ranked_keywords parsed user_id=%s domain=%s task_status=%s items=%s",
+            getattr(user, "id", None),
+            domain,
+            task.get("status_code"),
+            len(items),
+        )
+        # Log a small preview of the first item for debugging (no PII or secrets).
+        if items:
+            preview = {
+                "rank_absolute": items[0].get("rank_absolute"),
+                "search_volume": (
+                    ((items[0].get("keyword_data") or {}).get("keyword_info") or {}).get("search_volume")
+                    or items[0].get("search_volume")
+                ),
+                "keyword": (items[0].get("keyword_data") or {}).get("keyword") or items[0].get("keyword"),
+            }
+            logger.info(
+                "[SEO score] ranked_keywords first_item_preview user_id=%s domain=%s preview=%s",
+                getattr(user, "id", None),
+                domain,
+                preview,
+            )
+    except Exception as exc:
         items = []
+        logger.exception(
+            "[SEO score] Error parsing ranked_keywords for user_id=%s domain=%s raw_preview=%s",
+            getattr(user, "id", None),
+            domain,
+            str(ranked_data)[:200],
+        )
 
     if not items:
         seo_score = compute_professional_seo_score(
@@ -656,6 +921,8 @@ def get_or_refresh_seo_score_for_user(
     onpage_snapshot = run_onpage_audit_for_user(user, site_url)
     onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
     technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
+    pages_audited = onpage_snapshot.pages_audited if onpage_snapshot else 0
+    onpage_issue_summaries = onpage_snapshot.issue_summaries if onpage_snapshot else {}
 
     overall = int(round(
         search_performance_score * 0.5
@@ -668,6 +935,8 @@ def get_or_refresh_seo_score_for_user(
         "search_performance_score": search_performance_score,
         "onpage_seo_score": onpage_score,
         "technical_seo_score": technical_score,
+        "pages_audited": pages_audited,
+        "onpage_issue_summaries": onpage_issue_summaries,
         "organic_visitors": int(round(estimated_traffic)),
         "keywords_ranking": keywords_ranking,
         "top3_positions": top3_positions,
