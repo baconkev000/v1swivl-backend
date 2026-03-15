@@ -220,6 +220,8 @@ class SEOOverviewSnapshot(models.Model):
     missed_searches_monthly = models.IntegerField(default=0)
     search_visibility_percent = models.IntegerField(default=0)
     search_performance_score = models.IntegerField(null=True, blank=True)
+    seo_next_steps = models.JSONField(default=list, blank=True)
+    seo_next_steps_refreshed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = ("user", "period_start")

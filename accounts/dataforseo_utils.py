@@ -986,6 +986,7 @@ def get_or_refresh_seo_score_for_user(
                     "search_visibility_percent": getattr(snapshot, "search_visibility_percent", 0) or 0,
                     "missed_searches_monthly": getattr(snapshot, "missed_searches_monthly", 0) or 0,
                     "top_keywords": getattr(snapshot, "top_keywords", None) or [],
+                    "seo_next_steps": getattr(snapshot, "seo_next_steps", None) or [],
                 }
     except Exception:
         logger.exception("[SEO score] Error reading keyword cache for user_id=%s", getattr(user, "id", None))
@@ -1061,6 +1062,7 @@ def get_or_refresh_seo_score_for_user(
             "search_visibility_percent": 0,
             "missed_searches_monthly": 0,
             "top_keywords": [],
+            "seo_next_steps": [],
         }
 
     try:
@@ -1394,7 +1396,7 @@ def get_or_refresh_seo_score_for_user(
         + technical_score * 0.2
     ))
 
-    return {
+    result = {
         "seo_score": overall,
         "search_performance_score": search_performance_score,
         "onpage_seo_score": onpage_score,
@@ -1409,4 +1411,38 @@ def get_or_refresh_seo_score_for_user(
         "missed_searches_monthly": missed_searches_monthly,
         "top_keywords": top_keywords_sorted,
     }
+
+    # Next steps: only regenerate at most once per week; otherwise reuse cached list
+    steps_ttl = timedelta(days=7)
+    snapshot_for_steps = SEOOverviewSnapshot.objects.filter(
+        user=user,
+        period_start=start_current,
+    ).first()
+    cached_steps = []
+    if snapshot_for_steps and getattr(snapshot_for_steps, "seo_next_steps_refreshed_at", None):
+        refreshed_at = snapshot_for_steps.seo_next_steps_refreshed_at
+        if refreshed_at and (now_utc - refreshed_at) <= steps_ttl:
+            cached_steps = getattr(snapshot_for_steps, "seo_next_steps", None) or []
+    if cached_steps:
+        result["seo_next_steps"] = cached_steps
+    else:
+        try:
+            from .openai_utils import generate_seo_next_steps
+            steps = generate_seo_next_steps(result)
+            result["seo_next_steps"] = steps if steps else []
+        except Exception:
+            logger.exception("[SEO score] Failed to generate seo_next_steps for user_id=%s", getattr(user, "id", None))
+            result["seo_next_steps"] = []
+        try:
+            snap, _ = SEOOverviewSnapshot.objects.get_or_create(
+                user=user,
+                period_start=start_current,
+            )
+            snap.seo_next_steps = result.get("seo_next_steps") or []
+            snap.seo_next_steps_refreshed_at = now_utc
+            snap.save(update_fields=["seo_next_steps", "seo_next_steps_refreshed_at"])
+        except Exception:
+            logger.exception("[SEO score] Failed to save seo_next_steps to snapshot for user_id=%s", getattr(user, "id", None))
+
+    return result
 

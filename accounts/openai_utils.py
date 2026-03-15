@@ -4,6 +4,7 @@ OpenAI-backed helpers for agent chat and summarization.
 Keeps all OpenAI client usage and message formatting in one place.
 """
 
+import json
 import os
 
 from django.conf import settings
@@ -231,6 +232,81 @@ def generate_seo_keyword_candidates(
         elif word_count == 1 and len(phrase) >= 4:
             candidates.append(phrase)
     return candidates[:15]
+
+
+def generate_seo_next_steps(seo_data: dict) -> list[dict]:
+    """
+    Ask OpenAI for 6 next steps to improve SEO, given current SEO metrics.
+    seo_data should include: seo_score, missed_searches_monthly, organic_visitors,
+    total_search_volume, search_visibility_percent, top_keywords (list of {keyword, search_volume, rank}),
+    and optionally onpage_issue_summaries.
+    Returns list of {"label": str, "tag": str} (length 6). Tags are short, e.g. "Quick win", "High priority".
+    """
+    if not seo_data:
+        return []
+
+    score = seo_data.get("seo_score")
+    missed = seo_data.get("missed_searches_monthly")
+    organic = seo_data.get("organic_visitors")
+    total_vol = seo_data.get("total_search_volume")
+    visibility_pct = seo_data.get("search_visibility_percent")
+    keywords = seo_data.get("top_keywords") or []
+    onpage_summaries = seo_data.get("onpage_issue_summaries") or {}
+
+    keyword_preview = ""
+    if keywords:
+        parts = [f"{k.get('keyword', '')} ({k.get('search_volume', 0)}/mo)" for k in keywords[:12]]
+        keyword_preview = "\n".join(parts)
+
+    system = (
+        "You are an SEO expert. Given the site's current SEO data, output exactly 6 actionable next steps "
+        "to improve their SEO score. Each step must have: \"label\" (one short sentence, actionable, e.g. "
+        "'Rewrite your primary conversion page headline and CTA') and \"tag\" (2–3 words, e.g. 'Quick win', "
+        "'High priority', 'This week', 'Cross-channel'). Be specific to the data provided (e.g. mention "
+        "missed searches, visibility, or top keywords where relevant). Output only a JSON array of 6 objects "
+        "with keys \"label\" and \"tag\". No other text."
+    )
+    user_parts = [
+        f"SEO score (0–100): {score}",
+        f"Monthly missed searches (not finding this site): {missed}",
+        f"Organic visitors (estimated): {organic}",
+        f"Total search volume (keyword set): {total_vol}",
+        f"Search visibility %: {visibility_pct}%",
+    ]
+    if keyword_preview:
+        user_parts.append("Top keywords (keyword, volume/mo):\n" + keyword_preview)
+    if onpage_summaries:
+        user_parts.append("On-page/technical issues: " + str(onpage_summaries))
+    user_content = "Current SEO data:\n\n" + "\n".join(user_parts) + "\n\nReturn a JSON array of 6 next steps with \"label\" and \"tag\"."
+
+    try:
+        client = _get_client("OPEN_AI_SEO_API_KEY")
+        model = _get_model()
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        # Strip markdown code block if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rstrip("`").strip()
+        steps = json.loads(raw)
+        if not isinstance(steps, list):
+            return []
+        out = []
+        for i, item in enumerate(steps[:6]):
+            if not isinstance(item, dict):
+                continue
+            label = (item.get("label") or "").strip()
+            tag = (item.get("tag") or "Next step").strip()[:40]
+            if label:
+                out.append({"label": label, "tag": tag or "Next step"})
+        return out[:6]
+    except Exception:
+        return []
 
 
 def summarize_reviews_conversation(messages: list[ReviewsMessage]) -> str:
