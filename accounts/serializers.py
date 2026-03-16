@@ -28,6 +28,8 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     organic_visitors = serializers.SerializerMethodField()
     top_keywords = serializers.SerializerMethodField()
     seo_next_steps = serializers.SerializerMethodField()
+    keyword_action_suggestions = serializers.SerializerMethodField()
+    enrichment_status = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessProfile
@@ -55,6 +57,8 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "organic_visitors",
             "top_keywords",
             "seo_next_steps",
+            "keyword_action_suggestions",
+            "enrichment_status",
             "created_at",
             "updated_at",
         ]
@@ -195,3 +199,16 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if not bundle:
             return []
         return bundle.get("seo_next_steps") or []
+
+    def get_keyword_action_suggestions(self, obj: BusinessProfile):
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return []
+        # List of {\"keyword\": str, \"suggestion\": str}
+        return bundle.get("keyword_action_suggestions") or []
+
+    def get_enrichment_status(self, obj: BusinessProfile) -> str:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return "complete"
+        return bundle.get("enrichment_status") or "complete"

@@ -16,7 +16,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 # Requirements are installed here to ensure they will be cached.
 COPY ./requirements .
 
-# Create Python Dependency and Sub-Dependency Wheels.
+# Make sure pip tooling is up-to-date before building wheels (helps with newer deps like Celery).
+RUN pip install --upgrade pip setuptools wheel
+
+# Create Python Dependency and Sub-Dependency Wheels (local.txt / production.txt → base.txt).
 RUN pip wheel --wheel-dir /usr/src/app/wheels \
   -r ${BUILD_ENVIRONMENT}.txt
 

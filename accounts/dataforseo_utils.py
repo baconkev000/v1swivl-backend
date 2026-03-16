@@ -1259,8 +1259,11 @@ def save_seo_snapshot(
     missed_searches_monthly: int,
     search_visibility_percent: int,
     search_performance_score: int,
-) -> None:
-    """Persist keyword list and search metrics to SEOOverviewSnapshot. Logs on failure."""
+):
+    """
+    Persist keyword list and search metrics to SEOOverviewSnapshot. Logs on failure.
+    Returns the snapshot instance on success so callers can enqueue async tasks by snapshot.id; returns None on failure.
+    """
     try:
         snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
             user=user,
@@ -1277,8 +1280,10 @@ def save_seo_snapshot(
         snapshot.search_visibility_percent = int(search_visibility_percent or 0)
         snapshot.search_performance_score = int(search_performance_score or 0)
         snapshot.save()
+        return snapshot
     except Exception:
         logger.exception("[SEO score] Failed to save keyword cache for user_id=%s", getattr(user, "id", None))
+        return None
 
 
 def generate_or_get_next_steps(
@@ -1332,6 +1337,7 @@ def build_seo_response(
     missed_searches_monthly: int,
     top_keywords: List[Dict[str, Any]],
     seo_next_steps: Optional[List[Any]] = None,
+    enrichment_status: str = "complete",
 ) -> Dict[str, Any]:
     """Build the final API response dict from on-page snapshot and SEO metrics. Numeric safety: int(x or 0)."""
     onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
@@ -1356,6 +1362,7 @@ def build_seo_response(
         "missed_searches_monthly": int(missed_searches_monthly or 0),
         "top_keywords": top_keywords or [],
         "seo_next_steps": seo_next_steps if seo_next_steps is not None else [],
+        "enrichment_status": enrichment_status,
     }
 
 
@@ -1371,6 +1378,7 @@ def _build_empty_seo_response(user, site_url: str) -> Dict[str, Any]:
         search_performance_score=fallback_score,
         organic_visitors=0, total_search_volume=0, keywords_ranking=0, top3_positions=0,
         search_visibility_percent=0, missed_searches_monthly=0, top_keywords=[], seo_next_steps=[],
+        enrichment_status="complete",
     )
 
 
@@ -1427,6 +1435,11 @@ def get_or_refresh_seo_score_for_user(
     snapshot = get_cached_seo_snapshot(user, domain, start_current, cache_ttl, now_utc)
     if snapshot:
         onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+        enrichment_status = "complete" if (
+            getattr(snapshot, "keywords_enriched_at", None)
+            and getattr(snapshot, "seo_next_steps_refreshed_at", None)
+            and getattr(snapshot, "keyword_action_suggestions_refreshed_at", None)
+        ) else "pending"
         return build_seo_response(
             onpage_snapshot=onpage_snapshot,
             search_performance_score=int(snapshot.search_performance_score or 0),
@@ -1438,6 +1451,7 @@ def get_or_refresh_seo_score_for_user(
             missed_searches_monthly=int(getattr(snapshot, "missed_searches_monthly", 0) or 0),
             top_keywords=getattr(snapshot, "top_keywords", None) or [],
             seo_next_steps=getattr(snapshot, "seo_next_steps", None) or [],
+            enrichment_status=enrichment_status,
         )
 
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
@@ -1447,12 +1461,15 @@ def get_or_refresh_seo_score_for_user(
         return _build_empty_seo_response(user, site_url)
 
     metrics = compute_ranked_metrics(items)
-    enrich_with_gap_keywords(domain, location_code, language_code, user, metrics["top_keywords"])
-    enrich_with_llm_keywords(user, location_code, metrics["top_keywords"])
-    top_keywords_sorted = sorted(metrics["top_keywords"], key=lambda x: x.get("search_volume", 0), reverse=True)[:20]
+    # Ranked-only keywords for sync path: no gap/LLM enrichment here (done in background).
+    top_keywords_ranked = sorted(
+        metrics["top_keywords"],
+        key=lambda x: x.get("search_volume", 0),
+        reverse=True,
+    )[:20]
 
     visibility = compute_visibility_metrics(
-        top_keywords_sorted,
+        top_keywords_ranked,
         metrics["estimated_traffic"],
         metrics["keywords_ranking"],
         metrics["top3_positions"],
@@ -1463,20 +1480,33 @@ def get_or_refresh_seo_score_for_user(
         language_code,
     )
 
-    save_seo_snapshot(
+    snapshot = save_seo_snapshot(
         user, start_current, domain, now_utc,
         organic_visitors=int(round(metrics["estimated_traffic"]) or 0),
         keywords_ranking=int(metrics["keywords_ranking"] or 0),
         top3_positions=int(metrics["top3_positions"] or 0),
-        top_keywords_sorted=top_keywords_sorted,
+        top_keywords_sorted=top_keywords_ranked,
         total_search_volume=int(visibility["total_search_volume"] or 0),
         missed_searches_monthly=int(visibility["missed_searches_monthly"] or 0),
         search_visibility_percent=int(visibility["search_visibility_percent"] or 0),
         search_performance_score=int(visibility["search_performance_score"] or 0),
     )
 
+    if snapshot:
+        try:
+            from .tasks import (
+                enrich_snapshot_keywords_task,
+                generate_snapshot_next_steps_task,
+                generate_keyword_action_suggestions_task,
+            )
+            enrich_snapshot_keywords_task.delay(snapshot.id)
+            generate_snapshot_next_steps_task.delay(snapshot.id)
+            generate_keyword_action_suggestions_task.delay(snapshot.id)
+        except Exception as e:
+            logger.warning("[SEO score] Could not enqueue enrichment tasks: %s", e)
+
     onpage_snapshot = run_onpage_audit_for_user(user, site_url)
-    result = build_seo_response(
+    return build_seo_response(
         onpage_snapshot=onpage_snapshot,
         search_performance_score=int(visibility["search_performance_score"] or 0),
         organic_visitors=int(round(metrics["estimated_traffic"]) or 0),
@@ -1485,8 +1515,8 @@ def get_or_refresh_seo_score_for_user(
         top3_positions=int(metrics["top3_positions"] or 0),
         search_visibility_percent=int(visibility["search_visibility_percent"] or 0),
         missed_searches_monthly=int(visibility["missed_searches_monthly"] or 0),
-        top_keywords=top_keywords_sorted,
+        top_keywords=top_keywords_ranked,
+        seo_next_steps=[],
+        enrichment_status="pending",
     )
-    generate_or_get_next_steps(user, start_current, result, now_utc)
-    return result
 

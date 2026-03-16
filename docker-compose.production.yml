@@ -19,6 +19,21 @@ services:
       - /home/deploy/app/swivl-backend/.env
     command: /start
 
+  celery:
+    build:
+      context: .
+      dockerfile: ./compose/production/django/Dockerfile
+    image: swivl_production_celery
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - /home/deploy/app/swivl-backend/.env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    # Celery worker for async tasks (e.g. SEO enrichment)
+    command: celery -A config worker -l info
+
   postgres:
     build:
       context: .

@@ -22,6 +22,29 @@ services:
       - '8000:8000'
     command: /start
 
+  redis:
+    image: docker.io/redis:7.2
+
+  celery:
+    build:
+      context: .
+      dockerfile: ./compose/local/django/Dockerfile
+    image: swivl_local_celery
+    container_name: swivl_local_celery
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - /app/.venv
+      - .:/app:z
+    env_file:
+      - ./.envs/.local/.django
+      - ./.envs/.local/.postgres
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.local
+    # Celery worker for async tasks (e.g. SEO enrichment)
+    command: celery -A config worker -l info
+
   postgres:
     build:
       context: .

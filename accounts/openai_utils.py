@@ -309,6 +309,77 @@ def generate_seo_next_steps(seo_data: dict) -> list[dict]:
         return []
 
 
+def generate_keyword_action_suggestions(keywords: list[dict]) -> list[dict]:
+    """
+    Given a list of keyword dicts (from \"what people search for\" / top_keywords),
+    ask OpenAI to propose one-sentence SEO improvement actions per keyword.
+
+    Returns a list of {\"keyword\": str, \"suggestion\": str}.
+    """
+    if not keywords:
+        return []
+
+    # Limit to a reasonable number of keywords to keep the prompt small.
+    top = []
+    for k in keywords:
+        kw = (k.get("keyword") or "").strip()
+        if not kw:
+            continue
+        vol = int(k.get("search_volume") or 0)
+        top.append((kw, vol))
+    if not top:
+        return []
+    # Sort by volume descending and cap to top 20 for the prompt.
+    top_sorted = sorted(top, key=lambda kv: kv[1], reverse=True)[:20]
+
+    lines = [f"- {kw} ({vol}/mo)" for kw, vol in top_sorted]
+    user_content = (
+        "For each of the following search keyword phrases, suggest exactly ONE concise, "
+        "one-sentence action the business owner should take to improve their SEO for that keyword.\n\n"
+        "List of keywords with approximate monthly search volume:\n"
+        + "\n".join(lines)
+        + "\n\n"
+        "Return a JSON array where each item has:\n"
+        "- \"keyword\": the original keyword phrase string\n"
+        "- \"suggestion\": one clear, actionable sentence describing what to do next.\n"
+        "Do not include any other fields or text."
+    )
+
+    system = (
+        "You are an SEO strategist. Given keyword phrases and their search volumes, "
+        "you propose highly practical, concrete actions the business can take to rank higher "
+        "for each keyword. Suggestions should be short (one sentence) and easy to do."
+    )
+
+    try:
+        client = _get_client("OPEN_AI_SEO_API_KEY")
+        model = _get_model()
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rstrip("`").strip()
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            return []
+        out: list[dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            kw = (item.get("keyword") or "").strip()
+            suggestion = (item.get("suggestion") or "").strip()
+            if kw and suggestion:
+                out.append({"keyword": kw, "suggestion": suggestion})
+        return out
+    except Exception:
+        return []
+
+
 def summarize_reviews_conversation(messages: list[ReviewsMessage]) -> str:
     """
     Ask OpenAI to summarize a Reviews conversation into concise memory notes.
