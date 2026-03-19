@@ -13,14 +13,15 @@ from typing import Any, Dict, List, Optional
 import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
+import re
 
 import json
 import math
 import requests
+from pathlib import Path
 from django.conf import settings
 
-from .models import BusinessProfile, SEOOverviewSnapshot, OnPageAuditSnapshot
-from .onpage_audit import run_onpage_audit_for_user
+from .models import BusinessProfile, SEOOverviewSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +37,353 @@ def _get_llm_keyword_candidates(profile: Optional[BusinessProfile], homepage_met
 BASE_URL = "https://api.dataforseo.com"
 DEBUG_LOG_PATH = "debug-098bfd.log"
 
+# Debug-mode instrumentation (runtime evidence) for ranking/null issues.
+# Use a relative path so it works in both local + containerized deployments
+# where the module path resolution may not map 1:1 to the host workspace.
+_BA84AE_LOG_PATH = Path("debug-ba84ae.log")
+
+
+def _dbg_ba84ae_log(
+    *,
+    hypothesisId: str,
+    location: str,
+    message: str,
+    data: Dict[str, Any] | None = None,
+    runId: str = "pre-fix",
+) -> None:
+    """Write a single NDJSON debug log line for this debug session."""
+    try:
+        logger.info(
+            "[ba84ae_debug] %s %s: %s",
+            hypothesisId,
+            runId,
+            message,
+        )
+        payload: Dict[str, Any] = {
+            "sessionId": "ba84ae",
+            "id": f"ba84ae_{hypothesisId}_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "runId": runId,
+            "hypothesisId": hypothesisId,
+        }
+        _BA84AE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_BA84AE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception as e:
+        # Never break production flows due to debug logging failures,
+        # but do emit the error to standard logs so we can diagnose why
+        # debug-ba84ae.log isn't being created.
+        try:
+            logger.exception("[ba84ae_debug] failed to write %s: %s", _BA84AE_LOG_PATH, e)
+        except Exception:
+            pass
+        return
+
 # Industries where broad local directories (Yelp, Angi, etc.) are relevant competitors.
 # For other niches (e.g. SaaS, resume tools), we do not use these defaults.
 _LOCAL_INDUSTRY_KEYWORDS = frozenset({
     "home services", "plumbing", "restaurant", "legal", "contractor",
     "cleaning", "landscaping", "roofing", "electrical", "hvac", "real estate",
 })
+
+# Competitor quality filter:
+# We exclude common aggregator/social/map/listing domains (Yelp/Facebook/etc.)
+# because they skew domain_intersection toward non-direct competitors.
+_EXCLUDED_COMPETITOR_DOMAIN_ROOTS = frozenset({
+    # Social / platforms
+    "facebook.com",
+    "instagram.com",
+    "tiktok.com",
+    "twitter.com",
+    "x.com",
+    "pinterest.com",
+    "linkedin.com",
+    # Directories / review aggregators
+    "yelp.com",
+    "thumbtack.com",
+    "angieslist.com",
+    "tripadvisor.com",
+    "yellowpages.com",
+    "mapquest.com",
+    # Other common aggregators/maps
+    "opentable.com",
+    "foursquare.com",
+    "waze.com",
+})
+
+_ADDRESS_TOKEN_EXCLUDE = frozenset({
+    "usa",
+    "us",
+    "united",
+    "states",
+    "america",
+    "county",
+    "state",
+    "province",
+    "city",
+    "town",
+    "region",
+    "district",
+})
+
+
+def _normalize_domain_value(domain_or_url: str | None) -> Optional[str]:
+    """Normalize competitor override values into a root domain."""
+    if not domain_or_url:
+        return None
+    # Accept either raw domain ("example.com") or URL ("https://example.com/path")
+    normalized = normalize_domain(str(domain_or_url).strip())
+    return normalized
+
+
+def _parse_domain_csv(raw: str | None) -> List[str]:
+    """Parse comma-separated domains into normalized unique root domains."""
+    if not raw:
+        return []
+    parts = [p.strip() for p in str(raw).split(",")]
+    out: List[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        if not p:
+            continue
+        d = _normalize_domain_value(p)
+        if not d:
+            continue
+        if d in seen:
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _is_excluded_competitor_domain(domain: str) -> bool:
+    d = (domain or "").lower().strip()
+    if not d:
+        return True
+    if d in _EXCLUDED_COMPETITOR_DOMAIN_ROOTS:
+        return True
+    # Defensive: treat subdomains of excluded roots as excluded too.
+    for root in _EXCLUDED_COMPETITOR_DOMAIN_ROOTS:
+        if root and (d == root or d.endswith("." + root)):
+            return True
+    return False
+
+
+def _extract_tokens_from_text(text: str, *, min_len: int = 3, max_tokens: int = 20) -> List[str]:
+    """
+    Extract lowercase word tokens usable for heuristic domain scoring.
+    """
+    if not text:
+        return []
+    t = text.lower()
+    tokens = re.split(r"[^a-z0-9]+", t)
+    out: List[str] = []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok or len(tok) < min_len:
+            continue
+        if tok in _ADDRESS_TOKEN_EXCLUDE:
+            continue
+        if tok.isdigit():
+            continue
+        if tok not in out:
+            out.append(tok)
+        if len(out) >= max_tokens:
+            break
+    return out
+
+
+def _format_company_name_or_url(*, domain: str | None, url: str | None) -> Optional[str]:
+    """
+    Prefer a readable company name from domain; fallback to URL.
+    """
+    d = (domain or "").strip().lower()
+    if d:
+        # Remove common prefixes/suffixes and title-case the brand-like part.
+        if d.startswith("www."):
+            d = d[4:]
+        host = d.split("/")[0].split(":")[0]
+        labels = [p for p in host.split(".") if p]
+        if labels:
+            core = labels[0]
+            core = core.replace("-", " ").replace("_", " ").strip()
+            if core:
+                words = [w for w in core.split() if w]
+                if words:
+                    return " ".join(w.capitalize() for w in words)
+
+    u = (url or "").strip()
+    if u:
+        return u
+    return None
+
+
+def _get_profile_for_user(user) -> Optional[BusinessProfile]:
+    try:
+        return (
+            BusinessProfile.objects.filter(user=user, is_main=True).first()
+            or BusinessProfile.objects.filter(user=user).first()
+        )
+    except Exception:
+        logger.exception("[SEO score] Failed to load BusinessProfile for competitor selection")
+        return None
+
+
+def _score_competitor_domain(
+    *,
+    competitor_domain: str,
+    target_domain: str,
+    niche_tokens: List[str],
+    geo_tokens: List[str],
+) -> float:
+    """
+    Heuristic scoring for competitor priority when multiple filtered candidates exist.
+    Keeps DataForSEO relevance order as a baseline; boosts same-niche & geo hints.
+    """
+    score = 0.0
+    d = (competitor_domain or "").lower()
+
+    if d.endswith(".com") and target_domain.endswith(".com"):
+        score += 0.1
+
+    if niche_tokens and any(t in d for t in niche_tokens):
+        score += 2.0
+
+    if geo_tokens and any(t in d for t in geo_tokens):
+        score += 1.0
+
+    return score
+
+
+def get_competitors_for_domain_intersection(
+    *,
+    domain: str,
+    location_code: int,
+    language_code: str,
+    user=None,
+    profile: Optional[BusinessProfile] = None,
+    limit: int = 5,
+    min_competitors: int = 3,
+) -> Dict[str, Any]:
+    """
+    Select competitor domains for domain_intersection/live using:
+    - per-profile overrides (preferred)
+    - DataForSEO competitors_domain/live auto-competitors (filtered + prioritized)
+    - manual fallback list from settings (if provided)
+
+    Returns both raw and filtered lists for debug logging.
+    """
+    _profile = profile or _get_profile_for_user(user)
+    industry_lower = ((_profile.industry or "").strip()).lower() if _profile else ""
+    business_address = ((_profile.business_address or "").strip()).lower() if _profile else ""
+
+    override_domains = _parse_domain_csv(getattr(_profile, "seo_competitor_domains_override", "") or "")
+
+    # Always fetch raw competitors so we can output debug evidence.
+    # Use a larger initial limit to allow for filtering down to "limit".
+    raw_competitor_candidates = _get_competitor_domains(
+        domain,
+        location_code=location_code,
+        language_code=language_code,
+        limit=min(max(limit * 2, limit + 2), 10),
+    )
+
+    # Filter out generic aggregators/social/map/listing domains.
+    filtered_auto: List[str] = []
+    for c in raw_competitor_candidates:
+        if not c:
+            continue
+        if c.lower().strip() == domain.lower().strip():
+            continue
+        if _is_excluded_competitor_domain(c):
+            continue
+        filtered_auto.append(c.lower().strip())
+
+    # Heuristic prioritization: same niche + possible geo hints inside the domain.
+    niche_tokens = _extract_tokens_from_text(industry_lower, min_len=3, max_tokens=20)
+    if any(k in industry_lower for k in ("dental", "dentist", "orthodont", "implan")):
+        # Expand dental-specific tokens (improves sorting on dental practice domains).
+        for t in ["dental", "dentist", "orthodont", "implant", "implants", "clinic", "care"]:
+            if t not in niche_tokens:
+                niche_tokens.append(t)
+    geo_tokens = _extract_tokens_from_text(business_address, min_len=3, max_tokens=10)
+
+    # Preserve original order as a fallback; score only as a tiebreak.
+    scored_auto: List[tuple[int, str, float]] = [
+        (
+            i,
+            c,
+            _score_competitor_domain(
+                competitor_domain=c,
+                target_domain=domain,
+                niche_tokens=niche_tokens,
+                geo_tokens=geo_tokens,
+            ),
+        )
+        for i, c in enumerate(filtered_auto)
+    ]
+    scored_auto.sort(key=lambda t: (-t[2], t[0]))
+    filtered_auto_prioritized = [c for _i, c, _s in scored_auto][:limit]
+
+    manual_raw = getattr(settings, "DATAFORSEO_MANUAL_COMPETITORS", "") or ""
+    manual_competitors = _parse_domain_csv(manual_raw)
+    manual_competitors = [c for c in manual_competitors if not _is_excluded_competitor_domain(c)][:limit]
+
+    competitor_domains_used: List[str] = []
+    competitor_source = "none"
+
+    if override_domains:
+        competitor_domains_used = override_domains[:limit]
+        competitor_source = "profile_override"
+    else:
+        if len(filtered_auto_prioritized) >= min_competitors:
+            competitor_domains_used = filtered_auto_prioritized
+            competitor_source = "filtered_auto"
+        elif manual_competitors:
+            # Too weak: prefer manual competitor list instead of generic directories.
+            competitor_domains_used = manual_competitors
+            competitor_source = "manual_fallback"
+        else:
+            competitor_domains_used = []
+            competitor_source = "insufficient_auto_after_filter"
+
+    # Debug logs: raw vs filtered.
+    try:
+        logger.info(
+            "[SEO competitors] domain=%s raw_competitors=%s filtered_auto=%s used=%s source=%s",
+            domain,
+            raw_competitor_candidates,
+            filtered_auto_prioritized,
+            competitor_domains_used,
+            competitor_source,
+        )
+    except Exception:
+        pass
+
+    _dbg_ba84ae_log(
+        hypothesisId="H7_competitor_filter",
+        location="accounts/dataforseo_utils.py:get_competitors_for_domain_intersection",
+        message="competitor selection evidence (raw->filtered->used)",
+        data={
+            "domain": domain,
+            "raw_competitors": raw_competitor_candidates,
+            "filtered_auto_prioritized": filtered_auto_prioritized,
+            "competitor_domains_used": competitor_domains_used,
+            "competitor_source": competitor_source,
+            "override_domains_count": len(override_domains),
+            "manual_competitors_count": len(manual_competitors),
+        },
+        runId="pre-fix",
+    )
+
+    return {
+        "raw_competitors": raw_competitor_candidates,
+        "filtered_competitors_used": competitor_domains_used,
+        "competitor_source": competitor_source,
+    }
 
 # Seed keywords come only from the LLM (generate_seo_keyword_candidates) and are
 # validated via DataForSEO search volume; no fixed industry/generic seed data.
@@ -396,6 +738,29 @@ def _ctr_for_position(position: int) -> float:
     return 0.002
 
 
+def _estimate_missed_searches_monthly(search_volume: float, rank: Optional[int]) -> int:
+    """
+    Estimate how many monthly searches are *not* expected to click the business site.
+
+    Uses the same CTR curve as the overall visibility/SEO score, so per-keyword
+    missed-search math stays consistent with the snapshot-level "missed_searches_monthly".
+    """
+    try:
+        sv = max(float(search_volume or 0.0), 0.0)
+    except (TypeError, ValueError):
+        sv = 0.0
+    if sv <= 0:
+        return 0
+
+    if rank is None or rank <= 0:
+        # If we don't have a rank, assume 0% CTR for that snippet.
+        return int(round(sv))
+
+    ctr = _ctr_for_position(int(rank))
+    estimated_clicks = sv * ctr
+    return int(round(max(0.0, sv - estimated_clicks)))
+
+
 def _extract_keyword_difficulty(keyword_info: Dict[str, Any]) -> Optional[float]:
     """
     Extract a difficulty / competition score from DataForSEO keyword_info.
@@ -719,16 +1084,36 @@ def get_keyword_gap_keywords(
                             or item.get("sum_search_volume")
                         )
 
-                        # For each keyword, keep track of competitor URLs and
-                        # ranks for the competitor side of the intersection.
-                        serp_el = item.get("second_domain_serp_element") or item.get("first_domain_serp_element") or {}
+                        # For each keyword we want:
+                        # - our (target1) rank (first_domain_serp_element)
+                        # - competitor rank (second_domain_serp_element)
+                        # The UI needs "You rank #X" plus missed-search estimates.
+                        your_serp_el = item.get("first_domain_serp_element") or {}
+                        comp_serp_el = item.get("second_domain_serp_element") or {}
+
+                        your_rank = your_serp_el.get("rank_absolute")
+                        your_url = your_serp_el.get("url") or ""
+                        your_domain = (
+                            your_serp_el.get("main_domain")
+                            or your_serp_el.get("domain")
+                            or target_domain
+                        )
+
                         comp_domain = (
-                            serp_el.get("main_domain")
-                            or serp_el.get("domain")
+                            comp_serp_el.get("main_domain")
+                            or comp_serp_el.get("domain")
                             or competitor
                         )
-                        comp_url = serp_el.get("url") or ""
-                        comp_rank = serp_el.get("rank_absolute")
+                        comp_url = comp_serp_el.get("url") or ""
+                        comp_rank = comp_serp_el.get("rank_absolute")
+
+                        try:
+                            your_rank_int: Optional[int] = int(your_rank) if your_rank is not None else None
+                        except (TypeError, ValueError):
+                            your_rank_int = None
+
+                        if your_rank_int is not None and your_rank_int <= 0:
+                            your_rank_int = None
 
                         existing = aggregated.get(kw)
                         if existing is None:
@@ -741,10 +1126,22 @@ def get_keyword_gap_keywords(
                                         "rank": comp_rank,
                                     },
                                 )
+                            top_competitor = _format_company_name_or_url(
+                                domain=comp_domain,
+                                url=comp_url,
+                            )
+                            top_competitor_domain = comp_domain or None
+                            top_competitor_rank = comp_rank
                             aggregated[kw] = {
                                 "keyword": kw,
                                 "search_volume": search_volume,
+                                "your_domain": your_domain,
+                                "your_url": your_url,
+                                "your_rank": your_rank_int,
                                 "competitors": competitors_list,
+                                "top_competitor": top_competitor,
+                                "top_competitor_domain": top_competitor_domain,
+                                "top_competitor_rank": top_competitor_rank,
                             }
                         else:
                             # Keep the highest search volume we have seen.
@@ -752,6 +1149,16 @@ def get_keyword_gap_keywords(
                             curr_sv = search_volume or 0
                             if curr_sv > prev_sv:
                                 existing["search_volume"] = search_volume
+
+                            # Keep the best (lowest) rank we have seen for the target.
+                            prev_your_rank = existing.get("your_rank")
+                            if your_rank_int is not None:
+                                if prev_your_rank is None or (
+                                    isinstance(prev_your_rank, int) and your_rank_int < prev_your_rank
+                                ):
+                                    existing["your_rank"] = your_rank_int
+                                    if your_url:
+                                        existing["your_url"] = your_url
 
                             # Merge competitor URLs, keeping at most 3 per keyword,
                             # preferring better (lower) ranks.
@@ -776,6 +1183,22 @@ def get_keyword_gap_keywords(
                                 )
                                 if len(existing_list) > 3:
                                     del existing_list[3:]
+
+                            # Refresh top competitor after merge/sort.
+                            best_comp = None
+                            try:
+                                comps = existing.get("competitors") or []
+                                if comps:
+                                    best_comp = comps[0]
+                            except Exception:
+                                best_comp = None
+                            if best_comp:
+                                existing["top_competitor"] = _format_company_name_or_url(
+                                    domain=best_comp.get("domain"),
+                                    url=best_comp.get("url"),
+                                )
+                                existing["top_competitor_domain"] = best_comp.get("domain")
+                                existing["top_competitor_rank"] = best_comp.get("rank")
 
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception(
@@ -957,11 +1380,29 @@ def fetch_ranked_keyword_items(
         payload,
     )
     ranked_data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
+    _dbg_ba84ae_log(
+        hypothesisId="H0_ranked_keywords_request_response",
+        location="accounts/dataforseo_utils.py:fetch_ranked_keyword_items",
+        message="ranked_keywords response received",
+        data={
+            "domain": domain,
+            "has_ranked_data": ranked_data is not None,
+            "top_level_has_tasks": bool((ranked_data or {}).get("tasks")),
+        },
+        runId="pre-fix",
+    )
     if not ranked_data:
         logger.warning(
             "[SEO score] ranked_keywords returned no data for user_id=%s domain=%s",
             getattr(user, "id", None),
             domain,
+        )
+        _dbg_ba84ae_log(
+            hypothesisId="H0_ranked_keywords_no_data",
+            location="accounts/dataforseo_utils.py:fetch_ranked_keyword_items",
+            message="ranked_keywords: ranked_data falsy/None; returning []",
+            data={"domain": domain},
+            runId="pre-fix",
         )
         try:
             with open(DEBUG_LOG_PATH, "a") as f:
@@ -997,6 +1438,7 @@ def fetch_ranked_keyword_items(
         if items:
             preview = {
                 "rank_absolute": items[0].get("rank_absolute"),
+                "rank_group": items[0].get("rank_group"),
                 "search_volume": (
                     ((items[0].get("keyword_data") or {}).get("keyword_info") or {}).get("search_volume")
                     or items[0].get("search_volume")
@@ -1009,8 +1451,37 @@ def fetch_ranked_keyword_items(
                 domain,
                 preview,
             )
+
+            # Debug evidence: are rank fields present in the raw DataForSEO response?
+            _dbg_ba84ae_log(
+                hypothesisId="H1_rank_fields_present_in_ranked_keywords",
+                location="accounts/dataforseo_utils.py:fetch_ranked_keyword_items",
+                message="raw ranked_keywords rank fields sample",
+                data={
+                    "domain": domain,
+                    "total_items": len(items),
+                    "first_item": {
+                        "rank_absolute": items[0].get("rank_absolute"),
+                        "rank_group": items[0].get("rank_group"),
+                        "keyword": (items[0].get("keyword_data") or {}).get("keyword")
+                        or items[0].get("keyword"),
+                        "search_volume": (
+                            ((items[0].get("keyword_data") or {}).get("keyword_info") or {}).get("search_volume")
+                            or items[0].get("search_volume")
+                        ),
+                    },
+                },
+                runId="pre-fix",
+            )
         return items
     except Exception as exc:
+        _dbg_ba84ae_log(
+            hypothesisId="H0_ranked_keywords_parse_exception",
+            location="accounts/dataforseo_utils.py:fetch_ranked_keyword_items",
+            message="ranked_keywords parsing exception; returning []",
+            data={"domain": domain, "exc_type": type(exc).__name__, "exc_msg": str(exc)[:200]},
+            runId="pre-fix",
+        )
         logger.exception(
             "[SEO score] Error parsing ranked_keywords for user_id=%s domain=%s raw_preview=%s",
             getattr(user, "id", None),
@@ -1034,6 +1505,9 @@ def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     difficulties: List[float] = []
     total_search_volume = 0.0
     top_keywords: List[Dict[str, Any]] = []
+    rank_int_none_count = 0
+    rank_int_positive_count = 0
+    rank_int_other_count = 0
 
     for item in items:
         rank = item.get("rank_absolute") or item.get("rank_group")
@@ -1041,6 +1515,13 @@ def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             rank_int = int(rank) if rank is not None else None
         except (TypeError, ValueError):
             rank_int = None
+
+        if rank_int is None:
+            rank_int_none_count += 1
+        elif rank_int > 0:
+            rank_int_positive_count += 1
+        else:
+            rank_int_other_count += 1
 
         keyword_data = item.get("keyword_data") or {}
         kw_info = keyword_data.get("keyword_info") or {}
@@ -1064,11 +1545,29 @@ def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         if keyword_text and sv > 0:
             if rank_int is not None and rank_int > 0:
                 top_keywords.append(
-                    {"keyword": str(keyword_text), "search_volume": int(sv), "rank": int(rank_int)}
+                    {
+                        "keyword": str(keyword_text),
+                        "search_volume": int(sv),
+                        "rank": int(rank_int),
+                        "missed_searches_monthly": _estimate_missed_searches_monthly(sv, rank_int),
+                        "top_competitor": None,
+                        "top_competitor_domain": None,
+                        "top_competitor_rank": None,
+                        "competitors": [],
+                    }
                 )
             elif rank_int is None and sv >= MIN_SEARCH_VOLUME:
                 top_keywords.append(
-                    {"keyword": str(keyword_text), "search_volume": int(sv), "rank": None}
+                    {
+                        "keyword": str(keyword_text),
+                        "search_volume": int(sv),
+                        "rank": None,
+                        "missed_searches_monthly": _estimate_missed_searches_monthly(sv, None),
+                        "top_competitor": None,
+                        "top_competitor_domain": None,
+                        "top_competitor_rank": None,
+                        "competitors": [],
+                    }
                 )
 
         if rank_int is not None and rank_int > 0 and sv > 0:
@@ -1084,6 +1583,23 @@ def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             difficulties.append(diff)
 
     avg_difficulty = sum(difficulties) / len(difficulties) if difficulties else None
+
+    # Debug evidence: how often does DataForSEO give us rank values?
+    _dbg_ba84ae_log(
+        hypothesisId="H1_compute_ranked_metrics_rank_int_distribution",
+        location="accounts/dataforseo_utils.py:compute_ranked_metrics",
+        message="rank_int distribution for ranked_keywords items",
+        data={
+            "total_items": len(items),
+            "rank_int_none_count": rank_int_none_count,
+            "rank_int_positive_count": rank_int_positive_count,
+            "rank_int_other_count": rank_int_other_count,
+            "top_keywords_total": len(top_keywords),
+            "top_keywords_with_rank": sum(1 for k in top_keywords if k.get("rank") is not None),
+            "top_keywords_rank_positive": sum(1 for k in top_keywords if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0),
+        },
+        runId="pre-fix",
+    )
     return {
         "estimated_traffic": estimated_traffic,
         "keywords_ranking": keywords_ranking,
@@ -1103,12 +1619,7 @@ def enrich_with_gap_keywords(
     top_keywords: List[Dict[str, Any]],
 ) -> None:
     """Append gap keywords (vs competitors) to top_keywords in place. Preserves logging on error."""
-    competitor_domains = _get_competitor_domains(
-        domain,
-        location_code=location_code,
-        language_code=language_code,
-        limit=5,
-    )
+    rank_non_null_before = sum(1 for k in top_keywords if k.get("rank") is not None)
     try:
         _profile = (
             BusinessProfile.objects.filter(user=user, is_main=True).first()
@@ -1116,18 +1627,42 @@ def enrich_with_gap_keywords(
         )
     except Exception:
         _profile = None
-    industry_lower = ((_profile.industry or "").strip()).lower() if _profile else ""
-    if not competitor_domains and industry_lower in _LOCAL_INDUSTRY_KEYWORDS:
-        raw_competitors = getattr(
-            settings,
-            "DATAFORSEO_DEFAULT_COMPETITORS",
-            "yelp.com,angi.com,thumbtack.com,homeadvisor.com",
-        )
-        competitor_domains = [c.strip() for c in str(raw_competitors).split(",") if c.strip()]
+    competitor_selection = get_competitors_for_domain_intersection(
+        domain=domain,
+        location_code=location_code,
+        language_code=language_code,
+        user=user,
+        profile=_profile,
+        limit=5,
+        min_competitors=int(getattr(settings, "DATAFORSEO_MIN_COMPETITORS_FOR_GAP", 2)),
+    )
+    competitor_domains = competitor_selection.get("filtered_competitors_used") or []
 
     existing_keys = {str(k.get("keyword", "")).lower() for k in top_keywords if k.get("keyword")}
+    existing_by_key: Dict[str, Dict[str, Any]] = {
+        str(k.get("keyword", "")).lower(): k for k in top_keywords if k.get("keyword")
+    }
 
     if not competitor_domains:
+        rank_non_null_after = sum(1 for k in top_keywords if k.get("rank") is not None)
+        logger.warning(
+            "[SEO score] No quality competitors for domain_intersection. domain=%s rank_non_null_before=%s rank_non_null_after=%s",
+            domain,
+            rank_non_null_before,
+            rank_non_null_after,
+        )
+        _dbg_ba84ae_log(
+            hypothesisId="H8_competitor_filter_no_competitors",
+            location="accounts/dataforseo_utils.py:enrich_with_gap_keywords",
+            message="no competitor domains after quality filter/override; skipping domain_intersection enrichment",
+            data={
+                "domain": domain,
+                "rank_non_null_before": rank_non_null_before,
+                "rank_non_null_after": rank_non_null_after,
+                "competitor_source": competitor_selection.get("competitor_source"),
+            },
+            runId="pre-fix",
+        )
         return
     try:
         gap_items = get_keyword_gap_keywords(
@@ -1137,13 +1672,17 @@ def enrich_with_gap_keywords(
             language_code=language_code,
             limit=50,
         )
+        gap_items_processed = 0
+        gap_items_with_rank = 0
+        gap_items_without_rank = 0
+        gap_items_existing_key_with_rank = 0
+        gap_items_existing_key_rank_updated = 0
         for item in gap_items:
             kw = item.get("keyword")
             if not kw:
                 continue
             key_lower = str(kw).lower()
-            if key_lower in existing_keys:
-                continue
+            existing_entry = existing_by_key.get(key_lower)
             sv_gap = item.get("search_volume") or 0
             try:
                 sv_gap_f = float(sv_gap)
@@ -1151,15 +1690,261 @@ def enrich_with_gap_keywords(
                 sv_gap_f = 0.0
             if sv_gap_f <= 0:
                 continue
+
+            # domain_intersection includes our own rank (first_domain_serp_element)
+            # when intersections=true; use it so the UI can show "You rank #X".
+            your_rank = item.get("your_rank")
+            try:
+                your_rank_int: Optional[int] = int(your_rank) if your_rank is not None else None
+            except (TypeError, ValueError):
+                your_rank_int = None
+            if your_rank_int is not None and your_rank_int <= 0:
+                your_rank_int = None
+
+            missed = _estimate_missed_searches_monthly(sv_gap_f, your_rank_int)
+
+            gap_items_processed += 1
+            if your_rank_int is not None and your_rank_int > 0:
+                gap_items_with_rank += 1
+            else:
+                gap_items_without_rank += 1
+            if existing_entry is not None:
+                # If the keyword already exists but we previously had rank=null,
+                # overwrite it with the gap-provided rank (when available).
+                if your_rank_int is not None and your_rank_int > 0:
+                    gap_items_existing_key_with_rank += 1
+                    try:
+                        existing_rank = existing_entry.get("rank")
+                        existing_rank_int = int(existing_rank) if existing_rank is not None else None
+                    except (TypeError, ValueError):
+                        existing_rank_int = None
+
+                    if existing_rank_int is None or (existing_rank_int is not None and existing_rank_int > your_rank_int):
+                        existing_entry["rank"] = your_rank_int
+                        existing_entry["missed_searches_monthly"] = missed
+                        if sv_gap_f > (existing_entry.get("search_volume") or 0):
+                            existing_entry["search_volume"] = int(sv_gap_f)
+                        top_comp = item.get("top_competitor")
+                        if top_comp:
+                            existing_entry["top_competitor"] = top_comp
+                        existing_entry["top_competitor_domain"] = item.get("top_competitor_domain")
+                        existing_entry["top_competitor_rank"] = item.get("top_competitor_rank")
+                        gap_competitors = item.get("competitors")
+                        if isinstance(gap_competitors, list):
+                            existing_entry["competitors"] = gap_competitors[:3]
+                        gap_items_existing_key_rank_updated += 1
+                continue
+
             top_keywords.append(
-                {"keyword": str(kw), "search_volume": int(sv_gap_f), "rank": None}
+                {
+                    "keyword": str(kw),
+                    "search_volume": int(sv_gap_f),
+                    "rank": your_rank_int,
+                    "missed_searches_monthly": missed,
+                    "top_competitor": item.get("top_competitor"),
+                    "top_competitor_domain": item.get("top_competitor_domain"),
+                    "top_competitor_rank": item.get("top_competitor_rank"),
+                    "competitors": (item.get("competitors") or [])[:3],
+                }
             )
             existing_keys.add(key_lower)
+
+        _dbg_ba84ae_log(
+            hypothesisId="H4_domain_intersection_your_rank_parsing",
+            location="accounts/dataforseo_utils.py:enrich_with_gap_keywords",
+            message="gap keyword rank availability (target1 SERP rank)",
+            data={
+                "domain": domain,
+                "competitor_domains_count": len(competitor_domains),
+                "gap_items_total": len(gap_items),
+                "gap_items_processed": gap_items_processed,
+                "gap_items_with_rank": gap_items_with_rank,
+                "gap_items_without_rank": gap_items_without_rank,
+                "gap_items_existing_key_with_rank": gap_items_existing_key_with_rank,
+                "gap_items_existing_key_rank_updated": gap_items_existing_key_rank_updated,
+            },
+            runId="pre-fix",
+        )
     except Exception:
         logger.exception(
             "[SEO score] Error while enriching top_keywords with gap keywords for domain=%s",
             domain,
         )
+    finally:
+        rank_non_null_after = sum(1 for k in top_keywords if k.get("rank") is not None)
+        try:
+            _dbg_ba84ae_log(
+                hypothesisId="H9_rank_non_null_before_after_enrichment",
+                location="accounts/dataforseo_utils.py:enrich_with_gap_keywords",
+                message="keyword rank non-null coverage before/after gap enrichment",
+                data={
+                    "domain": domain,
+                    "rank_non_null_before": rank_non_null_before,
+                    "rank_non_null_after": rank_non_null_after,
+                },
+                runId="pre-fix",
+            )
+        except Exception:
+            pass
+        logger.info(
+            "[SEO score] Gap enrichment rank non-null coverage domain=%s before=%s after=%s",
+            domain,
+            rank_non_null_before,
+            rank_non_null_after,
+        )
+
+
+def _best_rank_from_ranked_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Build keyword -> best rank map from ranked_keywords/live items.
+    """
+    ranked_map: Dict[str, int] = {}
+    for item in items:
+        keyword_data = item.get("keyword_data") or {}
+        keyword_text = (keyword_data.get("keyword") or item.get("keyword") or "").strip()
+        if not keyword_text:
+            continue
+        raw_rank = item.get("rank_absolute") or item.get("rank_group")
+        try:
+            rank_int = int(raw_rank) if raw_rank is not None else None
+        except (TypeError, ValueError):
+            rank_int = None
+        if rank_int is None or rank_int <= 0:
+            continue
+        key = keyword_text.lower()
+        prev = ranked_map.get(key)
+        if prev is None or rank_int < prev:
+            ranked_map[key] = rank_int
+    return ranked_map
+
+
+def enrich_keyword_ranks_from_labs(
+    *,
+    domain: str,
+    location_code: int,
+    language_code: str,
+    top_keywords: List[Dict[str, Any]],
+    user=None,
+) -> Dict[str, int]:
+    """
+    Enrich existing top_keywords rank values using Labs APIs:
+    - ranked_keywords/live (rank_absolute/rank_group)
+    - domain_intersection/live (your_rank via first_domain_serp_element)
+
+    Keeps search_volume source unchanged; only fills/updates rank + missed searches.
+    Returns enrichment stats for coverage checks/logging.
+    """
+    if not top_keywords:
+        return {
+            "total": 0,
+            "null_before": 0,
+            "non_null_after": 0,
+            "filled_from_ranked": 0,
+            "filled_from_gap": 0,
+        }
+
+    total = len(top_keywords)
+    null_before = sum(1 for k in top_keywords if k.get("rank") is None)
+
+    ranked_items = fetch_ranked_keyword_items(
+        domain=domain,
+        location_code=location_code,
+        language_code=language_code,
+        user=user,
+    )
+    ranked_map = _best_rank_from_ranked_items(ranked_items)
+    filled_from_ranked = 0
+    filled_from_gap = 0
+
+    for row in top_keywords:
+        kw = str(row.get("keyword", "")).strip().lower()
+        if not kw:
+            continue
+        if kw not in ranked_map:
+            continue
+        rank_int = ranked_map[kw]
+        existing_rank = row.get("rank")
+        try:
+            existing_rank_int = int(existing_rank) if existing_rank is not None else None
+        except (TypeError, ValueError):
+            existing_rank_int = None
+        if existing_rank_int is None or existing_rank_int <= 0 or rank_int < existing_rank_int:
+            row["rank"] = rank_int
+            try:
+                sv = float(row.get("search_volume") or 0)
+            except (TypeError, ValueError):
+                sv = 0.0
+            row["missed_searches_monthly"] = _estimate_missed_searches_monthly(sv, rank_int)
+            filled_from_ranked += 1
+
+    unresolved_keywords = []
+    for row in top_keywords:
+        if row.get("rank") is None:
+            kw = str(row.get("keyword", "")).strip()
+            if kw:
+                unresolved_keywords.append(kw.lower())
+
+    if unresolved_keywords:
+        competitor_selection = get_competitors_for_domain_intersection(
+            domain=domain,
+            location_code=location_code,
+            language_code=language_code,
+            user=user,
+            profile=None,
+            limit=5,
+            min_competitors=int(getattr(settings, "DATAFORSEO_MIN_COMPETITORS_FOR_GAP", 2)),
+        )
+        competitor_domains = competitor_selection.get("filtered_competitors_used") or []
+        if competitor_domains:
+            gap_items = get_keyword_gap_keywords(
+                domain,
+                competitor_domains,
+                location_code=location_code,
+                language_code=language_code,
+                limit=100,
+            )
+            gap_rank_map: Dict[str, int] = {}
+            for item in gap_items:
+                kw = str(item.get("keyword") or "").strip().lower()
+                if not kw:
+                    continue
+                raw_rank = item.get("your_rank")
+                try:
+                    rank_int = int(raw_rank) if raw_rank is not None else None
+                except (TypeError, ValueError):
+                    rank_int = None
+                if rank_int is None or rank_int <= 0:
+                    continue
+                prev = gap_rank_map.get(kw)
+                if prev is None or rank_int < prev:
+                    gap_rank_map[kw] = rank_int
+
+            if gap_rank_map:
+                for row in top_keywords:
+                    if row.get("rank") is not None:
+                        continue
+                    kw = str(row.get("keyword", "")).strip().lower()
+                    rank_int = gap_rank_map.get(kw)
+                    if rank_int is None:
+                        continue
+                    row["rank"] = rank_int
+                    try:
+                        sv = float(row.get("search_volume") or 0)
+                    except (TypeError, ValueError):
+                        sv = 0.0
+                    row["missed_searches_monthly"] = _estimate_missed_searches_monthly(sv, rank_int)
+                    filled_from_gap += 1
+
+    non_null_after = sum(
+        1 for k in top_keywords if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0
+    )
+    return {
+        "total": total,
+        "null_before": null_before,
+        "non_null_after": non_null_after,
+        "filled_from_ranked": filled_from_ranked,
+        "filled_from_gap": filled_from_gap,
+    }
 
 
 def enrich_with_llm_keywords(
@@ -1183,25 +1968,131 @@ def enrich_with_llm_keywords(
     except Exception:
         pass
     try:
+        # Build a quick lookup of existing ranked keywords so we can
+        # reuse their rank/volume for very similar brand phrases.
+        existing_by_key: Dict[str, Dict[str, Any]] = {}
+        for k in top_keywords:
+            kw_text = str(k.get("keyword", "")).strip()
+            if not kw_text:
+                continue
+            existing_by_key[kw_text.lower()] = k
+
         llm_candidates = _get_llm_keyword_candidates(_profile, homepage_meta)
         filtered_candidates: List[str] = []
+        seen_llm: set[str] = set()
         for phrase in (llm_candidates or []):
             p = (phrase or "").strip()[:50]
-            if not p or p.lower() in existing_keys:
+            if not p:
                 continue
+            p_lower = p.lower()
+            if p_lower in seen_llm:
+                continue
+            seen_llm.add(p_lower)
             if not _is_search_like(p, allow_one_stopword=True):
                 continue
             filtered_candidates.append(p)
         if filtered_candidates:
+            # Use DataForSEO volumes, but also try to align brand phrases
+            # to any existing ranked keyword variant (e.g. "white pine dental"
+            # vs "white pine dental care") so we don't falsely mark them
+            # as not ranking.
             volumes = _get_search_volumes_for_keywords(filtered_candidates, location_code)
             for phrase in filtered_candidates:
                 key_lower = phrase.lower()
+                existing_entry = existing_by_key.get(key_lower)
+
+                # Try to find a very similar existing keyword variant: either
+                # the candidate is contained within an existing keyword or vice versa.
+                # Skip exact match so we don't "match to itself" when rank is null.
+                best_match: Optional[Dict[str, Any]] = None
+                for ek_lower, ek in existing_by_key.items():
+                    if ek_lower == key_lower:
+                        continue
+                    if key_lower in ek_lower or ek_lower in key_lower:
+                        best_match = ek
+                        break
+
+                if key_lower in existing_keys:
+                    # Keyword already exists in top_keywords.
+                    # If it currently has no rank, but we found a similar variant
+                    # that DOES have rank, update this entry.
+                    if existing_entry is not None:
+                        existing_rank = existing_entry.get("rank")
+                        try:
+                            existing_rank_int: Optional[int] = (
+                                int(existing_rank) if existing_rank is not None else None
+                            )
+                        except (TypeError, ValueError):
+                            existing_rank_int = None
+
+                        if (existing_rank_int is None or existing_rank_int <= 0) and best_match is not None:
+                            rank_existing = best_match.get("rank")
+                            try:
+                                rank_int = int(rank_existing) if rank_existing is not None else None
+                            except (TypeError, ValueError):
+                                rank_int = None
+
+                            if rank_int is not None and rank_int > 0:
+                                sv_existing = int(best_match.get("search_volume") or 0)
+                                missed = _estimate_missed_searches_monthly(sv_existing, rank_int)
+                                existing_entry["rank"] = rank_int
+                                existing_entry["search_volume"] = sv_existing
+                                existing_entry["missed_searches_monthly"] = missed
+                                if best_match.get("top_competitor") is not None:
+                                    existing_entry["top_competitor"] = best_match.get("top_competitor")
+                                if best_match.get("top_competitor_domain") is not None:
+                                    existing_entry["top_competitor_domain"] = best_match.get("top_competitor_domain")
+                                if best_match.get("top_competitor_rank") is not None:
+                                    existing_entry["top_competitor_rank"] = best_match.get("top_competitor_rank")
+                                if isinstance(best_match.get("competitors"), list):
+                                    existing_entry["competitors"] = (best_match.get("competitors") or [])[:3]
+                    continue
+
+                if best_match is not None:
+                    # Candidate keyword does not exist yet: add it by reusing the
+                    # similar existing keyword's rank and volume so the UI shows
+                    # "You rank #X" for the brand phrase variant.
+                    sv_existing = int(best_match.get("search_volume") or 0)
+                    rank_existing = best_match.get("rank")
+                    try:
+                        rank_int = int(rank_existing) if rank_existing is not None else None
+                    except (TypeError, ValueError):
+                        rank_int = None
+                    missed = _estimate_missed_searches_monthly(sv_existing, rank_int)
+                    top_keywords.append(
+                        {
+                            "keyword": phrase,
+                            "search_volume": sv_existing,
+                            "rank": rank_int,
+                            "missed_searches_monthly": missed,
+                            "top_competitor": best_match.get("top_competitor"),
+                            "top_competitor_domain": best_match.get("top_competitor_domain"),
+                            "top_competitor_rank": best_match.get("top_competitor_rank"),
+                            "competitors": (best_match.get("competitors") or [])[:3]
+                            if isinstance(best_match.get("competitors"), list)
+                            else [],
+                        }
+                    )
+                    existing_keys.add(key_lower)
+                    continue
+
+                # Fallback: use DataForSEO volume for this exact phrase with no rank.
                 vol = volumes.get(key_lower, 0)
                 if vol <= 0:
                     continue
-                if key_lower in existing_keys:
-                    continue
-                top_keywords.append({"keyword": phrase, "search_volume": int(vol), "rank": None})
+                missed = _estimate_missed_searches_monthly(vol, None)
+                top_keywords.append(
+                    {
+                        "keyword": phrase,
+                        "search_volume": int(vol),
+                        "rank": None,
+                        "missed_searches_monthly": missed,
+                        "top_competitor": None,
+                        "top_competitor_domain": None,
+                        "top_competitor_rank": None,
+                        "competitors": [],
+                    }
+                )
                 existing_keys.add(key_lower)
     except Exception:
         logger.exception(
@@ -1336,7 +2227,6 @@ def generate_or_get_next_steps(
 
 def build_seo_response(
     *,
-    onpage_snapshot: Optional[Any],
     search_performance_score: int,
     organic_visitors: int,
     total_search_volume: int,
@@ -1348,21 +2238,14 @@ def build_seo_response(
     seo_next_steps: Optional[List[Any]] = None,
     enrichment_status: str = "complete",
 ) -> Dict[str, Any]:
-    """Build the final API response dict from on-page snapshot and SEO metrics. Numeric safety: int(x or 0)."""
-    onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
-    technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
-    pages_audited = onpage_snapshot.pages_audited if onpage_snapshot else 0
-    onpage_issue_summaries = onpage_snapshot.issue_summaries if onpage_snapshot else {}
-    overall = int(round(
-        search_performance_score * 0.5 + onpage_score * 0.3 + technical_score * 0.2
-    ))
+    """Build the SEO overview API payload.
+
+    On-page/technical audit is intentionally disabled to avoid DataForSEO On-Page costs.
+    """
+    overall = int(search_performance_score or 0)
     return {
         "seo_score": overall,
         "search_performance_score": int(search_performance_score or 0),
-        "onpage_seo_score": int(onpage_score or 0),
-        "technical_seo_score": int(technical_score or 0),
-        "pages_audited": int(pages_audited or 0),
-        "onpage_issue_summaries": onpage_issue_summaries,
         "organic_visitors": int(organic_visitors or 0),
         "total_search_volume": int(total_search_volume or 0),
         "keywords_ranking": int(keywords_ranking or 0),
@@ -1376,14 +2259,12 @@ def build_seo_response(
 
 
 def _build_empty_seo_response(user, site_url: str) -> Dict[str, Any]:
-    """Build zeroed SEO response when no ranked data; attaches on-page snapshot."""
+    """Build zeroed SEO response when no ranked data."""
     fallback_score = compute_professional_seo_score(
         estimated_traffic=0.0, keywords_count=0, top3_positions=0, top10_positions=0,
         avg_keyword_difficulty=None, competitor_avg_traffic=0.0,
     )
-    onpage_snapshot = run_onpage_audit_for_user(user, site_url)
     return build_seo_response(
-        onpage_snapshot=onpage_snapshot,
         search_performance_score=fallback_score,
         organic_visitors=0, total_search_volume=0, keywords_ranking=0, top3_positions=0,
         search_visibility_percent=0, missed_searches_monthly=0, top_keywords=[], seo_next_steps=[],
@@ -1410,6 +2291,7 @@ def get_or_refresh_seo_score_for_user(
     user,
     *,
     site_url: str | None,
+    force_refresh: bool = False,
 ) -> Dict[str, Any] | None:
     """
     Fetch a cached, professional-grade SEO score + core metrics for the given user,
@@ -1442,15 +2324,41 @@ def get_or_refresh_seo_score_for_user(
         return None
 
     snapshot = get_cached_seo_snapshot(user, domain, start_current, cache_ttl, now_utc)
-    if snapshot:
-        onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+    if snapshot and not force_refresh:
+        try:
+            cached_keywords = getattr(snapshot, "top_keywords", None) or []
+            cached_rank_positive = sum(
+                1 for k in cached_keywords if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0
+            )
+            cached_rank_none = sum(1 for k in cached_keywords if k.get("rank") is None)
+            refreshed_at = getattr(snapshot, "refreshed_at", None)
+            age_sec = None
+            if refreshed_at:
+                try:
+                    age_sec = (now_utc - refreshed_at).total_seconds()
+                except Exception:
+                    age_sec = None
+            _dbg_ba84ae_log(
+                hypothesisId="H2_cache_hit_serves_null_ranks",
+                location="accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
+                message="cache hit: serving snapshot (rank evidence)",
+                data={
+                    "domain": domain,
+                    "top_keywords_count": len(cached_keywords),
+                    "rank_positive_count": cached_rank_positive,
+                    "rank_none_count": cached_rank_none,
+                    "age_sec": age_sec,
+                },
+                runId="pre-fix",
+            )
+        except Exception:
+            pass
         enrichment_status = "complete" if (
             getattr(snapshot, "keywords_enriched_at", None)
             and getattr(snapshot, "seo_next_steps_refreshed_at", None)
             and getattr(snapshot, "keyword_action_suggestions_refreshed_at", None)
         ) else "pending"
         return build_seo_response(
-            onpage_snapshot=onpage_snapshot,
             search_performance_score=int(snapshot.search_performance_score or 0),
             organic_visitors=int(snapshot.organic_visitors or 0),
             total_search_volume=int(getattr(snapshot, "total_search_volume", 0) or 0),
@@ -1463,6 +2371,13 @@ def get_or_refresh_seo_score_for_user(
             enrichment_status=enrichment_status,
         )
 
+    _dbg_ba84ae_log(
+        hypothesisId="H2_cache_miss_about_to_call_ranked_keywords",
+        location="accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
+        message="cache miss: will call ranked_keywords/live",
+        data={"domain": domain},
+        runId="pre-fix",
+    )
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
     items = fetch_ranked_keyword_items(domain, location_code, language_code, user)
@@ -1514,9 +2429,7 @@ def get_or_refresh_seo_score_for_user(
         except Exception as e:
             logger.warning("[SEO score] Could not enqueue enrichment tasks: %s", e)
 
-    onpage_snapshot = run_onpage_audit_for_user(user, site_url)
     return build_seo_response(
-        onpage_snapshot=onpage_snapshot,
         search_performance_score=int(visibility["search_performance_score"] or 0),
         organic_visitors=int(round(metrics["estimated_traffic"]) or 0),
         total_search_volume=int(visibility["total_search_volume"] or 0),

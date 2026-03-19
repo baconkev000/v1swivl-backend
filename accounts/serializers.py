@@ -18,10 +18,6 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(source="user.email", read_only=True)
     seo_score = serializers.SerializerMethodField()
     search_performance_score = serializers.SerializerMethodField()
-    onpage_seo_score = serializers.SerializerMethodField()
-    technical_seo_score = serializers.SerializerMethodField()
-    pages_audited = serializers.SerializerMethodField()
-    onpage_issue_summaries = serializers.SerializerMethodField()
     search_visibility_percent = serializers.SerializerMethodField()
     missed_searches_monthly = serializers.SerializerMethodField()
     total_search_volume = serializers.SerializerMethodField()
@@ -30,6 +26,10 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     seo_next_steps = serializers.SerializerMethodField()
     keyword_action_suggestions = serializers.SerializerMethodField()
     enrichment_status = serializers.SerializerMethodField()
+    seo_competitor_domains_override = serializers.CharField(
+        required=False,
+        allow_blank=True,
+    )
 
     class Meta:
         model = BusinessProfile
@@ -46,12 +46,9 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "website_url",
             "plan",
             "is_main",
+            "seo_competitor_domains_override",
             "seo_score",
             "search_performance_score",
-            "onpage_seo_score",
-            "technical_seo_score",
-            "pages_audited",
-            "onpage_issue_summaries",
             "search_visibility_percent",
             "missed_searches_monthly",
             "total_search_volume",
@@ -106,7 +103,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
 
             logger.info(
                 "[BusinessProfileSerializer] get_seo_score: resolved seo_bundle=%s for user_id=%s",
-                {k: data.get(k) for k in ["seo_score", "search_performance_score", "onpage_seo_score", "technical_seo_score", "pages_audited"]},
+                {k: data.get(k) for k in ["seo_score", "search_performance_score"]},
                 getattr(user, "id", None),
             )
             setattr(self, cache_attr, data)
@@ -133,33 +130,6 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             return None
         score = bundle.get("search_performance_score")
         return int(score) if score is not None else None
-
-    def get_onpage_seo_score(self, obj: BusinessProfile) -> int | None:
-        bundle = self._get_seo_bundle(obj)
-        if not bundle:
-            return None
-        score = bundle.get("onpage_seo_score")
-        return int(score) if score is not None else None
-
-    def get_technical_seo_score(self, obj: BusinessProfile) -> int | None:
-        bundle = self._get_seo_bundle(obj)
-        if not bundle:
-            return None
-        score = bundle.get("technical_seo_score")
-        return int(score) if score is not None else None
-
-    def get_pages_audited(self, obj: BusinessProfile) -> int | None:
-        bundle = self._get_seo_bundle(obj)
-        if not bundle:
-            return None
-        val = bundle.get("pages_audited")
-        return int(val) if val is not None else None
-
-    def get_onpage_issue_summaries(self, obj: BusinessProfile) -> dict | None:
-        bundle = self._get_seo_bundle(obj)
-        if not bundle:
-            return None
-        return bundle.get("onpage_issue_summaries") or {}
 
     def get_search_visibility_percent(self, obj: BusinessProfile) -> int | None:
         bundle = self._get_seo_bundle(obj)

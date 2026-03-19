@@ -45,6 +45,7 @@ from .dataforseo_utils import (
     get_ranked_keywords_visibility,
     compute_professional_seo_score,
     get_or_refresh_seo_score_for_user,
+    get_competitors_for_domain_intersection,
 )
 from . import openai_utils
 from . import debug_log as _debug
@@ -1155,7 +1156,10 @@ def seo_keywords(request: HttpRequest) -> Response:
     """
     force_refresh = request.GET.get("refresh") == "1"
 
-    profile = BusinessProfile.objects.filter(user=request.user).first()
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
     site_url = profile.website_url if profile and profile.website_url else ""
     if not site_url:
         return Response({"keywords": []})
@@ -1187,18 +1191,19 @@ def seo_keywords(request: HttpRequest) -> Response:
             )
             return Response({"keywords": cached})
 
-    # Competitor domains can be configured globally for now; later we can make this
-    # per-user if needed. Provide a sensible default set of common directories so
-    # competitor analysis works even if the env var is not set.
-    raw_competitors = getattr(
-        settings,
-        "DATAFORSEO_DEFAULT_COMPETITORS",
-        "yelp.com,angi.com,thumbtack.com,homeadvisor.com",
-    )
-    competitor_domains = [c.strip() for c in raw_competitors.split(",") if c.strip()]
-
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
+
+    competitor_selection = get_competitors_for_domain_intersection(
+        domain=domain,
+        location_code=location_code,
+        language_code=language_code,
+        user=request.user,
+        profile=profile,
+        limit=5,
+        min_competitors=int(getattr(settings, "DATAFORSEO_MIN_COMPETITORS_FOR_GAP", 2)),
+    )
+    competitor_domains = competitor_selection.get("filtered_competitors_used") or []
 
     logger.info(
         "[SEO keywords] user_id=%s domain=%s competitors=%s location_code=%s",
@@ -1207,6 +1212,9 @@ def seo_keywords(request: HttpRequest) -> Response:
         ",".join(competitor_domains) or "(none)",
         location_code,
     )
+
+    if not competitor_domains:
+        return Response({"keywords": []})
 
     gap_items = get_keyword_gap_keywords(
         domain,
@@ -1233,6 +1241,9 @@ def seo_keywords(request: HttpRequest) -> Response:
                 "impressions": 0,
                 "clicks": 0,
                 "ctr": 0,
+                "top_competitor": item.get("top_competitor"),
+                "top_competitor_domain": item.get("top_competitor_domain"),
+                "top_competitor_rank": item.get("top_competitor_rank"),
                 "competitors": [
                     {
                         "domain": c.get("domain") or "",
@@ -1593,7 +1604,6 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
         "total_search_volume": int(getattr(snapshot, "total_search_volume", 0) or 0),
         "search_visibility_percent": int(getattr(snapshot, "search_visibility_percent", 0) or 0),
         "top_keywords": getattr(snapshot, "top_keywords", None) or [],
-        "onpage_issue_summaries": {},
         "business_name": getattr(profile, "business_name", "") or "",
         "website_url": site_url,
         "business_description": getattr(profile, "description", "") or "",
@@ -1616,6 +1626,171 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
     serializer = BusinessProfileSerializer(profile)
     return Response(serializer.data)
 
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def refresh_seo_snapshot(request: HttpRequest) -> Response:
+    """
+    Force a refresh of the SEO snapshot (keywords, rankings, visibility) for the user's
+    main business profile, then return the updated profile.
+
+    This calls get_or_refresh_seo_score_for_user with the current website_url so that:
+    - top_keywords (including rank and missed_searches_monthly) are up to date
+    - search_visibility_percent, missed_searches_monthly, etc. are recomputed
+    """
+    user = request.user
+
+    profile = (
+        BusinessProfile.objects.filter(user=user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=user).first()
+    )
+    if not profile or not profile.website_url:
+        return Response(
+            {"detail": "No main business profile with a website URL is configured."},
+            status=400,
+        )
+
+    site_url = profile.website_url
+    try:
+        # IMPORTANT:
+        # ranked_keywords/live is returning rank_absolute=null in our current pipeline.
+        # If we recompute/save a fresh snapshot here, it overwrites previously-enriched
+        # keyword ranks back to null.
+        #
+        # Instead, we ONLY re-run enrichment tasks (gap keywords + next steps) on the
+        # existing snapshot, so ranks stay intact and refresh is meaningful.
+        from .dataforseo_utils import (
+            normalize_domain,
+            enrich_with_gap_keywords,
+            enrich_with_llm_keywords,
+            enrich_keyword_ranks_from_labs,
+        )
+        from .tasks import (
+            generate_snapshot_next_steps_task,
+            generate_keyword_action_suggestions_task,
+        )
+
+        domain = normalize_domain(site_url) or ""
+        if not domain:
+            raise ValueError("Could not normalize domain for refresh_seo_snapshot")
+
+        today = datetime.now(timezone.utc).date()
+        start_current = today.replace(day=1)
+
+        snapshot = SEOOverviewSnapshot.objects.filter(
+            user=user,
+            period_start=start_current,
+        ).order_by("-last_fetched_at").first()
+
+        # If snapshot doesn't exist yet, fall back to full creation (it will enqueue tasks).
+        if not snapshot:
+            get_or_refresh_seo_score_for_user(user, site_url=site_url)
+            snapshot = SEOOverviewSnapshot.objects.filter(
+                user=user,
+                period_start=start_current,
+            ).order_by("-last_fetched_at").first()
+
+        if snapshot:
+            # Synchronously enrich only keywords so the UI immediately reflects
+            # updated "You rank #X" pills instead of showing cached rank=null
+            # while background tasks are still running.
+            location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+            language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
+            user = snapshot.user
+
+            top_keywords: list[dict] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]
+            enrich_with_gap_keywords(
+                domain=domain,
+                location_code=location_code,
+                language_code=language_code,
+                user=user,
+                top_keywords=top_keywords,
+            )
+            enrich_with_llm_keywords(
+                user=user,
+                location_code=location_code,
+                top_keywords=top_keywords,
+            )
+            rank_stats = enrich_keyword_ranks_from_labs(
+                domain=domain,
+                location_code=location_code,
+                language_code=language_code,
+                top_keywords=top_keywords,
+                user=user,
+            )
+            total = int(rank_stats.get("total") or 0)
+            ranked_after = int(rank_stats.get("non_null_after") or 0)
+            coverage = (ranked_after / total) if total > 0 else 0.0
+            min_coverage = float(getattr(settings, "SEO_RANK_ENRICHMENT_MIN_COVERAGE", 0.05))
+            logger.info(
+                "[SEO refresh] rank enrichment coverage user_id=%s total=%s ranked_after=%s coverage=%.2f%% filled_ranked=%s filled_gap=%s",
+                getattr(user, "id", None),
+                total,
+                ranked_after,
+                coverage * 100.0,
+                int(rank_stats.get("filled_from_ranked") or 0),
+                int(rank_stats.get("filled_from_gap") or 0),
+            )
+            if total > 0 and coverage < min_coverage:
+                refresh_warning = (
+                    "Rank enrichment coverage is too low; refresh aborted to avoid returning all-none ranks."
+                )
+                logger.warning(
+                    "[SEO refresh] %s user_id=%s coverage=%.2f%% threshold=%.2f%%",
+                    refresh_warning,
+                    getattr(user, "id", None),
+                    coverage * 100.0,
+                    min_coverage * 100.0,
+                )
+                return Response(
+                    {
+                        "detail": refresh_warning,
+                        "rank_coverage_percent": round(coverage * 100.0, 2),
+                    },
+                    status=409,
+                )
+
+            top_keywords_sorted = sorted(
+                top_keywords,
+                key=lambda x: x.get("search_volume", 0),
+                reverse=True,
+            )[:20]
+            total_keywords = len(top_keywords_sorted)
+            keywords_with_rank = sum(
+                1 for k in top_keywords_sorted if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0
+            )
+            keywords_with_competitor = sum(
+                1
+                for k in top_keywords_sorted
+                if (
+                    (k.get("top_competitor_domain") or k.get("top_competitor"))
+                    or (isinstance(k.get("competitors"), list) and len(k.get("competitors") or []) > 0)
+                )
+            )
+            rank_pct = (keywords_with_rank / total_keywords * 100.0) if total_keywords > 0 else 0.0
+            competitor_pct = (keywords_with_competitor / total_keywords * 100.0) if total_keywords > 0 else 0.0
+            logger.info(
+                "[SEO refresh] keyword coverage user_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f",
+                getattr(user, "id", None),
+                total_keywords,
+                rank_pct,
+                competitor_pct,
+            )
+            snapshot.top_keywords = top_keywords_sorted
+            snapshot.keywords_enriched_at = datetime.now(timezone.utc)
+            snapshot.save(update_fields=["top_keywords", "keywords_enriched_at"])
+
+            # Next steps / action suggestions can remain async.
+            generate_snapshot_next_steps_task.delay(snapshot.id)
+            generate_keyword_action_suggestions_task.delay(snapshot.id)
+    except Exception:
+        # Never block the UI on SEO refresh failures; return the profile anyway.
+        pass
+
+    serializer = BusinessProfileSerializer(profile)
+    return Response(serializer.data)
 
 @csrf_exempt
 @api_view(["GET", "PATCH", "PUT", "DELETE"])

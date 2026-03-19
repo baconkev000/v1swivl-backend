@@ -89,6 +89,11 @@ def run_onpage_audit_for_user(user, site_url: str | None) -> Optional[OnPageAudi
     - Aggregates page-level findings into site-wide metrics & scores.
     - Caches results in OnPageAuditSnapshot, updated at most once every 24 hours.
     """
+    logger.info(
+        "[OnPageAudit] Disabled (cost control): on-page/technical audit is not running."
+    )
+    return None
+
     from django.utils import timezone
 
     if not site_url:

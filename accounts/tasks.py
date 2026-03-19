@@ -58,11 +58,66 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     # Copy so we don't mutate in-place until we're ready to save
     top_keywords: List[Dict[str, Any]] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]
 
+    # Debug evidence: do we already have rank values before gap/LLM enrichment?
     try:
-        from .dataforseo_utils import enrich_with_gap_keywords, enrich_with_llm_keywords
+        from .dataforseo_utils import _dbg_ba84ae_log  # avoid module-level import
+
+        ranked_before_positive = sum(
+            1 for k in top_keywords if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0
+        )
+        ranked_before_none = sum(1 for k in top_keywords if k.get("rank") is None)
+        _dbg_ba84ae_log(
+            hypothesisId="H3_enrichment_before_snapshot_rank_counts",
+            location="accounts/tasks.py:enrich_snapshot_keywords_task",
+            message="before enrichment rank counts",
+            data={
+                "snapshot_id": snapshot_id,
+                "top_keywords_count": len(top_keywords),
+                "rank_positive_count": ranked_before_positive,
+                "rank_none_count": ranked_before_none,
+            },
+            runId="pre-fix",
+        )
+    except Exception:
+        pass
+
+    try:
+        from .dataforseo_utils import (
+            enrich_with_gap_keywords,
+            enrich_with_llm_keywords,
+            enrich_keyword_ranks_from_labs,
+        )
 
         enrich_with_gap_keywords(domain, location_code, language_code, user, top_keywords)
         enrich_with_llm_keywords(user, location_code, top_keywords)
+        rank_stats = enrich_keyword_ranks_from_labs(
+            domain=domain,
+            location_code=location_code,
+            language_code=language_code,
+            top_keywords=top_keywords,
+            user=user,
+        )
+        total = int(rank_stats.get("total") or 0)
+        ranked_after = int(rank_stats.get("non_null_after") or 0)
+        coverage = (ranked_after / total) if total > 0 else 0.0
+        logger.info(
+            "[SEO async] rank enrichment coverage snapshot_id=%s total=%s ranked_after=%s coverage=%.2f%% filled_ranked=%s filled_gap=%s",
+            snapshot_id,
+            total,
+            ranked_after,
+            coverage * 100.0,
+            int(rank_stats.get("filled_from_ranked") or 0),
+            int(rank_stats.get("filled_from_gap") or 0),
+        )
+        min_coverage = float(getattr(settings, "SEO_RANK_ENRICHMENT_MIN_COVERAGE", 0.05))
+        if total > 0 and coverage < min_coverage:
+            logger.warning(
+                "[SEO async] rank enrichment below threshold; skipping save snapshot_id=%s coverage=%.2f%% threshold=%.2f%%",
+                snapshot_id,
+                coverage * 100.0,
+                min_coverage * 100.0,
+            )
+            return
     except Exception as e:
         logger.exception(
             "[SEO async] enrich_snapshot_keywords_task enrichment failed snapshot_id=%s: %s",
@@ -77,10 +132,56 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         reverse=True,
     )[:20]
 
+    # Debug guardrails: quickly detect blank competitor/rank regressions in UI tables.
+    total_keywords = len(top_keywords_sorted)
+    keywords_with_rank = sum(
+        1 for k in top_keywords_sorted if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0
+    )
+    keywords_with_competitor = sum(
+        1
+        for k in top_keywords_sorted
+        if (
+            (k.get("top_competitor_domain") or k.get("top_competitor"))
+            or (isinstance(k.get("competitors"), list) and len(k.get("competitors") or []) > 0)
+        )
+    )
+    rank_pct = (keywords_with_rank / total_keywords * 100.0) if total_keywords > 0 else 0.0
+    competitor_pct = (keywords_with_competitor / total_keywords * 100.0) if total_keywords > 0 else 0.0
+    logger.info(
+        "[SEO async] keyword coverage snapshot_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f",
+        snapshot_id,
+        total_keywords,
+        rank_pct,
+        competitor_pct,
+    )
+
     try:
         snapshot.top_keywords = top_keywords_sorted
         snapshot.keywords_enriched_at = django_tz.now()
         snapshot.save(update_fields=["top_keywords", "keywords_enriched_at"])
+
+        # Debug evidence after enrichment: did we keep rank values or end up null?
+        try:
+            from .dataforseo_utils import _dbg_ba84ae_log  # avoid module-level import
+
+            ranked_after_positive = sum(
+                1 for k in top_keywords_sorted if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0
+            )
+            ranked_after_none = sum(1 for k in top_keywords_sorted if k.get("rank") is None)
+            _dbg_ba84ae_log(
+                hypothesisId="H3_enrichment_after_snapshot_rank_counts",
+                location="accounts/tasks.py:enrich_snapshot_keywords_task",
+                message="after enrichment rank counts",
+                data={
+                    "snapshot_id": snapshot_id,
+                    "top_keywords_count": len(top_keywords_sorted),
+                    "rank_positive_count": ranked_after_positive,
+                    "rank_none_count": ranked_after_none,
+                },
+                runId="pre-fix",
+            )
+        except Exception:
+            pass
     except Exception as e:
         logger.exception(
             "[SEO async] enrich_snapshot_keywords_task save failed snapshot_id=%s: %s",

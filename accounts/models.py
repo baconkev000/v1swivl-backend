@@ -36,6 +36,11 @@ class BusinessProfile(models.Model):
     # Whether this is the main / primary profile for the user.
     is_main = models.BooleanField(default=False)
 
+    # Optional: comma-separated competitor domains for SEO keyword gap analysis.
+    # When provided, these are preferred over DataForSEO auto-competitors.
+    # Example: "smilebright.com, nocavityclinic.com, oakdentalcare.com"
+    seo_competitor_domains_override = models.TextField(blank=True, default="")
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

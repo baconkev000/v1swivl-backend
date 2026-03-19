@@ -112,6 +112,8 @@ urlpatterns += [
     path("api/seo/overview/", accounts_views.seo_overview, name="seo-overview"),
     # High-Intent Keywords dataset for SEO agent
     path("api/seo/keywords/", accounts_views.seo_keywords, name="seo-keywords"),
+    # Force-refresh SEO snapshot (keywords, rankings, visibility) for main business profile
+    path("api/seo/refresh-snapshot/", accounts_views.refresh_seo_snapshot, name="refresh-seo-snapshot"),
     # SEO agent chat
     path("api/seo/chat/", accounts_views.seo_chat, name="seo-chat"),
     # Reviews agent chat (separate tables, different system role)
