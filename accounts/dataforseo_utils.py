@@ -2314,7 +2314,9 @@ def get_or_refresh_seo_score_for_user(
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
     now_utc = datetime.now(timezone.utc)
-    cache_ttl = timedelta(hours=1)
+    # Cache cadence for keyword ranks + competitor evidence:
+    # Requirement: keep keyword data stable for 7 days unless refresh is explicitly requested.
+    cache_ttl = timedelta(days=7)
     if not site_url:
         _log_seo_skip_and_return_none("No site_url; skipping SEO score calculation", user)
         return None

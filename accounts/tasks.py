@@ -16,7 +16,9 @@ from django.utils import timezone as django_tz
 logger = logging.getLogger(__name__)
 
 # Duplicate prevention: skip keyword enrichment if already done within this TTL.
-KEYWORDS_ENRICHMENT_TTL = timedelta(hours=1)
+# Requirement: ranks + competitor enrichment should stay stable for 7 days unless
+# user explicitly clicks the refresh button.
+KEYWORDS_ENRICHMENT_TTL = timedelta(days=7)
 # Next steps: reuse existing TTL from generate_or_get_next_steps.
 NEXT_STEPS_TTL = timedelta(days=7)
 # Per-keyword action suggestions TTL (for \"Do these now\" UI).
@@ -145,14 +147,44 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             or (isinstance(k.get("competitors"), list) and len(k.get("competitors") or []) > 0)
         )
     )
+    keywords_with_outranking_competitor = sum(
+        1
+        for k in top_keywords_sorted
+        if (
+            isinstance(k.get("rank"), int)
+            and (k.get("rank") or 0) > 0
+            and (
+                (
+                    isinstance(k.get("top_competitor_rank"), int)
+                    and (k.get("top_competitor_rank") or 0) > 0
+                    and int(k.get("top_competitor_rank")) < int(k.get("rank"))
+                )
+                or (
+                    isinstance(k.get("competitors"), list)
+                    and any(
+                        isinstance(c.get("rank"), int)
+                        and (c.get("rank") or 0) > 0
+                        and int(c.get("rank")) < int(k.get("rank"))
+                        for c in (k.get("competitors") or [])
+                    )
+                )
+            )
+        )
+    )
     rank_pct = (keywords_with_rank / total_keywords * 100.0) if total_keywords > 0 else 0.0
     competitor_pct = (keywords_with_competitor / total_keywords * 100.0) if total_keywords > 0 else 0.0
+    outranking_competitor_pct = (
+        keywords_with_outranking_competitor / total_keywords * 100.0
+        if total_keywords > 0
+        else 0.0
+    )
     logger.info(
-        "[SEO async] keyword coverage snapshot_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f",
+        "[SEO async] keyword coverage snapshot_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f outranking_competitor_pct=%.2f",
         snapshot_id,
         total_keywords,
         rank_pct,
         competitor_pct,
+        outranking_competitor_pct,
     )
 
     try:

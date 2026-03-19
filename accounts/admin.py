@@ -5,7 +5,6 @@ from .models import (
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
     GoogleAdsConnection,
-    GoogleAdsMetricsCache,
     MetaAdsConnection,
     SEOOverviewSnapshot,
     ReviewsOverviewSnapshot,
@@ -53,12 +52,6 @@ class GoogleAdsConnectionAdmin(admin.ModelAdmin):
 @admin.register(MetaAdsConnection)
 class MetaAdsConnectionAdmin(admin.ModelAdmin):
     list_display = ("id", "user", "expires_at", "created_at", "updated_at")
-    search_fields = ("user__email", "user__username")
-
-
-@admin.register(GoogleAdsMetricsCache)
-class GoogleAdsMetricsCacheAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "fetched_at", "new_customers_this_month", "avg_roas", "cost_per_customer")
     search_fields = ("user__email", "user__username")
 
 

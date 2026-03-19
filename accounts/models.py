@@ -171,34 +171,6 @@ class MetaAdsConnection(models.Model):
         return f"MetaAdsConnection(user={self.user!s})"
 
 
-class GoogleAdsMetricsCache(models.Model):
-    """
-    Cached Google Ads metrics per user. Used to avoid calling the Google Ads API
-    more than once per hour when the user is on the site (rate limit / cost control).
-    """
-    user = models.OneToOneField(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="google_ads_metrics_cache",
-    )
-    fetched_at = models.DateTimeField(auto_now=True)
-
-    new_customers_this_month = models.IntegerField(default=0)
-    new_customers_previous_month = models.IntegerField(default=0)
-    avg_roas = models.FloatField(default=0)
-    google_search_roas = models.FloatField(default=0)
-    cost_per_customer = models.FloatField(default=0)
-    cost_per_customer_previous = models.FloatField(default=0)
-    active_campaigns_count = models.IntegerField(default=0)
-
-    class Meta:
-        verbose_name = "Google Ads metrics cache"
-        verbose_name_plural = "Google Ads metrics caches"
-
-    def __str__(self) -> str:
-        return f"GoogleAdsMetricsCache(user={self.user!s}, fetched_at={self.fetched_at})"
-
-
 class SEOOverviewSnapshot(models.Model):
     """
     Stores monthly SEO overview metrics for a user

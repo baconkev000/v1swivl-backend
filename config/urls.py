@@ -101,7 +101,6 @@ urlpatterns += [
     # TikTok Ads integration status
     path("api/integrations/tiktok-ads/status/", accounts_views.tiktok_ads_status, name="tiktok-ads-status"),
     # Google Ads performance metrics (conversions, ROAS, cost per customer)
-    path("api/integrations/google-ads/metrics/", accounts_views.ads_metrics, name="gads-metrics"),
     # Google Business Profile integration status (Reviews Agent)
     path("api/integrations/google-business-profile/status/", accounts_views.gbp_status, name="gbp-status"),
     # Reviews overview (star rating, total reviews, response rate, etc. — GBP or cached)
@@ -112,6 +111,8 @@ urlpatterns += [
     path("api/seo/overview/", accounts_views.seo_overview, name="seo-overview"),
     # High-Intent Keywords dataset for SEO agent
     path("api/seo/keywords/", accounts_views.seo_keywords, name="seo-keywords"),
+    # Debug helper: returns saved top_keywords row for a keyword
+    path("api/seo/keyword-debug/", accounts_views.seo_keyword_debug, name="seo-keyword-debug"),
     # Force-refresh SEO snapshot (keywords, rankings, visibility) for main business profile
     path("api/seo/refresh-snapshot/", accounts_views.refresh_seo_snapshot, name="refresh-seo-snapshot"),
     # SEO agent chat

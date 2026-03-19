@@ -18,7 +18,6 @@ from rest_framework.response import Response
 from .models import (
     AgentActivityLog,
     BusinessProfile,
-    GoogleAdsMetricsCache,
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
     MetaAdsConnection,
@@ -28,16 +27,11 @@ from .models import (
     AgentMessage,
 )
 
-# Third-party API cache: only refetch from GSC, Google Ads, GBP if last fetch was >= this long ago.
+# Third-party API cache: only refetch from GSC/GBP if last fetch was >= this long ago.
 THIRD_PARTY_CACHE_TTL = timedelta(hours=1)
 # Google My Business Account Management API: 1 request per minute per project. Enforce per-user to avoid 429.
 GBP_API_MIN_INTERVAL_SECONDS = 60
 from .serializers import BusinessProfileSerializer
-from .google_ads_client import (
-    classify_intent,
-    fetch_ads_metrics_for_user,
-    fetch_ads_metrics_for_user_result,
-)
 from .meta_ads_utils import get_meta_ads_status_for_user
 from .tiktok_ads_utils import get_tiktok_ads_status_for_user
 from .dataforseo_utils import (
@@ -52,6 +46,25 @@ from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+def classify_intent(keyword: str) -> str:
+    """
+    Simple keyword intent classifier (kept local to avoid non-OAuth Google Ads dependency).
+    """
+    k = (keyword or "").lower()
+    high_triggers = [
+        "buy", "price", "cost", "near me", "coupon", "deal", "best",
+        "hire", "book", "quote", "service",
+    ]
+    low_triggers = [
+        "what is", "definition", "how to", "tutorial", "examples", "guide", "meaning",
+    ]
+    if any(t in k for t in high_triggers):
+        return "HIGH"
+    if any(t in k for t in low_triggers):
+        return "LOW"
+    return "MEDIUM"
 
 
 class CsrfExemptSessionAuthentication(SessionAuthentication):
@@ -642,68 +655,6 @@ def tiktok_ads_connect_callback(request: HttpRequest) -> HttpResponse:
     return redirect(next_url)
 
 
-@csrf_exempt
-@api_view(["GET"])
-@authentication_classes([CsrfExemptSessionAuthentication])
-@permission_classes([IsAuthenticated])
-def ads_metrics(request: HttpRequest) -> Response:
-    """
-    Return Google Ads performance metrics for the current user.
-    Uses a 1-hour cache: if we have fresh cached metrics, return them without calling the Google Ads API.
-    """
-    now = datetime.now(timezone.utc)
-    cutoff = now - THIRD_PARTY_CACHE_TTL
-    force_refresh = request.GET.get("refresh") == "1"
-
-    if not force_refresh:
-        try:
-            cache = GoogleAdsMetricsCache.objects.get(user=request.user)
-            if cache.fetched_at >= cutoff:
-                return Response({
-                    "new_customers_this_month": cache.new_customers_this_month,
-                    "new_customers_previous_month": cache.new_customers_previous_month,
-                    "avg_roas": cache.avg_roas,
-                    "google_search_roas": cache.google_search_roas,
-                    "cost_per_customer": cache.cost_per_customer,
-                    "cost_per_customer_previous": cache.cost_per_customer_previous,
-                    "active_campaigns_count": cache.active_campaigns_count,
-                })
-        except GoogleAdsMetricsCache.DoesNotExist:
-            pass
-
-    metrics, reason, detail = fetch_ads_metrics_for_user_result(request.user.id)
-    if metrics is None:
-        return Response(
-            {
-                "error": detail or "Google Ads not connected or metrics unavailable",
-                "reason": reason or "not_connected",
-            },
-            status=404,
-        )
-
-    cache, _ = GoogleAdsMetricsCache.objects.update_or_create(
-        user=request.user,
-        defaults={
-            "new_customers_this_month": metrics.new_customers_this_month,
-            "new_customers_previous_month": metrics.new_customers_previous_month,
-            "avg_roas": metrics.avg_roas,
-            "google_search_roas": metrics.google_search_roas,
-            "cost_per_customer": metrics.cost_per_customer,
-            "cost_per_customer_previous": metrics.cost_per_customer_previous,
-            "active_campaigns_count": metrics.active_campaigns_count,
-        },
-    )
-    return Response({
-        "new_customers_this_month": cache.new_customers_this_month,
-        "new_customers_previous_month": cache.new_customers_previous_month,
-        "avg_roas": cache.avg_roas,
-        "google_search_roas": cache.google_search_roas,
-        "cost_per_customer": cache.cost_per_customer,
-        "cost_per_customer_previous": cache.cost_per_customer_previous,
-        "active_campaigns_count": cache.active_campaigns_count,
-    })
-
-
 def ads_connect_start(request: HttpRequest) -> HttpResponse:
     """
     Start Google OAuth flow for Google Ads API access.
@@ -1172,7 +1123,7 @@ def seo_keywords(request: HttpRequest) -> Response:
     if not domain:
         return Response({"keywords": []})
 
-    # Use per-user cache so we only call DataForSEO at most once per hour,
+    # Use per-user cache so we only call DataForSEO at most once per 7 days,
     # unless the caller explicitly asks for a refresh via ?refresh=1 or the
     # business website domain has changed.
     cache_key = f"seo_keywords:{request.user.id}"
@@ -1266,9 +1217,8 @@ def seo_keywords(request: HttpRequest) -> Response:
     results.sort(key=sort_key)
     top_results = results[:100]
 
-    # Cache the computed keyword gaps for this user for the same window as other
-    # third-party data, so page loads reuse this instead of hitting DataForSEO.
-    cache_ttl = int(THIRD_PARTY_CACHE_TTL.total_seconds())
+    # Cache the computed keyword gaps for this user.
+    cache_ttl = int(timedelta(days=7).total_seconds())
     cache.set(cache_key, top_results, cache_ttl)
     cache.set(domain_cache_key, domain, cache_ttl)
 
@@ -1279,6 +1229,112 @@ def seo_keywords(request: HttpRequest) -> Response:
     )
 
     return Response({"keywords": top_results})
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def seo_keyword_debug(request: HttpRequest) -> Response:
+    """
+    Debug helper: return the saved SEOOverviewSnapshot top_keywords row for a keyword.
+
+    Query params:
+    - keyword (required): keyword text to match (case-insensitive + trimmed)
+    """
+    raw_keyword = request.GET.get("keyword") or ""
+    keyword = raw_keyword.strip()
+    if not keyword:
+        return Response({"detail": "Missing required query param: keyword"}, status=400)
+
+    normalized_target = keyword.lower().strip()
+
+    today = datetime.now(timezone.utc).date()
+    start_current = today.replace(day=1)
+
+    snapshot = (
+        SEOOverviewSnapshot.objects.filter(user=request.user, period_start=start_current)
+        .order_by("-last_fetched_at")
+        .first()
+    )
+    if not snapshot:
+        return Response({"detail": "No SEOOverviewSnapshot for this user this month."}, status=404)
+
+    top_keywords = getattr(snapshot, "top_keywords", None) or []
+    matches: list[dict] = []
+    for row in top_keywords:
+        row_kw = str((row or {}).get("keyword") or "").strip()
+        if not row_kw:
+            continue
+        if row_kw.lower().strip() == normalized_target:
+            matches.append(row)
+
+    # If no exact normalized matches, try best-effort substring match to help triage.
+    if not matches:
+        for row in top_keywords:
+            row_kw = str((row or {}).get("keyword") or "").strip()
+            if not row_kw:
+                continue
+            if normalized_target in row_kw.lower().strip() or row_kw.lower().strip() in normalized_target:
+                matches.append(row)
+
+    def _ui_rank_display(r: Any) -> Any:
+        try:
+            if r is None:
+                return "—"
+            r_int = int(r)
+            return f"#{r_int}" if r_int > 0 else "—"
+        except Exception:
+            return "—"
+
+    def _competitor_outranking(your_rank: Any, comp_rank: Any) -> bool:
+        try:
+            if your_rank is None:
+                return False
+            your = int(your_rank)
+            if your <= 0:
+                return False
+            if comp_rank is None:
+                return False
+            comp = int(comp_rank)
+            if comp <= 0:
+                return False
+            return comp < your
+        except Exception:
+            return False
+
+    enriched: list[dict] = []
+    for m in matches[:5]:
+        your_rank = m.get("rank")
+        top_comp_domain = m.get("top_competitor_domain") or m.get("top_competitor") or None
+        top_comp_rank = m.get("top_competitor_rank")
+        competitors = m.get("competitors") if isinstance(m.get("competitors"), list) else []
+        any_outranking = any(
+            _competitor_outranking(your_rank, c.get("rank")) for c in competitors if isinstance(c, dict)
+        )
+        enriched.append(
+            {
+                "keyword": m.get("keyword"),
+                "rank": your_rank,
+                "ui_rank_display": _ui_rank_display(your_rank),
+                "top_competitor_domain": top_comp_domain,
+                "top_competitor_rank": top_comp_rank,
+                "top_competitor_outranks_you": _competitor_outranking(your_rank, top_comp_rank),
+                "competitors_count": len(competitors),
+                "competitors": competitors[:5],
+                "any_competitor_outranks_you": any_outranking,
+            }
+        )
+
+    return Response(
+        {
+            "debug_keyword": keyword,
+            "snapshot_id": snapshot.id,
+            "snapshot_refreshed_at": snapshot.refreshed_at,
+            "keywords_matches_count": len(matches),
+            "matches": enriched,
+        }
+    )
 
 
 def _reviews_overview_response_from_snapshot(snapshot: ReviewsOverviewSnapshot) -> Response:
@@ -1769,18 +1825,51 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                     or (isinstance(k.get("competitors"), list) and len(k.get("competitors") or []) > 0)
                 )
             )
+            keywords_with_outranking_competitor = sum(
+                1
+                for k in top_keywords_sorted
+                if (
+                    isinstance(k.get("rank"), int)
+                    and (k.get("rank") or 0) > 0
+                    and (
+                        (
+                            isinstance(k.get("top_competitor_rank"), int)
+                            and (k.get("top_competitor_rank") or 0) > 0
+                            and int(k.get("top_competitor_rank")) < int(k.get("rank"))
+                        )
+                        or (
+                            isinstance(k.get("competitors"), list)
+                            and any(
+                                isinstance(c.get("rank"), int)
+                                and (c.get("rank") or 0) > 0
+                                and int(c.get("rank")) < int(k.get("rank"))
+                                for c in (k.get("competitors") or [])
+                            )
+                        )
+                    )
+                )
+            )
             rank_pct = (keywords_with_rank / total_keywords * 100.0) if total_keywords > 0 else 0.0
             competitor_pct = (keywords_with_competitor / total_keywords * 100.0) if total_keywords > 0 else 0.0
+            outranking_competitor_pct = (
+                keywords_with_outranking_competitor / total_keywords * 100.0
+                if total_keywords > 0
+                else 0.0
+            )
             logger.info(
-                "[SEO refresh] keyword coverage user_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f",
+                "[SEO refresh] keyword coverage user_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f outranking_competitor_pct=%.2f",
                 getattr(user, "id", None),
                 total_keywords,
                 rank_pct,
                 competitor_pct,
+                outranking_competitor_pct,
             )
             snapshot.top_keywords = top_keywords_sorted
             snapshot.keywords_enriched_at = datetime.now(timezone.utc)
-            snapshot.save(update_fields=["top_keywords", "keywords_enriched_at"])
+            # Mark the snapshot as freshly enriched so the 7-day cache logic
+            # does not overwrite these keywords/ranks with new null-ranked data.
+            snapshot.refreshed_at = datetime.now(timezone.utc)
+            snapshot.save(update_fields=["top_keywords", "keywords_enriched_at", "refreshed_at"])
 
             # Next steps / action suggestions can remain async.
             generate_snapshot_next_steps_task.delay(snapshot.id)
