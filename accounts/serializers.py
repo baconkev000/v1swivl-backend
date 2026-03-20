@@ -1,9 +1,18 @@
 from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.utils import timezone
 from rest_framework import serializers
 import logging
 
-from .models import BusinessProfile, SEOOverviewSnapshot
+from .constants import SEO_SNAPSHOT_TTL
+from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot
 from .dataforseo_utils import get_or_refresh_seo_score_for_user
+from .dataforseo_utils import (
+    get_aeo_content_readiness_for_site,
+    get_profile_location_code,
+    normalize_domain,
+)
+from . import debug_log as _debug
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +33,18 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     organic_visitors = serializers.SerializerMethodField()
     top_keywords = serializers.SerializerMethodField()
     seo_next_steps = serializers.SerializerMethodField()
+    aeo_score = serializers.SerializerMethodField()
+    question_coverage_score = serializers.SerializerMethodField()
+    questions_found = serializers.SerializerMethodField()
+    questions_missing = serializers.SerializerMethodField()
+    faq_readiness_score = serializers.SerializerMethodField()
+    faq_blocks_found = serializers.SerializerMethodField()
+    faq_schema_present = serializers.SerializerMethodField()
+    snippet_readiness_score = serializers.SerializerMethodField()
+    answer_blocks_found = serializers.SerializerMethodField()
+    aeo_recommendations = serializers.SerializerMethodField()
+    aeo_status = serializers.SerializerMethodField()
+    aeo_last_computed_at = serializers.SerializerMethodField()
     keyword_action_suggestions = serializers.SerializerMethodField()
     enrichment_status = serializers.SerializerMethodField()
     seo_competitor_domains_override = serializers.CharField(
@@ -55,6 +76,18 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "organic_visitors",
             "top_keywords",
             "seo_next_steps",
+            "aeo_score",
+            "question_coverage_score",
+            "questions_found",
+            "questions_missing",
+            "faq_readiness_score",
+            "faq_blocks_found",
+            "faq_schema_present",
+            "snippet_readiness_score",
+            "answer_blocks_found",
+            "aeo_recommendations",
+            "aeo_status",
+            "aeo_last_computed_at",
             "keyword_action_suggestions",
             "enrichment_status",
             "created_at",
@@ -170,6 +203,278 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if not bundle:
             return []
         return bundle.get("seo_next_steps") or []
+
+    def _get_aeo_bundle(self, obj: BusinessProfile) -> dict:
+        domain = normalize_domain(obj.website_url or "") or ""
+        context = getattr(self, "context", {}) or {}
+        force_aeo_refresh = bool(context.get("force_aeo_refresh"))
+        default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+        resolved_location_code, _, resolved_location_label = get_profile_location_code(obj, default_location_code)
+        cache_key = f"{getattr(obj, 'id', 'unknown')}:{domain}:{int(resolved_location_code)}"
+        cache_attr = "_aeo_bundle_cache_map"
+        cache_map = getattr(self, cache_attr, {})
+        if (not force_aeo_refresh) and (cache_key in cache_map):
+            # #region agent log
+            _debug.log(
+                "serializers.py:BusinessProfileSerializer:_get_aeo_bundle:cache_hit",
+                "AEO bundle cache hit in serializer",
+                {"profile_id": getattr(obj, "id", None), "cache_key": cache_key},
+                "H1",
+            )
+            # #endregion
+            return cache_map[cache_key]
+
+        domain = domain or None
+        niche = (obj.industry or "").strip() or None
+        # #region agent log
+        _debug.log(
+            "serializers.py:BusinessProfileSerializer:_get_aeo_bundle:entry",
+            "Resolving AEO bundle for profile",
+            {
+                "profile_id": getattr(obj, "id", None),
+                "user_id": getattr(getattr(obj, "user", None), "id", None),
+                "has_domain": bool(domain),
+                "industry": niche or "",
+                "force_aeo_refresh": force_aeo_refresh,
+            },
+            "H1",
+        )
+        # #endregion
+        logger.info(
+            "[AEO debug eb0539] H1 serializer entry profile_id=%s user_id=%s domain=%s force_refresh=%s industry=%s",
+            getattr(obj, "id", None),
+            getattr(getattr(obj, "user", None), "id", None),
+            domain or "",
+            force_aeo_refresh,
+            niche or "",
+        )
+
+        if not force_aeo_refresh:
+            snapshot = AEOOverviewSnapshot.objects.filter(
+                profile=obj,
+                domain=domain or "",
+                location_code=int(resolved_location_code),
+            ).first()
+            if snapshot and (timezone.now() - snapshot.refreshed_at) <= SEO_SNAPSHOT_TTL:
+                # #region agent log
+                _debug.log(
+                    "serializers.py:BusinessProfileSerializer:_get_aeo_bundle:snapshot_cache_hit",
+                    "Returning AEO snapshot cache",
+                    {
+                        "profile_id": getattr(obj, "id", None),
+                        "domain": domain or "",
+                        "snapshot_refreshed_at": str(snapshot.refreshed_at),
+                        "snapshot_aeo_score": int(snapshot.aeo_score or 0),
+                        "snapshot_question_coverage_score": int(snapshot.question_coverage_score or 0),
+                        "snapshot_faq_readiness_score": int(snapshot.faq_readiness_score or 0),
+                        "snapshot_snippet_readiness_score": int(snapshot.snippet_readiness_score or 0),
+                        "ttl_seconds": int(SEO_SNAPSHOT_TTL.total_seconds()),
+                    },
+                    "H1",
+                )
+                # #endregion
+                logger.info(
+                    "[AEO debug 442421] snapshot cache hit profile_id=%s domain=%s refreshed_at=%s aeo=%s q=%s faq=%s snip=%s found=%s missing=%s",
+                    getattr(obj, "id", None),
+                    domain or "",
+                    snapshot.refreshed_at,
+                    int(snapshot.aeo_score or 0),
+                    int(snapshot.question_coverage_score or 0),
+                    int(snapshot.faq_readiness_score or 0),
+                    int(snapshot.snippet_readiness_score or 0),
+                    len(snapshot.questions_found or []),
+                    len(snapshot.questions_missing or []),
+                )
+                safe_bundle = {
+                    "question_coverage_score": int(snapshot.question_coverage_score or 0),
+                    "questions_found": list(snapshot.questions_found or []),
+                    "questions_missing": list(snapshot.questions_missing or []),
+                    "faq_readiness_score": int(snapshot.faq_readiness_score or 0),
+                    "faq_blocks_found": int(snapshot.faq_blocks_found or 0),
+                    "faq_schema_present": bool(snapshot.faq_schema_present),
+                    "snippet_readiness_score": int(snapshot.snippet_readiness_score or 0),
+                    "answer_blocks_found": int(snapshot.answer_blocks_found or 0),
+                    "aeo_score": int(snapshot.aeo_score or 0),
+                    "aeo_recommendations": list(snapshot.aeo_recommendations or []),
+                    "aeo_status": "ready",
+                    "aeo_last_computed_at": snapshot.refreshed_at.isoformat() if snapshot.refreshed_at else None,
+                }
+                cache_map[cache_key] = safe_bundle
+                setattr(self, cache_attr, cache_map)
+                return safe_bundle
+
+        try:
+            data = get_aeo_content_readiness_for_site(
+                target_domain=domain,
+                niche=niche,
+                cache_key_seed=f"user:{getattr(getattr(obj, 'user', None), 'id', 'unknown')}",
+                force_refresh=force_aeo_refresh,
+                location_code=resolved_location_code,
+                profile_id=getattr(obj, "id", None),
+            ) or {}
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[BusinessProfileSerializer] get_aeo_bundle failed for profile id=%s",
+                getattr(obj, "id", None),
+            )
+            data = {}
+        # #region agent log
+        _debug.log(
+            "serializers.py:BusinessProfileSerializer:_get_aeo_bundle:result",
+            "AEO bundle resolved from helper",
+            {
+                "profile_id": getattr(obj, "id", None),
+                "question_coverage_score": int(data.get("question_coverage_score") or 0),
+                "faq_readiness_score": int(data.get("faq_readiness_score") or 0),
+                "snippet_readiness_score": int(data.get("snippet_readiness_score") or 0),
+                "questions_found_count": len(data.get("questions_found") or []),
+                "questions_missing_count": len(data.get("questions_missing") or []),
+                "faq_blocks_found": int(data.get("faq_blocks_found") or 0),
+                "answer_blocks_found": int(data.get("answer_blocks_found") or 0),
+            },
+            "H2",
+        )
+        # #endregion
+        logger.info(
+            "[AEO debug eb0539] H2 serializer result profile_id=%s q=%s faq=%s snip=%s found=%s missing=%s",
+            getattr(obj, "id", None),
+            int(data.get("question_coverage_score") or 0),
+            int(data.get("faq_readiness_score") or 0),
+            int(data.get("snippet_readiness_score") or 0),
+            len(data.get("questions_found") or []),
+            len(data.get("questions_missing") or []),
+        )
+
+        safe_bundle = {
+            "question_coverage_score": int(data.get("question_coverage_score") or 0),
+            "questions_found": data.get("questions_found") or [],
+            "questions_missing": data.get("questions_missing") or [],
+            "faq_readiness_score": int(data.get("faq_readiness_score") or 0),
+            "faq_blocks_found": int(data.get("faq_blocks_found") or 0),
+            "faq_schema_present": bool(data.get("faq_schema_present") or False),
+            "snippet_readiness_score": int(data.get("snippet_readiness_score") or 0),
+            "answer_blocks_found": int(data.get("answer_blocks_found") or 0),
+            "aeo_status": str(data.get("aeo_status") or "ready"),
+            "aeo_last_computed_at": data.get("aeo_last_computed_at"),
+        }
+        aeo_status = str(safe_bundle.get("aeo_status") or "ready")
+        if aeo_status != "ready":
+            safe_bundle["aeo_score"] = int(data.get("aeo_score") or 0)
+            safe_bundle["aeo_recommendations"] = list(data.get("aeo_recommendations") or [])
+            cache_map[cache_key] = safe_bundle
+            setattr(self, cache_attr, cache_map)
+            return safe_bundle
+
+        question_coverage_score = int(safe_bundle.get("question_coverage_score") or 0)
+        faq_readiness_score = int(safe_bundle.get("faq_readiness_score") or 0)
+        snippet_readiness_score = int(safe_bundle.get("snippet_readiness_score") or 0)
+        aeo_score = int(
+            round(
+                (question_coverage_score * 0.4)
+                + (faq_readiness_score * 0.3)
+                + (snippet_readiness_score * 0.3),
+            )
+        )
+        aeo_score = max(0, min(100, aeo_score))
+
+        recommendations: list[str] = []
+        if question_coverage_score < 60:
+            recommendations.append("Add content answering customer search questions")
+        if faq_readiness_score < 60:
+            recommendations.append("Add FAQ sections and FAQ schema")
+        if snippet_readiness_score < 60:
+            recommendations.append("Shorten answer paragraphs under headings")
+
+        safe_bundle["aeo_score"] = aeo_score
+        safe_bundle["aeo_recommendations"] = recommendations
+        # #region agent log
+        _debug.log(
+            "serializers.py:BusinessProfileSerializer:_get_aeo_bundle:computed_bundle",
+            "Computed AEO bundle before snapshot save",
+            {
+                "profile_id": getattr(obj, "id", None),
+                "aeo_score": int(aeo_score),
+                "question_coverage_score": int(question_coverage_score),
+                "faq_readiness_score": int(faq_readiness_score),
+                "snippet_readiness_score": int(snippet_readiness_score),
+                "questions_found_count": len(safe_bundle.get("questions_found") or []),
+                "questions_missing_count": len(safe_bundle.get("questions_missing") or []),
+            },
+            "H2",
+        )
+        # #endregion
+
+        AEOOverviewSnapshot.objects.update_or_create(
+            profile=obj,
+            domain=domain or "",
+            location_code=int(resolved_location_code),
+            defaults={
+                "user": obj.user,
+                "location_label": resolved_location_label or "",
+                "niche": niche or "",
+                "aeo_score": int(safe_bundle["aeo_score"] or 0),
+                "question_coverage_score": int(safe_bundle["question_coverage_score"] or 0),
+                "questions_found": list(safe_bundle["questions_found"] or []),
+                "questions_missing": list(safe_bundle["questions_missing"] or []),
+                "faq_readiness_score": int(safe_bundle["faq_readiness_score"] or 0),
+                "faq_blocks_found": int(safe_bundle["faq_blocks_found"] or 0),
+                "faq_schema_present": bool(safe_bundle["faq_schema_present"]),
+                "snippet_readiness_score": int(safe_bundle["snippet_readiness_score"] or 0),
+                "answer_blocks_found": int(safe_bundle["answer_blocks_found"] or 0),
+                "aeo_recommendations": list(safe_bundle["aeo_recommendations"] or []),
+            },
+        )
+        cache_map[cache_key] = safe_bundle
+        setattr(self, cache_attr, cache_map)
+        return safe_bundle
+
+    def get_aeo_score(self, obj: BusinessProfile) -> int:
+        bundle = self._get_aeo_bundle(obj)
+        return int(bundle.get("aeo_score") or 0)
+
+    def get_question_coverage_score(self, obj: BusinessProfile) -> int:
+        bundle = self._get_aeo_bundle(obj)
+        return int(bundle.get("question_coverage_score") or 0)
+
+    def get_questions_found(self, obj: BusinessProfile):
+        bundle = self._get_aeo_bundle(obj)
+        return bundle.get("questions_found") or []
+
+    def get_questions_missing(self, obj: BusinessProfile):
+        bundle = self._get_aeo_bundle(obj)
+        return bundle.get("questions_missing") or []
+
+    def get_faq_readiness_score(self, obj: BusinessProfile) -> int:
+        bundle = self._get_aeo_bundle(obj)
+        return int(bundle.get("faq_readiness_score") or 0)
+
+    def get_faq_blocks_found(self, obj: BusinessProfile) -> int:
+        bundle = self._get_aeo_bundle(obj)
+        return int(bundle.get("faq_blocks_found") or 0)
+
+    def get_faq_schema_present(self, obj: BusinessProfile) -> bool:
+        bundle = self._get_aeo_bundle(obj)
+        return bool(bundle.get("faq_schema_present") or False)
+
+    def get_snippet_readiness_score(self, obj: BusinessProfile) -> int:
+        bundle = self._get_aeo_bundle(obj)
+        return int(bundle.get("snippet_readiness_score") or 0)
+
+    def get_answer_blocks_found(self, obj: BusinessProfile) -> int:
+        bundle = self._get_aeo_bundle(obj)
+        return int(bundle.get("answer_blocks_found") or 0)
+
+    def get_aeo_recommendations(self, obj: BusinessProfile):
+        bundle = self._get_aeo_bundle(obj)
+        return bundle.get("aeo_recommendations") or []
+
+    def get_aeo_status(self, obj: BusinessProfile) -> str:
+        bundle = self._get_aeo_bundle(obj)
+        return str(bundle.get("aeo_status") or "ready")
+
+    def get_aeo_last_computed_at(self, obj: BusinessProfile):
+        bundle = self._get_aeo_bundle(obj)
+        return bundle.get("aeo_last_computed_at")
 
     def get_keyword_action_suggestions(self, obj: BusinessProfile):
         bundle = self._get_seo_bundle(obj)

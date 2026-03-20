@@ -1514,7 +1514,11 @@ def business_profile(request: HttpRequest) -> Response:
             profile = profile_qs.first()
 
     if request.method == "GET":
-        serializer = BusinessProfileSerializer(profile)
+        force_aeo_refresh = str(request.GET.get("refresh_aeo", "")).strip().lower() in {"1", "true", "yes"}
+        serializer = BusinessProfileSerializer(
+            profile,
+            context={"force_aeo_refresh": force_aeo_refresh},
+        )
         return Response(serializer.data)
 
     # For PATCH/PUT, apply partial updates

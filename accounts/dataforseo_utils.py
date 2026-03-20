@@ -8,20 +8,24 @@ Primary endpoints used:
 - POST /v3/dataforseo_labs/google/domain_intersection/live  → keyword gap vs competitors
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import re
+import random
+import time
 
 import json
 import math
 import requests
 from pathlib import Path
 from django.conf import settings
+from django.core.cache import cache
 
-from .models import BusinessProfile, SEOOverviewSnapshot
+from .models import AEOOverviewSnapshot, BusinessProfile, SEOOverviewSnapshot
+from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +141,32 @@ def _normalize_domain_value(domain_or_url: str | None) -> Optional[str]:
     # Accept either raw domain ("example.com") or URL ("https://example.com/path")
     normalized = normalize_domain(str(domain_or_url).strip())
     return normalized
+
+
+def get_profile_location_code(
+    profile: Optional[BusinessProfile],
+    default_code: int,
+) -> Tuple[int, bool, str]:
+    """
+    Resolve the effective DataForSEO location code for a profile.
+
+    Returns:
+        (resolved_location_code, used_fallback_default, location_label)
+    """
+    fallback_code = int(default_code)
+    if not profile:
+        return fallback_code, True, ""
+    raw_code = getattr(profile, "seo_location_code", None)
+    raw_label = str(getattr(profile, "seo_location_label", "") or "").strip()
+    if raw_code is None:
+        return fallback_code, True, raw_label
+    try:
+        resolved = int(raw_code)
+    except (TypeError, ValueError):
+        return fallback_code, True, raw_label
+    if resolved <= 0:
+        return fallback_code, True, raw_label
+    return resolved, False, raw_label
 
 
 def _parse_domain_csv(raw: str | None) -> List[str]:
@@ -937,6 +967,18 @@ def get_ranked_keywords_visibility(
     # #region agent log
     _debug.log("dataforseo_utils.py:get_ranked_keywords_visibility:after_post", "API response", {"has_data": data is not None}, "H4")
     # #endregion
+    # #region agent log
+    _debug.log(
+        "dataforseo_utils.py:get_ranked_keywords_visibility:response_shape",
+        "Ranked keywords response shape",
+        {
+            "data_type": type(data).__name__ if data is not None else "NoneType",
+            "top_keys": list((data or {}).keys())[:8] if isinstance(data, dict) else [],
+            "tasks_count": len((data or {}).get("tasks") or []) if isinstance(data, dict) else -1,
+        },
+        "H1",
+    )
+    # #endregion
     if not data:
         return None
 
@@ -998,6 +1040,972 @@ def get_ranked_keywords_visibility(
             exc,
         )
         return None
+
+
+def get_question_intent_keywords(
+    *,
+    target_domain: Optional[str] = None,
+    niche: Optional[str] = None,
+    location_code: Optional[int] = None,
+    language_code: str = "en",
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve question-intent keywords from DataForSEO for a business domain or niche.
+
+    - Uses ranked_keywords/live when target_domain is provided.
+    - Uses keywords_data search_volume/live with seeded question phrases when niche is provided.
+    - Keeps only question-intent prefixes: how, what, why, when, best.
+    - Returns at most 20 rows in shape: {"keyword": str, "search_volume": int}
+    - Returns [] on any failure.
+    """
+    try:
+        max_rows = max(1, min(int(limit or 20), 20))
+        resolved_location_code = int(
+            location_code if location_code is not None else getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840)
+        )
+        question_prefixes = ("how ", "what ", "why ", "when ", "best ")
+
+        def _is_question_intent_keyword(value: Any) -> bool:
+            kw = str(value or "").strip().lower()
+            return any(kw.startswith(prefix) for prefix in question_prefixes)
+
+        collected: Dict[str, int] = {}
+
+        normalized_domain = normalize_domain(target_domain) if target_domain else None
+        if normalized_domain:
+            payload = [
+                {
+                    "target": normalized_domain,
+                    "location_code": resolved_location_code,
+                    "language_code": language_code,
+                    "limit": 200,
+                },
+            ]
+            data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
+            if data:
+                tasks = data.get("tasks") or []
+                for task in tasks:
+                    for result in (task.get("result") or []):
+                        for item in (result.get("items") or []):
+                            keyword_data = item.get("keyword_data") or {}
+                            kw = (keyword_data.get("keyword") or item.get("keyword") or "").strip()
+                            if not kw or not _is_question_intent_keyword(kw):
+                                continue
+
+                            kw_info = keyword_data.get("keyword_info") or {}
+                            raw_sv = (
+                                kw_info.get("search_volume")
+                                or kw_info.get("search_volume_global")
+                                or kw_info.get("sum_search_volume")
+                                or item.get("search_volume")
+                                or item.get("sum_search_volume")
+                                or 0
+                            )
+                            try:
+                                sv = int(raw_sv) if raw_sv is not None else 0
+                            except (TypeError, ValueError):
+                                sv = 0
+                            if sv <= 0:
+                                continue
+                            prev = collected.get(kw.lower(), 0)
+                            if sv > prev:
+                                collected[kw.lower()] = sv
+
+        niche_clean = (niche or "").strip()
+        if niche_clean:
+            seeded_keywords = [f"{prefix.strip()} {niche_clean}" for prefix in question_prefixes]
+            seed_volumes = _get_search_volumes_for_keywords(seeded_keywords, resolved_location_code)
+            for kw_seed in seeded_keywords:
+                kw_seed_clean = kw_seed.strip()
+                if not _is_question_intent_keyword(kw_seed_clean):
+                    continue
+                sv = int(seed_volumes.get(kw_seed_clean.lower(), 0) or 0)
+                if sv <= 0:
+                    continue
+                prev = collected.get(kw_seed_clean.lower(), 0)
+                if sv > prev:
+                    collected[kw_seed_clean.lower()] = sv
+
+        def _extract_paa_questions_for_terms(terms: List[str]) -> List[str]:
+            """
+            Pull question variants from SERP People Also Ask blocks.
+            Best-effort only: returns [] on any failure.
+            """
+            if not terms:
+                return []
+            found: List[str] = []
+            # Keep this lightweight to control API usage.
+            for term in terms[:5]:
+                payload = [
+                    {
+                        "keyword": term,
+                        "location_code": resolved_location_code,
+                        "language_code": language_code,
+                        "device": "desktop",
+                        "os": "windows",
+                        "depth": 20,
+                    },
+                ]
+                data = _post("/v3/serp/google/organic/live/advanced", payload)
+                if not data:
+                    continue
+                try:
+                    tasks = data.get("tasks") or []
+                    for task in tasks:
+                        for result in (task.get("result") or []):
+                            for item in (result.get("items") or []):
+                                item_type = str(item.get("type") or "").lower()
+                                if "people_also_ask" not in item_type and "related_questions" not in item_type:
+                                    continue
+                                nested_items = item.get("items") or []
+                                for nested in nested_items if isinstance(nested_items, list) else []:
+                                    q = str(
+                                        nested.get("question")
+                                        or nested.get("title")
+                                        or nested.get("text")
+                                        or ""
+                                    ).strip()
+                                    if not q:
+                                        continue
+                                    ql = q.lower()
+                                    if _is_question_intent_keyword(ql) and ql not in found:
+                                        found.append(ql)
+                except Exception:
+                    continue
+            return found
+
+        # Enrich demand set with true SERP/PAA questions from top terms.
+        if collected:
+            top_seed_terms = [
+                kw for kw, _sv in sorted(collected.items(), key=lambda kv: -int(kv[1]))[:5]
+            ]
+            paa_questions = _extract_paa_questions_for_terms(top_seed_terms)
+            if paa_questions:
+                paa_volumes = _get_search_volumes_for_keywords(paa_questions, resolved_location_code)
+                for q in paa_questions:
+                    sv = int(paa_volumes.get(q.lower(), 0) or 0)
+                    if sv <= 0:
+                        continue
+                    prev = collected.get(q.lower(), 0)
+                    if sv > prev:
+                        collected[q.lower()] = sv
+
+        if not collected:
+            return []
+
+        sorted_rows = sorted(
+            ({"keyword": kw, "search_volume": int(sv)} for kw, sv in collected.items()),
+            key=lambda row: (-int(row.get("search_volume") or 0), str(row.get("keyword") or "")),
+        )
+        return sorted_rows[:max_rows]
+    except Exception:
+        logger.exception(
+            "[DataForSEO] get_question_intent_keywords failed for domain=%s niche=%s",
+            target_domain,
+            niche,
+        )
+        return []
+
+
+def _extract_text_fragments_for_question_coverage(value: Any) -> List[str]:
+    """
+    Recursively extract text-like fragments from nested DataForSEO page payloads.
+    """
+    out: List[str] = []
+    if value is None:
+        return out
+    if isinstance(value, str):
+        v = value.strip()
+        if v:
+            out.append(v)
+        return out
+    if isinstance(value, (int, float, bool)):
+        return out
+    if isinstance(value, list):
+        for item in value:
+            out.extend(_extract_text_fragments_for_question_coverage(item))
+        return out
+    if isinstance(value, dict):
+        # Prefer these fields first if available.
+        preferred_keys = (
+            "url",
+            "title",
+            "description",
+            "meta_title",
+            "meta_description",
+            "h1",
+            "h2",
+            "text",
+            "snippet",
+            "content",
+        )
+        seen = set()
+        for key in preferred_keys:
+            if key in value:
+                seen.add(key)
+                out.extend(_extract_text_fragments_for_question_coverage(value.get(key)))
+        for key, nested in value.items():
+            if key in seen:
+                continue
+            out.extend(_extract_text_fragments_for_question_coverage(nested))
+        return out
+    return out
+
+
+def _crawl_pages_for_aeo(
+    *,
+    target_domain: Optional[str],
+    location_code: Optional[int] = None,
+    language_code: str = "en",
+    max_pages: int = 20,
+    crawl_scope: Optional[str] = None,
+    timeout_seconds: int = 120,
+) -> Dict[str, Any]:
+    """
+    Crawl site pages via DataForSEO On-Page API with bounded polling.
+    Returns status metadata with pages.
+    """
+    normalized_domain = normalize_domain(target_domain) if target_domain else None
+    # #region agent log
+    _debug.log(
+        "dataforseo_utils.py:_crawl_pages_for_aeo:entry",
+        "Starting crawl pages for AEO",
+        {
+            "target_domain": target_domain or "",
+            "normalized_domain": normalized_domain or "",
+            "max_pages": int(max_pages or 0),
+        },
+        "H3",
+    )
+    # #endregion
+    logger.info(
+        "[AEO debug eb0539] H3 crawl entry target_domain=%s normalized_domain=%s max_pages=%s",
+        target_domain,
+        normalized_domain,
+        max_pages,
+    )
+    if not normalized_domain:
+        # #region agent log
+        _debug.log(
+            "dataforseo_utils.py:_crawl_pages_for_aeo:no_domain",
+            "No normalized domain; returning empty pages",
+            {},
+            "H3",
+        )
+        # #endregion
+        logger.info("[AEO debug eb0539] H3 crawl early return: no normalized domain")
+        return {"pages": [], "aeo_status": "error", "exit_reason": "no_domain", "task_id": None}
+
+    resolved_location_code = int(
+        location_code if location_code is not None else getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840)
+    )
+    scope = (crawl_scope or "default").strip().lower() or "default"
+    lock_key = f"aeo_crawl_lock:{scope}:{normalized_domain}:{resolved_location_code}:{language_code}"
+    task_key = f"aeo_crawl_task:{scope}:{normalized_domain}:{resolved_location_code}:{language_code}"
+    lock_ttl = max(60, min(120, int(timeout_seconds)))
+    task_id: Optional[str] = None
+    lock_acquired = cache.add(lock_key, "1", lock_ttl)
+
+    if lock_acquired:
+        task_data = _post(
+            "/v3/on_page/task_post",
+            [
+                {
+                    "target": normalized_domain,
+                    "max_crawl_pages": max_pages,
+                    "load_resources": False,
+                    "enable_javascript": True,
+                },
+            ],
+        )
+        if not task_data:
+            cache.delete(lock_key)
+            return {"pages": [], "aeo_status": "error", "exit_reason": "task_post_empty", "task_id": None}
+        try:
+            task_id = ((task_data.get("tasks") or [])[0] or {}).get("id")
+        except Exception:
+            task_id = None
+        if not task_id:
+            cache.delete(lock_key)
+            return {"pages": [], "aeo_status": "error", "exit_reason": "missing_task_id", "task_id": None}
+        cache.set(task_key, str(task_id), lock_ttl)
+    else:
+        cached_task_id = cache.get(task_key)
+        if isinstance(cached_task_id, str) and cached_task_id.strip():
+            task_id = cached_task_id.strip()
+            logger.info("[AEO crawl] Reusing existing task domain=%s task_id=%s", normalized_domain, task_id)
+        else:
+            return {"pages": [], "aeo_status": "processing", "exit_reason": "lock_in_progress", "task_id": None}
+
+    started_at = time.monotonic()
+    attempt = 0
+    sleep_seconds = 2.0
+    while True:
+        attempt += 1
+        elapsed = float(time.monotonic() - started_at)
+        if elapsed >= float(timeout_seconds):
+            return {"pages": [], "aeo_status": "timed_out", "exit_reason": "timeout", "task_id": task_id}
+
+        pages_data = _post(
+            "/v3/on_page/pages",
+            [
+                {
+                    "id": task_id,
+                    "location_code": resolved_location_code,
+                    "language_code": language_code,
+                    "limit": max_pages,
+                    "offset": 0,
+                },
+            ],
+        )
+        if not pages_data:
+            return {"pages": [], "aeo_status": "error", "exit_reason": "api_error", "task_id": task_id}
+
+        pages: List[Dict[str, Any]] = []
+        task_status_code = 0
+        task_status_message = ""
+        try:
+            tasks = pages_data.get("tasks") or []
+            if tasks:
+                task_status_code = int((tasks[0] or {}).get("status_code") or 0)
+                task_status_message = str((tasks[0] or {}).get("status_message") or "")
+            for task in tasks:
+                for page_result in (task.get("result") or []):
+                    pages.extend((page_result.get("items") or [])[:max_pages])
+        except Exception:
+            return {"pages": [], "aeo_status": "error", "exit_reason": "parse_error", "task_id": task_id}
+
+        if pages:
+            logger.info(
+                "[AEO crawl] attempt=%s elapsed=%.2fs next_sleep=0.00 status=%s pages=%s exit_reason=finished_with_pages",
+                attempt,
+                elapsed,
+                task_status_code,
+                len(pages),
+            )
+            return {"pages": pages[:max_pages], "aeo_status": "ready", "exit_reason": "finished_with_pages", "task_id": task_id}
+
+        if task_status_code >= 40000:
+            homepage_page = _fetch_homepage_page_for_aeo(normalized_domain)
+            if homepage_page:
+                logger.info(
+                    "[AEO crawl] attempt=%s elapsed=%.2fs next_sleep=0.00 status=%s pages=1 exit_reason=fallback_used",
+                    attempt,
+                    elapsed,
+                    task_status_code,
+                )
+                return {"pages": [homepage_page], "aeo_status": "ready", "exit_reason": "fallback_used", "task_id": task_id}
+            logger.warning(
+                "[AEO crawl] terminal_error domain=%s task_id=%s status=%s message=%s",
+                normalized_domain,
+                task_id,
+                task_status_code,
+                task_status_message,
+            )
+            return {"pages": [], "aeo_status": "error", "exit_reason": "api_error", "task_id": task_id}
+
+        next_sleep = min(15.0, sleep_seconds * random.uniform(0.8, 1.2))
+        logger.info(
+            "[AEO crawl] attempt=%s elapsed=%.2fs next_sleep=%.2fs status=%s pages=%s exit_reason=processing",
+            attempt,
+            elapsed,
+            next_sleep,
+            task_status_code,
+            len(pages),
+        )
+        _debug.log(
+            "dataforseo_utils.py:_crawl_pages_for_aeo:poll",
+            "Polling on_page/pages for crawl completion",
+            {
+                "attempt": int(attempt),
+                "elapsed_time_seconds": round(elapsed, 3),
+                "next_sleep_seconds": round(next_sleep, 3),
+                "crawl_progress_status": int(task_status_code),
+                "pages_found_count": int(len(pages)),
+                "exit_reason": "processing",
+            },
+            "H4",
+        )
+        remaining = float(timeout_seconds) - elapsed
+        time.sleep(min(next_sleep, max(0.05, remaining)))
+        sleep_seconds = min(15.0, sleep_seconds * 1.7)
+
+
+def _fetch_homepage_page_for_aeo(normalized_domain: str) -> Dict[str, Any] | None:
+    """
+    Minimal fallback when DataForSEO On-Page returns no page rows.
+    Returns a page-like dict consumed by AEO scoring helpers.
+    """
+    if not normalized_domain:
+        return None
+    for scheme in ("https://", "http://"):
+        url = f"{scheme}{normalized_domain}/"
+        try:
+            resp = requests.get(
+                url,
+                timeout=8,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; swivl-aeo-debug/1.0)"},
+            )
+            if resp.status_code >= 400:
+                continue
+            text = resp.text or ""
+            if not text.strip():
+                continue
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+            title = re.sub(r"\s+", " ", (title_match.group(1) if title_match else "")).strip()
+            return {
+                "url": url,
+                "title": title,
+                "content": text,
+                "text": text,
+            }
+        except Exception:
+            continue
+    return None
+
+
+def _collect_heading_texts(page: Dict[str, Any]) -> List[str]:
+    headings: List[str] = []
+    content_value = page.get("content")
+    content_dict = content_value if isinstance(content_value, dict) else {}
+    page_timing_value = page.get("page_timing")
+    page_timing_dict = page_timing_value if isinstance(page_timing_value, dict) else {}
+    raw_headings = (
+        page.get("headings")
+        or content_dict.get("headings")
+        or page_timing_dict.get("headings")
+        or []
+    )
+    for row in raw_headings if isinstance(raw_headings, list) else []:
+        if isinstance(row, dict):
+            txt = str(row.get("text") or row.get("value") or "").strip()
+            if txt:
+                headings.append(txt)
+        elif isinstance(row, str):
+            txt = row.strip()
+            if txt:
+                headings.append(txt)
+    return headings
+
+
+def _contains_faq_schema(value: Any) -> bool:
+    """
+    Detect FAQPage schema in nested payload values.
+    """
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        node_type = str(value.get("@type") or value.get("type") or "").strip().lower()
+        if node_type == "faqpage":
+            return True
+        for nested in value.values():
+            if _contains_faq_schema(nested):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_contains_faq_schema(v) for v in value)
+    if isinstance(value, str):
+        v = value.lower()
+        return '"@type":"faqpage"' in v.replace(" ", "") or '"@type": "faqpage"' in v
+    return False
+
+
+def compute_faq_readiness_for_pages(pages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    FAQ readiness:
+    - Detect FAQ sections in HTML/text
+    - Detect FAQ schema presence
+    """
+    if not pages:
+        return {
+            "faq_readiness_score": 0,
+            "faq_blocks_found": 0,
+            "faq_schema_present": False,
+        }
+
+    faq_blocks_found = 0
+    faq_schema_present = False
+    faq_section_re = re.compile(r"\b(faq|faqs|frequently asked questions)\b", re.IGNORECASE)
+
+    for page in pages:
+        if _contains_faq_schema(page):
+            faq_schema_present = True
+
+        page_text = " ".join(_extract_text_fragments_for_question_coverage(page))
+        if faq_section_re.search(page_text):
+            faq_blocks_found += 1
+            continue
+
+        headings = _collect_heading_texts(page)
+        if any(faq_section_re.search(h) for h in headings):
+            faq_blocks_found += 1
+
+    # Isolated scoring: FAQ section presence + FAQ schema presence.
+    score = 0
+    if faq_blocks_found > 0:
+        score += 60
+    if faq_schema_present:
+        score += 40
+    score = max(0, min(100, score))
+    # #region agent log
+    _debug.log(
+        "dataforseo_utils.py:compute_faq_readiness_for_pages:summary",
+        "FAQ readiness summary",
+        {
+            "pages_count": len(pages),
+            "faq_blocks_found": int(faq_blocks_found),
+            "faq_schema_present": bool(faq_schema_present),
+            "score": int(score),
+        },
+        "H7",
+    )
+    # #endregion
+    logger.info(
+        "[AEO debug eb0539] H7 faq summary pages=%s faq_blocks=%s faq_schema=%s score=%s",
+        len(pages),
+        int(faq_blocks_found),
+        bool(faq_schema_present),
+        int(score),
+    )
+    return {
+        "faq_readiness_score": int(score),
+        "faq_blocks_found": int(faq_blocks_found),
+        "faq_schema_present": bool(faq_schema_present),
+    }
+
+
+def _extract_candidate_answer_paragraphs(value: Any) -> List[str]:
+    """
+    Extract paragraph-like text blocks for snippet readiness checks.
+    """
+    texts = _extract_text_fragments_for_question_coverage(value)
+    out: List[str] = []
+    for t in texts:
+        words = re.findall(r"\b[\w'-]+\b", t)
+        if len(words) >= 20:  # exclude tiny fragments
+            out.append(t.strip())
+    return out
+
+
+def compute_snippet_readiness_for_pages(pages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Snippet readiness:
+    - Detect question-style headings
+    - Detect short answer paragraph below heading
+    - Reward paragraph lengths near 40-60 words
+    """
+    if not pages:
+        return {
+            "snippet_readiness_score": 0,
+            "answer_blocks_found": 0,
+        }
+
+    question_heading_re = re.compile(
+        r"^(how|what|why|when|best|can|should|is|are|does|do)\b|.+\?$",
+        re.IGNORECASE,
+    )
+    answer_blocks_found = 0
+    paragraphs_near_target = 0
+
+    for page in pages:
+        headings = _collect_heading_texts(page)
+        question_headings = [h for h in headings if question_heading_re.search(h.strip())]
+        if not question_headings:
+            continue
+
+        paragraphs = _extract_candidate_answer_paragraphs(page)
+        if not paragraphs:
+            continue
+
+        # Heuristic: if page has question-style heading and paragraph text exists, count as answer block.
+        answer_blocks_found += 1
+        for p in paragraphs:
+            wc = len(re.findall(r"\b[\w'-]+\b", p))
+            if 40 <= wc <= 60:
+                paragraphs_near_target += 1
+                break
+
+    # Isolated scoring for snippet readiness.
+    total_pages = len(pages)
+    answer_block_ratio = (answer_blocks_found / total_pages) if total_pages > 0 else 0.0
+    near_target_bonus = 20 if paragraphs_near_target > 0 else 0
+    score = int(round(min(100.0, (answer_block_ratio * 80.0) + near_target_bonus)))
+    # #region agent log
+    _debug.log(
+        "dataforseo_utils.py:compute_snippet_readiness_for_pages:summary",
+        "Snippet readiness summary",
+        {
+            "pages_count": len(pages),
+            "answer_blocks_found": int(answer_blocks_found),
+            "paragraphs_near_target": int(paragraphs_near_target),
+            "score": int(score),
+        },
+        "H8",
+    )
+    # #endregion
+    logger.info(
+        "[AEO debug eb0539] H8 snippet summary pages=%s answer_blocks=%s near_target=%s score=%s",
+        len(pages),
+        int(answer_blocks_found),
+        int(paragraphs_near_target),
+        int(score),
+    )
+    return {
+        "snippet_readiness_score": score,
+        "answer_blocks_found": int(answer_blocks_found),
+    }
+
+
+def get_question_coverage_for_site(
+    *,
+    target_domain: Optional[str],
+    niche: Optional[str] = None,
+    location_code: Optional[int] = None,
+    language_code: str = "en",
+    pages: Optional[List[Dict[str, Any]]] = None,
+    keywords_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Compute question coverage score by matching question-intent keywords against crawled page content.
+
+    Returns:
+    {
+      "question_coverage_score": int,
+      "questions_found": [str],
+      "questions_missing": [str],
+    }
+    """
+    result: Dict[str, Any] = {
+        "question_coverage_score": 0,
+        "questions_found": [],
+        "questions_missing": [],
+    }
+    try:
+        normalized_domain = normalize_domain(target_domain) if target_domain else None
+        resolved_keywords_rows = keywords_rows if keywords_rows is not None else get_question_intent_keywords(
+            target_domain=normalized_domain,
+            niche=niche,
+            location_code=location_code,
+            language_code=language_code,
+            limit=20,
+        )
+        if not resolved_keywords_rows:
+            return result
+
+        weighted_keywords: List[tuple[str, int]] = []
+        for row in resolved_keywords_rows:
+            kw = str((row or {}).get("keyword") or "").strip().lower()
+            if not kw:
+                continue
+            try:
+                sv = int((row or {}).get("search_volume") or 0)
+            except Exception:
+                sv = 0
+            # Keep a floor weight so lower-volume questions still contribute.
+            weighted_keywords.append((kw, max(1, sv)))
+        if not weighted_keywords:
+            return result
+        # #region agent log
+        _debug.log(
+            "dataforseo_utils.py:get_question_coverage_for_site:keywords",
+            "Resolved weighted question keywords",
+            {
+                "keywords_count": len(weighted_keywords),
+                "sample_keywords": [kw for kw, _sv in weighted_keywords[:5]],
+            },
+            "H9",
+        )
+        # #endregion
+        logger.info(
+            "[AEO debug eb0539] H9 keywords count=%s sample=%s",
+            len(weighted_keywords),
+            [kw for kw, _sv in weighted_keywords[:5]],
+        )
+
+        if not normalized_domain:
+            result["questions_missing"] = [kw for kw, _sv in weighted_keywords]
+            return result
+
+        resolved_pages_raw = pages if pages is not None else _crawl_pages_for_aeo(
+            target_domain=normalized_domain,
+            location_code=location_code,
+            language_code=language_code,
+            max_pages=20,
+        )
+        if isinstance(resolved_pages_raw, dict):
+            resolved_pages = list(resolved_pages_raw.get("pages") or [])
+        else:
+            resolved_pages = list(resolved_pages_raw or [])
+
+        if not resolved_pages:
+            result["questions_missing"] = [kw for kw, _sv in weighted_keywords]
+            return result
+
+        text_fragments: List[str] = []
+        for page in resolved_pages:
+            text_fragments.extend(_extract_text_fragments_for_question_coverage(page))
+        page_text = " ".join(text_fragments).lower()
+        if not page_text.strip():
+            result["questions_missing"] = [kw for kw, _sv in weighted_keywords]
+            return result
+        # #region agent log
+        _debug.log(
+            "dataforseo_utils.py:get_question_coverage_for_site:text",
+            "Prepared page text for matching",
+            {
+                "text_length": len(page_text),
+                "fragments_count": len(text_fragments),
+                "contains_faq_token": ("faq" in page_text),
+            },
+            "H9",
+        )
+        # #endregion
+        logger.info(
+            "[AEO debug eb0539] H9 page text length=%s fragments=%s contains_faq=%s",
+            len(page_text),
+            len(text_fragments),
+            ("faq" in page_text),
+        )
+
+        questions_found: List[str] = []
+        questions_missing: List[str] = []
+        found_volume = 0
+        total_volume = 0
+        for kw, sv in weighted_keywords:
+            total_volume += int(sv)
+            # Require full phrase boundaries to avoid partial/garbage matches.
+            pattern = re.compile(rf"(?<!\w){re.escape(kw)}(?!\w)", re.IGNORECASE)
+            if pattern.search(page_text):
+                questions_found.append(kw)
+                found_volume += int(sv)
+            else:
+                questions_missing.append(kw)
+
+        score = int(round((found_volume / total_volume) * 100)) if total_volume > 0 else 0
+        # #region agent log
+        _debug.log(
+            "dataforseo_utils.py:get_question_coverage_for_site:match_summary",
+            "Question coverage match summary",
+            {
+                "found_count": len(questions_found),
+                "missing_count": len(questions_missing),
+                "score": int(score),
+                "sample_missing": questions_missing[:5],
+            },
+            "H9",
+        )
+        # #endregion
+        logger.info(
+            "[AEO debug eb0539] H9 match summary found=%s missing=%s score=%s",
+            len(questions_found),
+            len(questions_missing),
+            int(score),
+        )
+        result["question_coverage_score"] = score
+        result["questions_found"] = questions_found
+        result["questions_missing"] = questions_missing
+        return result
+    except Exception:
+        logger.exception(
+            "[DataForSEO] get_question_coverage_for_site failed for domain=%s niche=%s",
+            target_domain,
+            niche,
+        )
+        return result
+
+
+def get_aeo_content_readiness_for_site(
+    *,
+    target_domain: Optional[str],
+    niche: Optional[str] = None,
+    cache_key_seed: Optional[str] = None,
+    force_refresh: bool = False,
+    location_code: Optional[int] = None,
+    language_code: str = "en",
+    profile_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Aggregate isolated AEO checks:
+    - question coverage
+    - FAQ readiness
+    - snippet readiness
+    """
+    default_result: Dict[str, Any] = {
+        "aeo_status": "ready",
+        "aeo_last_computed_at": None,
+        "question_coverage_score": 0,
+        "questions_found": [],
+        "questions_missing": [],
+        "faq_readiness_score": 0,
+        "faq_blocks_found": 0,
+        "faq_schema_present": False,
+        "snippet_readiness_score": 0,
+        "answer_blocks_found": 0,
+    }
+    try:
+        normalized_domain = normalize_domain(target_domain) if target_domain else ""
+        normalized_niche = (niche or "").strip().lower()
+        cache_seed = (cache_key_seed or "").strip().lower()
+        cache_key = (
+            f"aeo_readiness:{cache_seed}:{normalized_domain}:{normalized_niche}:"
+            f"{int(location_code if location_code is not None else getattr(settings, 'DATAFORSEO_LOCATION_CODE', 2840))}:{language_code}"
+        )
+        cache_ttl_seconds = int(timedelta(days=7).total_seconds())
+        if not force_refresh:
+            cached = cache.get(cache_key)
+            if isinstance(cached, dict):
+                # #region agent log
+                _debug.log(
+                    "dataforseo_utils.py:get_aeo_content_readiness_for_site:cache_hit",
+                    "AEO readiness cache hit",
+                    {
+                        "cache_key_seed": cache_seed,
+                        "normalized_domain": normalized_domain,
+                        "force_refresh": bool(force_refresh),
+                    },
+                    "H2",
+                )
+                # #endregion
+                logger.info(
+                    "[AEO debug eb0539] H2 cache hit domain=%s niche=%s key=%s",
+                    normalized_domain,
+                    normalized_niche,
+                    cache_key,
+                )
+                return {**default_result, **cached}
+
+        question_keywords = get_question_intent_keywords(
+            target_domain=target_domain,
+            niche=niche,
+            location_code=location_code,
+            language_code=language_code,
+            limit=20,
+        )
+        crawl_result = _crawl_pages_for_aeo(
+            target_domain=normalized_domain,
+            location_code=location_code,
+            language_code=language_code,
+            max_pages=20,
+            crawl_scope=cache_seed or f"profile:{profile_id or 'unknown'}",
+            timeout_seconds=120,
+        )
+        if isinstance(crawl_result, list):
+            pages = list(crawl_result)
+            aeo_status = "ready"
+            exit_reason = "legacy_pages_list"
+        else:
+            pages = list((crawl_result or {}).get("pages") or [])
+            aeo_status = str((crawl_result or {}).get("aeo_status") or "ready")
+            exit_reason = str((crawl_result or {}).get("exit_reason") or "")
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if aeo_status in {"processing", "timed_out"}:
+            snapshot = None
+            if profile_id:
+                try:
+                    snapshot = AEOOverviewSnapshot.objects.filter(
+                        profile_id=profile_id,
+                        domain=normalized_domain or "",
+                        location_code=int(
+                            location_code
+                            if location_code is not None
+                            else getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840)
+                        ),
+                    ).first()
+                except Exception:
+                    snapshot = None
+            if snapshot:
+                snapshot_result = {
+                    **default_result,
+                    "aeo_status": aeo_status,
+                    "aeo_last_computed_at": snapshot.refreshed_at.isoformat() if snapshot.refreshed_at else now_iso,
+                    "question_coverage_score": int(snapshot.question_coverage_score or 0),
+                    "questions_found": list(snapshot.questions_found or []),
+                    "questions_missing": list(snapshot.questions_missing or []),
+                    "faq_readiness_score": int(snapshot.faq_readiness_score or 0),
+                    "faq_blocks_found": int(snapshot.faq_blocks_found or 0),
+                    "faq_schema_present": bool(snapshot.faq_schema_present),
+                    "snippet_readiness_score": int(snapshot.snippet_readiness_score or 0),
+                    "answer_blocks_found": int(snapshot.answer_blocks_found or 0),
+                }
+                logger.info(
+                    "[AEO crawl] status=%s exit_reason=%s using_snapshot profile_id=%s domain=%s",
+                    aeo_status,
+                    exit_reason,
+                    profile_id,
+                    normalized_domain,
+                )
+                return snapshot_result
+            degraded = {
+                **default_result,
+                "aeo_status": aeo_status,
+                "aeo_last_computed_at": None,
+            }
+            logger.warning(
+                "[AEO crawl] status=%s exit_reason=%s no_snapshot profile_id=%s domain=%s",
+                aeo_status,
+                exit_reason,
+                profile_id,
+                normalized_domain,
+            )
+            return degraded
+
+        question_data = get_question_coverage_for_site(
+            target_domain=target_domain,
+            niche=niche,
+            location_code=location_code,
+            language_code=language_code,
+            pages=pages,
+            keywords_rows=question_keywords,
+        )
+        faq_data = compute_faq_readiness_for_pages(pages)
+        snippet_data = compute_snippet_readiness_for_pages(pages)
+        result = {
+            **default_result,
+            "aeo_status": "ready",
+            "aeo_last_computed_at": now_iso,
+            **(question_data or {}),
+            **(faq_data or {}),
+            **(snippet_data or {}),
+        }
+        # #region agent log
+        _debug.log(
+            "dataforseo_utils.py:get_aeo_content_readiness_for_site:computed",
+            "Computed AEO readiness result",
+            {
+                "normalized_domain": normalized_domain,
+                "pages_count": len(pages or []),
+                "question_coverage_score": int(result.get("question_coverage_score") or 0),
+                "faq_readiness_score": int(result.get("faq_readiness_score") or 0),
+                "snippet_readiness_score": int(result.get("snippet_readiness_score") or 0),
+                "questions_found_count": len(result.get("questions_found") or []),
+                "questions_missing_count": len(result.get("questions_missing") or []),
+                "aeo_status": result.get("aeo_status"),
+                "exit_reason": exit_reason,
+            },
+            "H5",
+        )
+        # #endregion
+        logger.info(
+            "[AEO debug eb0539] H5 computed domain=%s pages=%s q=%s faq=%s snip=%s found=%s missing=%s",
+            normalized_domain,
+            len(pages or []),
+            int(result.get("question_coverage_score") or 0),
+            int(result.get("faq_readiness_score") or 0),
+            int(result.get("snippet_readiness_score") or 0),
+            len(result.get("questions_found") or []),
+            len(result.get("questions_missing") or []),
+        )
+        cache.set(cache_key, result, cache_ttl_seconds)
+        return result
+    except Exception:
+        logger.exception(
+            "[DataForSEO] get_aeo_content_readiness_for_site failed for domain=%s niche=%s",
+            target_domain,
+            niche,
+        )
+        return default_result
 
 
 def get_keyword_gap_keywords(

@@ -217,6 +217,52 @@ class SEOOverviewSnapshot(models.Model):
         return f"SEOOverviewSnapshot(user={self.user!s}, period_start={self.period_start})"
 
 
+class AEOOverviewSnapshot(models.Model):
+    """
+    Cached AEO readiness metrics per profile/domain/location.
+    Used for serializer-level reuse and basic historical/audit visibility.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="aeo_overview_snapshots",
+    )
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_overview_snapshots",
+    )
+    domain = models.CharField(max_length=255, blank=True)
+    location_code = models.IntegerField(default=2840)
+    location_label = models.CharField(max_length=255, blank=True, default="")
+    niche = models.CharField(max_length=255, blank=True, default="")
+
+    aeo_score = models.IntegerField(default=0)
+    question_coverage_score = models.IntegerField(default=0)
+    questions_found = models.JSONField(default=list, blank=True)
+    questions_missing = models.JSONField(default=list, blank=True)
+    faq_readiness_score = models.IntegerField(default=0)
+    faq_blocks_found = models.IntegerField(default=0)
+    faq_schema_present = models.BooleanField(default=False)
+    snippet_readiness_score = models.IntegerField(default=0)
+    answer_blocks_found = models.IntegerField(default=0)
+    aeo_recommendations = models.JSONField(default=list, blank=True)
+
+    refreshed_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("profile", "domain", "location_code")
+        verbose_name = "AEO overview snapshot"
+        verbose_name_plural = "AEO overview snapshots"
+
+    def __str__(self) -> str:
+        return (
+            f"AEOOverviewSnapshot(profile_id={self.profile_id}, "
+            f"domain={self.domain}, location_code={self.location_code})"
+        )
+
+
 class OnPageAuditSnapshot(models.Model):
     """
     Cached On-Page / Technical SEO audit metrics per user & domain.
