@@ -4,7 +4,7 @@ from django.utils import timezone
 from rest_framework import serializers
 import logging
 
-from .constants import SEO_SNAPSHOT_TTL
+from .constants import AEO_RECOMMENDATIONS_TTL, SEO_SNAPSHOT_TTL
 from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot
 from .dataforseo_utils import get_or_refresh_seo_score_for_user
 from .dataforseo_utils import (
@@ -12,6 +12,7 @@ from .dataforseo_utils import (
     get_profile_location_code,
     normalize_domain,
 )
+from .openai_utils import generate_aeo_recommendations
 from . import debug_log as _debug
 
 
@@ -295,7 +296,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                     "snippet_readiness_score": int(snapshot.snippet_readiness_score or 0),
                     "answer_blocks_found": int(snapshot.answer_blocks_found or 0),
                     "aeo_score": int(snapshot.aeo_score or 0),
-                    "aeo_recommendations": list(snapshot.aeo_recommendations or []),
+                    "aeo_recommendations": list(snapshot.aeo_recommendations or [])[:5],
                     "aeo_status": "ready",
                     "aeo_last_computed_at": snapshot.refreshed_at.isoformat() if snapshot.refreshed_at else None,
                 }
@@ -378,15 +379,38 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         aeo_score = max(0, min(100, aeo_score))
 
         recommendations: list[str] = []
-        if question_coverage_score < 60:
-            recommendations.append("Add content answering customer search questions")
-        if faq_readiness_score < 60:
-            recommendations.append("Add FAQ sections and FAQ schema")
-        if snippet_readiness_score < 60:
-            recommendations.append("Shorten answer paragraphs under headings")
+        existing_snapshot = AEOOverviewSnapshot.objects.filter(
+            profile=obj,
+            domain=domain or "",
+            location_code=int(resolved_location_code),
+        ).first()
+        should_refresh_recommendations = True
+        if (
+            existing_snapshot
+            and existing_snapshot.aeo_recommendations
+            and existing_snapshot.aeo_recommendations_refreshed_at
+            and (timezone.now() - existing_snapshot.aeo_recommendations_refreshed_at) <= AEO_RECOMMENDATIONS_TTL
+        ):
+            should_refresh_recommendations = False
+            recommendations = list(existing_snapshot.aeo_recommendations or [])[:5]
+        if should_refresh_recommendations:
+            seo_bundle = self._get_seo_bundle(obj) or {}
+            recommendations = generate_aeo_recommendations(safe_bundle, seo_bundle)[:5]
+        if not recommendations:
+            # Minimal safe fallback if OpenAI fails.
+            recommendations = [
+                "Publish a dedicated FAQ page targeting your highest-volume missing questions.",
+                "Add concise 40-60 word answer blocks directly below question-style headings.",
+                "Implement or validate FAQPage schema on core service pages.",
+                "Expand content on pages with high-volume keywords where rank is weak or missing.",
+                "Refresh internal linking so top-demand question pages are linked from navigation.",
+            ]
+        recommendations_refreshed_at = timezone.now() if should_refresh_recommendations else (
+            existing_snapshot.aeo_recommendations_refreshed_at if existing_snapshot else timezone.now()
+        )
 
         safe_bundle["aeo_score"] = aeo_score
-        safe_bundle["aeo_recommendations"] = recommendations
+        safe_bundle["aeo_recommendations"] = recommendations[:5]
         # #region agent log
         _debug.log(
             "serializers.py:BusinessProfileSerializer:_get_aeo_bundle:computed_bundle",
@@ -422,6 +446,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 "snippet_readiness_score": int(safe_bundle["snippet_readiness_score"] or 0),
                 "answer_blocks_found": int(safe_bundle["answer_blocks_found"] or 0),
                 "aeo_recommendations": list(safe_bundle["aeo_recommendations"] or []),
+                "aeo_recommendations_refreshed_at": recommendations_refreshed_at,
             },
         )
         cache_map[cache_key] = safe_bundle

@@ -248,6 +248,7 @@ class AEOOverviewSnapshot(models.Model):
     snippet_readiness_score = models.IntegerField(default=0)
     answer_blocks_found = models.IntegerField(default=0)
     aeo_recommendations = models.JSONField(default=list, blank=True)
+    aeo_recommendations_refreshed_at = models.DateTimeField(null=True, blank=True)
 
     refreshed_at = models.DateTimeField(auto_now=True)
 

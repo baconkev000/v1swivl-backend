@@ -380,6 +380,80 @@ def generate_keyword_action_suggestions(keywords: list[dict]) -> list[dict]:
         return []
 
 
+def generate_aeo_recommendations(aeo_data: dict, seo_data: dict | None = None) -> list[str]:
+    """
+    Generate exactly 5 actionable AEO next-step suggestions.
+    Uses AEO metrics plus relevant SEO context to prioritize impact.
+    Returns a list of suggestion strings.
+    """
+    if not aeo_data:
+        return []
+
+    seo_data = seo_data or {}
+    question_coverage = int(aeo_data.get("question_coverage_score") or 0)
+    faq_readiness = int(aeo_data.get("faq_readiness_score") or 0)
+    snippet_readiness = int(aeo_data.get("snippet_readiness_score") or 0)
+    questions_missing = list(aeo_data.get("questions_missing") or [])[:12]
+    top_keywords = list((seo_data or {}).get("top_keywords") or [])[:12]
+    visibility = seo_data.get("search_visibility_percent")
+    organic = seo_data.get("organic_visitors")
+    missed = seo_data.get("missed_searches_monthly")
+
+    keyword_preview = []
+    for row in top_keywords:
+        kw = str((row or {}).get("keyword") or "").strip()
+        sv = int((row or {}).get("search_volume") or 0)
+        rank = (row or {}).get("rank")
+        if kw:
+            keyword_preview.append(f"{kw} (sv={sv}, rank={rank})")
+
+    system = (
+        "You are an Answer Engine Optimization strategist. "
+        "Given AEO and SEO performance data, produce exactly 5 highly actionable next steps "
+        "to improve AEO score in the next 30 days. Focus on question coverage, FAQ quality, "
+        "snippet-ready answer blocks, and entity clarity. "
+        "Output only a JSON array of 5 plain strings. No markdown, no numbering, no extra text."
+    )
+    user_content = (
+        "AEO data:\n"
+        f"- question_coverage_score: {question_coverage}\n"
+        f"- faq_readiness_score: {faq_readiness}\n"
+        f"- snippet_readiness_score: {snippet_readiness}\n"
+        f"- sample_questions_missing: {questions_missing}\n\n"
+        "Relevant SEO context:\n"
+        f"- search_visibility_percent: {visibility}\n"
+        f"- organic_visitors: {organic}\n"
+        f"- missed_searches_monthly: {missed}\n"
+        f"- top_keywords: {keyword_preview}\n\n"
+        "Return a JSON array of exactly 5 short actionable recommendations."
+    )
+
+    try:
+        client = _get_client("OPEN_AI_SEO_API_KEY")
+        model = _get_model()
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rstrip("`").strip()
+        payload = json.loads(raw)
+        if not isinstance(payload, list):
+            return []
+        out: list[str] = []
+        for item in payload:
+            rec = str(item or "").strip()
+            if rec:
+                out.append(rec)
+        return out[:5]
+    except Exception:
+        return []
+
+
 def summarize_reviews_conversation(messages: list[ReviewsMessage]) -> str:
     """
     Ask OpenAI to summarize a Reviews conversation into concise memory notes.
