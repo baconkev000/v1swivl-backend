@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 
 from celery import shared_task
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone as django_tz
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             enrich_with_gap_keywords,
             enrich_with_llm_keywords,
             enrich_keyword_ranks_from_labs,
+            recompute_snapshot_metrics_from_keywords,
         )
 
         enrich_with_gap_keywords(domain, location_code, language_code, user, top_keywords)
@@ -188,9 +190,58 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     )
 
     try:
-        snapshot.top_keywords = top_keywords_sorted
-        snapshot.keywords_enriched_at = django_tz.now()
-        snapshot.save(update_fields=["top_keywords", "keywords_enriched_at"])
+        metrics = recompute_snapshot_metrics_from_keywords(
+            top_keywords=top_keywords_sorted,
+            domain=domain,
+            location_code=location_code,
+            language_code=language_code,
+        )
+        logger.info(
+            "[SEO async] recompute snapshot_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
+            snapshot_id,
+            keywords_with_rank,
+            int(snapshot.organic_visitors or 0),
+            int(metrics.get("estimated_traffic") or 0),
+            int(snapshot.total_search_volume or 0),
+            int(metrics.get("total_search_volume") or 0),
+            int(snapshot.search_visibility_percent or 0),
+            int(metrics.get("search_visibility_percent") or 0),
+            int(snapshot.missed_searches_monthly or 0),
+            int(metrics.get("missed_searches_monthly") or 0),
+        )
+        if (
+            keywords_with_rank > 0
+            and int(metrics.get("search_visibility_percent") or 0) == 0
+            and int(metrics.get("total_search_volume") or 0) > 0
+        ):
+            logger.warning(
+                "[SEO async] consistency_check snapshot_id=%s ranked_keywords=%s visibility_zero_with_volume=true",
+                snapshot_id,
+                keywords_with_rank,
+            )
+        with transaction.atomic():
+            snapshot.top_keywords = top_keywords_sorted
+            snapshot.keywords_enriched_at = django_tz.now()
+            snapshot.organic_visitors = int(metrics.get("estimated_traffic") or 0)
+            snapshot.total_search_volume = int(metrics.get("total_search_volume") or 0)
+            snapshot.search_visibility_percent = int(metrics.get("search_visibility_percent") or 0)
+            snapshot.missed_searches_monthly = int(metrics.get("missed_searches_monthly") or 0)
+            snapshot.search_performance_score = int(metrics.get("search_performance_score") or 0)
+            snapshot.keywords_ranking = int(metrics.get("keywords_ranking") or 0)
+            snapshot.top3_positions = int(metrics.get("top3_positions") or 0)
+            snapshot.save(
+                update_fields=[
+                    "top_keywords",
+                    "keywords_enriched_at",
+                    "organic_visitors",
+                    "total_search_volume",
+                    "search_visibility_percent",
+                    "missed_searches_monthly",
+                    "search_performance_score",
+                    "keywords_ranking",
+                    "top3_positions",
+                ]
+            )
 
         # Debug evidence after enrichment: did we keep rank values or end up null?
         try:

@@ -394,7 +394,15 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             should_refresh_recommendations = False
             recommendations = list(existing_snapshot.aeo_recommendations or [])[:5]
         if should_refresh_recommendations:
-            seo_bundle = self._get_seo_bundle(obj) or {}
+            context = getattr(self, "context", {}) or {}
+            if bool(context.get("disable_seo_context_for_aeo")):
+                logger.warning(
+                    "[AEO guard] disable_seo_context_for_aeo enabled; skipping SEO helper for profile id=%s",
+                    getattr(obj, "id", None),
+                )
+                seo_bundle = {}
+            else:
+                seo_bundle = self._get_seo_bundle(obj) or {}
             recommendations = generate_aeo_recommendations(safe_bundle, seo_bundle)[:5]
         if not recommendations:
             # Minimal safe fallback if OpenAI fails.
@@ -513,3 +521,80 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if not bundle:
             return "complete"
         return bundle.get("enrichment_status") or "complete"
+
+
+class BusinessProfileSEOSerializer(BusinessProfileSerializer):
+    class Meta(BusinessProfileSerializer.Meta):
+        fields = [
+            "id",
+            "email",
+            "full_name",
+            "business_name",
+            "business_address",
+            "industry",
+            "tone_of_voice",
+            "phone",
+            "description",
+            "website_url",
+            "plan",
+            "is_main",
+            "seo_competitor_domains_override",
+            "seo_score",
+            "search_performance_score",
+            "search_visibility_percent",
+            "missed_searches_monthly",
+            "total_search_volume",
+            "organic_visitors",
+            "top_keywords",
+            "seo_next_steps",
+            "keyword_action_suggestions",
+            "enrichment_status",
+            "created_at",
+            "updated_at",
+        ]
+
+    def _get_aeo_bundle(self, obj: BusinessProfile) -> dict:
+        logger.warning(
+            "[SEO guard] AEO bundle requested from SEO serializer for profile id=%s; returning empty",
+            getattr(obj, "id", None),
+        )
+        return {}
+
+
+class BusinessProfileAEOSerializer(BusinessProfileSerializer):
+    class Meta(BusinessProfileSerializer.Meta):
+        fields = [
+            "id",
+            "email",
+            "full_name",
+            "business_name",
+            "business_address",
+            "industry",
+            "tone_of_voice",
+            "phone",
+            "description",
+            "website_url",
+            "plan",
+            "is_main",
+            "aeo_score",
+            "question_coverage_score",
+            "questions_found",
+            "questions_missing",
+            "faq_readiness_score",
+            "faq_blocks_found",
+            "faq_schema_present",
+            "snippet_readiness_score",
+            "answer_blocks_found",
+            "aeo_recommendations",
+            "aeo_status",
+            "aeo_last_computed_at",
+            "created_at",
+            "updated_at",
+        ]
+
+    def _get_seo_bundle(self, obj: BusinessProfile) -> dict | None:
+        logger.warning(
+            "[AEO guard] SEO bundle requested from AEO serializer for profile id=%s; returning none",
+            getattr(obj, "id", None),
+        )
+        return None

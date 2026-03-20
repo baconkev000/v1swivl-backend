@@ -52,6 +52,9 @@ urlpatterns += [
     path("api/seo/keyword-debug/", accounts_views.seo_keyword_debug, name="seo-keyword-debug"),
     # Force-refresh SEO snapshot (keywords, rankings, visibility) for main business profile
     path("api/seo/refresh-snapshot/", accounts_views.refresh_seo_snapshot, name="refresh-seo-snapshot"),
+    path("api/seo/profile/", accounts_views.seo_profile_data, name="seo-profile-data"),
+    path("api/aeo/profile/", accounts_views.aeo_profile_data, name="aeo-profile-data"),
+    path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
     # SEO agent chat
     path("api/seo/chat/", accounts_views.seo_chat, name="seo-chat"),
     # API logout to clear Django/Google SSO session

@@ -2388,6 +2388,19 @@ def fetch_ranked_keyword_items(
         payload,
     )
     ranked_data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
+    # #region agent log
+    _debug.log(
+        "dataforseo_utils.py:fetch_ranked_keyword_items:response_shape",
+        "Ranked keywords raw response shape",
+        {
+            "domain": domain,
+            "ranked_data_type": type(ranked_data).__name__ if ranked_data is not None else "NoneType",
+            "top_keys": list((ranked_data or {}).keys())[:8] if isinstance(ranked_data, dict) else [],
+            "tasks_count": len((ranked_data or {}).get("tasks") or []) if isinstance(ranked_data, dict) else -1,
+        },
+        "S1",
+    )
+    # #endregion
     _dbg_ba84ae_log(
         hypothesisId="H0_ranked_keywords_request_response",
         location="accounts/dataforseo_utils.py:fetch_ranked_keyword_items",
@@ -2429,6 +2442,14 @@ def fetch_ranked_keyword_items(
     try:
         tasks = ranked_data.get("tasks") or []
         if not tasks:
+            # #region agent log
+            _debug.log(
+                "dataforseo_utils.py:fetch_ranked_keyword_items:no_tasks",
+                "Ranked keywords has no tasks",
+                {"domain": domain, "raw_preview": str(ranked_data)[:300]},
+                "S2",
+            )
+            # #endregion
             raise ValueError("no tasks")
         task = tasks[0]
         results = task.get("result") or []
@@ -2436,6 +2457,19 @@ def fetch_ranked_keyword_items(
             raise ValueError("no results")
         result = results[0]
         items = result.get("items") or []
+        # #region agent log
+        _debug.log(
+            "dataforseo_utils.py:fetch_ranked_keyword_items:parsed_items",
+            "Parsed ranked keyword items",
+            {
+                "domain": domain,
+                "items_count": len(items),
+                "task_status_code": task.get("status_code"),
+                "task_status_message": task.get("status_message"),
+            },
+            "S3",
+        )
+        # #endregion
         logger.info(
             "[SEO score] ranked_keywords parsed user_id=%s domain=%s task_status=%s items=%s",
             getattr(user, "id", None),
@@ -3154,6 +3188,79 @@ def compute_visibility_metrics(
     }
 
 
+def recompute_snapshot_metrics_from_keywords(
+    *,
+    top_keywords: List[Dict[str, Any]],
+    domain: str,
+    location_code: int,
+    language_code: str = "en",
+) -> Dict[str, int]:
+    """
+    Recompute aggregate snapshot metrics from enriched keyword rows.
+    Keeps spotlight metrics in sync with refreshed top_keywords ranks.
+    """
+    rows = list(top_keywords or [])
+    total_search_volume = 0.0
+    estimated_traffic = 0.0
+    keywords_ranking = 0
+    top3_positions = 0
+    top10_positions = 0
+    difficulty_values: List[float] = []
+
+    for row in rows:
+        try:
+            sv = max(float((row or {}).get("search_volume") or 0), 0.0)
+        except (TypeError, ValueError):
+            sv = 0.0
+        total_search_volume += sv
+
+        rank_raw = (row or {}).get("rank")
+        try:
+            rank_int = int(rank_raw) if rank_raw is not None else None
+        except (TypeError, ValueError):
+            rank_int = None
+        if isinstance(rank_int, int) and rank_int > 0:
+            keywords_ranking += 1
+            if rank_int <= 3:
+                top3_positions += 1
+            if rank_int <= 10:
+                top10_positions += 1
+            estimated_traffic += sv * _ctr_for_position(rank_int)
+
+        for diff_key in ("keyword_difficulty", "difficulty"):
+            diff_raw = (row or {}).get(diff_key)
+            if diff_raw is None:
+                continue
+            try:
+                dv = float(diff_raw)
+            except (TypeError, ValueError):
+                continue
+            difficulty_values.append(max(0.0, min(100.0, dv)))
+            break
+
+    avg_difficulty = (sum(difficulty_values) / len(difficulty_values)) if difficulty_values else None
+    visibility = compute_visibility_metrics(
+        rows,
+        estimated_traffic,
+        keywords_ranking,
+        top3_positions,
+        top10_positions,
+        avg_difficulty,
+        domain,
+        int(location_code),
+        language_code,
+    )
+    return {
+        "estimated_traffic": int(round(max(0.0, estimated_traffic))),
+        "total_search_volume": int(visibility.get("total_search_volume") or 0),
+        "search_visibility_percent": int(visibility.get("search_visibility_percent") or 0),
+        "missed_searches_monthly": int(visibility.get("missed_searches_monthly") or 0),
+        "search_performance_score": int(visibility.get("search_performance_score") or 0),
+        "keywords_ranking": int(keywords_ranking),
+        "top3_positions": int(top3_positions),
+    }
+
+
 def save_seo_snapshot(
     user,
     period_start,
@@ -3334,6 +3441,20 @@ def get_or_refresh_seo_score_for_user(
         return None
 
     snapshot = get_cached_seo_snapshot(user, domain, start_current, cache_ttl, now_utc)
+    # #region agent log
+    _debug.log(
+        "dataforseo_utils.py:get_or_refresh_seo_score_for_user:cache_probe",
+        "SEO snapshot cache probe",
+        {
+            "user_id": getattr(user, "id", None),
+            "domain": domain,
+            "force_refresh": bool(force_refresh),
+            "snapshot_found": snapshot is not None,
+            "cache_ttl_days": int(cache_ttl.days),
+        },
+        "S4",
+    )
+    # #endregion
     if snapshot and not force_refresh:
         try:
             cached_keywords = getattr(snapshot, "top_keywords", None) or []
@@ -3392,6 +3513,14 @@ def get_or_refresh_seo_score_for_user(
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
     items = fetch_ranked_keyword_items(domain, location_code, language_code, user)
     if not items:
+        # #region agent log
+        _debug.log(
+            "dataforseo_utils.py:get_or_refresh_seo_score_for_user:empty_items_zero_fallback",
+            "No ranked keyword items; returning zero SEO response",
+            {"user_id": getattr(user, "id", None), "domain": domain},
+            "S5",
+        )
+        # #endregion
         return _build_empty_seo_response(user, site_url)
 
     metrics = compute_ranked_metrics(items)

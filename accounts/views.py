@@ -31,7 +31,11 @@ from .models import (
 THIRD_PARTY_CACHE_TTL = timedelta(hours=1)
 # Google My Business Account Management API: 1 request per minute per project. Enforce per-user to avoid 429.
 GBP_API_MIN_INTERVAL_SECONDS = 60
-from .serializers import BusinessProfileSerializer
+from .serializers import (
+    BusinessProfileAEOSerializer,
+    BusinessProfileSEOSerializer,
+    BusinessProfileSerializer,
+)
 from .meta_ads_utils import get_meta_ads_status_for_user
 from .tiktok_ads_utils import get_tiktok_ads_status_for_user
 from .dataforseo_utils import (
@@ -1517,7 +1521,7 @@ def business_profile(request: HttpRequest) -> Response:
         force_aeo_refresh = str(request.GET.get("refresh_aeo", "")).strip().lower() in {"1", "true", "yes"}
         serializer = BusinessProfileSerializer(
             profile,
-            context={"force_aeo_refresh": force_aeo_refresh},
+            context={"force_aeo_refresh": force_aeo_refresh, "disable_seo_context_for_aeo": True},
         )
         return Response(serializer.data)
 
@@ -1544,6 +1548,67 @@ def business_profile(request: HttpRequest) -> Response:
             # Never block profile saves on DataForSEO errors.
             pass
 
+    return Response(serializer.data)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def seo_profile_data(request: HttpRequest) -> Response:
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+    serializer = BusinessProfileSEOSerializer(profile)
+    return Response(serializer.data)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_profile_data(request: HttpRequest) -> Response:
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+    serializer = BusinessProfileAEOSerializer(
+        profile,
+        context={"force_aeo_refresh": False, "disable_seo_context_for_aeo": True},
+    )
+    return Response(serializer.data)
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def refresh_aeo_snapshot(request: HttpRequest) -> Response:
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"detail": "No main business profile is configured."}, status=400)
+    logger.info(
+        "[refresh_endpoint] module=aeo user_id=%s profile_id=%s refresh_started=true external_api_called=true",
+        getattr(request.user, "id", None),
+        getattr(profile, "id", None),
+    )
+    serializer = BusinessProfileAEOSerializer(
+        profile,
+        context={"force_aeo_refresh": True, "disable_seo_context_for_aeo": True},
+    )
+    logger.info(
+        "[refresh_endpoint] module=aeo user_id=%s profile_id=%s refresh_completed=true external_api_called=true",
+        getattr(request.user, "id", None),
+        getattr(profile, "id", None),
+    )
     return Response(serializer.data)
 
 
@@ -1713,6 +1778,12 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         )
 
     site_url = profile.website_url
+    logger.info(
+        "[refresh_endpoint] module=seo user_id=%s profile_id=%s refresh_started=true external_api_called=false",
+        getattr(user, "id", None),
+        getattr(profile, "id", None),
+    )
+    external_api_called = False
     try:
         # IMPORTANT:
         # ranked_keywords/live is returning rank_absolute=null in our current pipeline.
@@ -1726,6 +1797,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
             enrich_with_gap_keywords,
             enrich_with_llm_keywords,
             enrich_keyword_ranks_from_labs,
+            recompute_snapshot_metrics_from_keywords,
         )
         from .tasks import (
             generate_snapshot_next_steps_task,
@@ -1768,6 +1840,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                 user=user,
                 top_keywords=top_keywords,
             )
+            external_api_called = True
             enrich_with_llm_keywords(
                 user=user,
                 location_code=location_code,
@@ -1780,6 +1853,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                 top_keywords=top_keywords,
                 user=user,
             )
+            external_api_called = True
             total = int(rank_stats.get("total") or 0)
             ranked_after = int(rank_stats.get("non_null_after") or 0)
             coverage = (ranked_after / total) if total > 0 else 0.0
@@ -1868,12 +1942,59 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                 competitor_pct,
                 outranking_competitor_pct,
             )
+            metrics = recompute_snapshot_metrics_from_keywords(
+                top_keywords=top_keywords_sorted,
+                domain=domain,
+                location_code=location_code,
+                language_code=language_code,
+            )
+            logger.info(
+                "[SEO refresh] recompute user_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
+                getattr(user, "id", None),
+                keywords_with_rank,
+                int(snapshot.organic_visitors or 0),
+                int(metrics.get("estimated_traffic") or 0),
+                int(snapshot.total_search_volume or 0),
+                int(metrics.get("total_search_volume") or 0),
+                int(snapshot.search_visibility_percent or 0),
+                int(metrics.get("search_visibility_percent") or 0),
+                int(snapshot.missed_searches_monthly or 0),
+                int(metrics.get("missed_searches_monthly") or 0),
+            )
+            if (
+                keywords_with_rank > 0
+                and int(metrics.get("search_visibility_percent") or 0) == 0
+                and int(metrics.get("total_search_volume") or 0) > 0
+            ):
+                logger.warning(
+                    "[SEO refresh] consistency_check user_id=%s ranked_keywords=%s visibility_zero_with_volume=true",
+                    getattr(user, "id", None),
+                    keywords_with_rank,
+                )
             snapshot.top_keywords = top_keywords_sorted
             snapshot.keywords_enriched_at = datetime.now(timezone.utc)
-            # Mark the snapshot as freshly enriched so the 7-day cache logic
-            # does not overwrite these keywords/ranks with new null-ranked data.
             snapshot.refreshed_at = datetime.now(timezone.utc)
-            snapshot.save(update_fields=["top_keywords", "keywords_enriched_at", "refreshed_at"])
+            snapshot.organic_visitors = int(metrics.get("estimated_traffic") or 0)
+            snapshot.total_search_volume = int(metrics.get("total_search_volume") or 0)
+            snapshot.search_visibility_percent = int(metrics.get("search_visibility_percent") or 0)
+            snapshot.missed_searches_monthly = int(metrics.get("missed_searches_monthly") or 0)
+            snapshot.search_performance_score = int(metrics.get("search_performance_score") or 0)
+            snapshot.keywords_ranking = int(metrics.get("keywords_ranking") or 0)
+            snapshot.top3_positions = int(metrics.get("top3_positions") or 0)
+            snapshot.save(
+                update_fields=[
+                    "top_keywords",
+                    "keywords_enriched_at",
+                    "refreshed_at",
+                    "organic_visitors",
+                    "total_search_volume",
+                    "search_visibility_percent",
+                    "missed_searches_monthly",
+                    "search_performance_score",
+                    "keywords_ranking",
+                    "top3_positions",
+                ]
+            )
 
             # Next steps / action suggestions can remain async.
             generate_snapshot_next_steps_task.delay(snapshot.id)
@@ -1882,7 +2003,13 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         # Never block the UI on SEO refresh failures; return the profile anyway.
         pass
 
-    serializer = BusinessProfileSerializer(profile)
+    logger.info(
+        "[refresh_endpoint] module=seo user_id=%s profile_id=%s refresh_completed=true external_api_called=%s",
+        getattr(user, "id", None),
+        getattr(profile, "id", None),
+        bool(external_api_called),
+    )
+    serializer = BusinessProfileSEOSerializer(profile)
     return Response(serializer.data)
 
 @csrf_exempt
