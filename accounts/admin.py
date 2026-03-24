@@ -1,6 +1,10 @@
 from django.contrib import admin
 
 from .models import (
+    AEOExtractionSnapshot,
+    AEOResponseSnapshot,
+    AEORecommendationRun,
+    AEOScoreSnapshot,
     BusinessProfile,
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
@@ -14,6 +18,72 @@ from .models import (
     ReviewsConversation,
     ReviewsMessage,
 )
+
+
+@admin.register(AEORecommendationRun)
+class AEORecommendationRunAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "profile",
+        "score_snapshot",
+        "visibility_score_at_run",
+        "citation_share_at_run",
+        "created_at",
+    )
+    list_filter = ("created_at",)
+    search_fields = ("profile__business_name",)
+    raw_id_fields = ("profile", "score_snapshot")
+
+
+@admin.register(AEOScoreSnapshot)
+class AEOScoreSnapshotAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "profile",
+        "visibility_score",
+        "weighted_position_score",
+        "citation_share",
+        "total_prompts",
+        "total_mentions",
+        "created_at",
+    )
+    list_filter = ("created_at",)
+    search_fields = ("profile__business_name",)
+    raw_id_fields = ("profile",)
+
+
+@admin.register(AEOExtractionSnapshot)
+class AEOExtractionSnapshotAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "response_snapshot",
+        "brand_mentioned",
+        "mention_position",
+        "mention_count",
+        "sentiment",
+        "extraction_parse_failed",
+        "extraction_model",
+        "created_at",
+    )
+    list_filter = ("brand_mentioned", "mention_position", "sentiment", "extraction_parse_failed")
+    search_fields = ("response_snapshot__prompt_hash", "response_snapshot__prompt_text")
+    raw_id_fields = ("response_snapshot",)
+
+
+@admin.register(AEOResponseSnapshot)
+class AEOResponseSnapshotAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "profile",
+        "prompt_hash",
+        "prompt_type",
+        "model_name",
+        "platform",
+        "created_at",
+    )
+    list_filter = ("platform", "prompt_type", "is_dynamic")
+    search_fields = ("prompt_hash", "prompt_text", "profile__business_name")
+    raw_id_fields = ("profile",)
 
 
 @admin.register(BusinessProfile)

@@ -52,6 +52,24 @@ class BusinessProfile(models.Model):
         choices=SEO_LOCATION_MODE_CHOICES,
         default=SEO_LOCATION_MODE_ORGANIC,
     )
+    # Persisted SEO location context (used by DataForSEO helpers via getattr on profile).
+    seo_location_depth = models.IntegerField(
+        default=0,
+        help_text="Legacy; prefer seo_location_mode. Kept for DB compatibility and older clients.",
+    )
+    seo_location_code = models.IntegerField(
+        default=0,
+        help_text="DataForSEO location code when seo_location_mode is local; 0 means unset / use default.",
+    )
+    seo_location_label = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Human-readable location label for local SEO mode.",
+    )
+
+    # Onboarding / settings: ordered list of AEO visibility prompt strings the user chose to track.
+    selected_aeo_prompts = models.JSONField(default=list, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -300,6 +318,182 @@ class AEOOverviewSnapshot(models.Model):
             f"AEOOverviewSnapshot(profile_id={self.profile_id}, "
             f"domain={self.domain}, location_code={self.location_code})"
         )
+
+
+class AEOResponseSnapshot(models.Model):
+    """
+    Raw OpenAI (or other platform) answer for a single AEO visibility prompt.
+
+    One row per prompt execution; prompt_hash enables reruns and trend comparison.
+    """
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_response_snapshots",
+    )
+    prompt_text = models.TextField()
+    prompt_type = models.CharField(max_length=32, blank=True, default="")
+    weight = models.FloatField(default=1.0)
+    is_dynamic = models.BooleanField(default=False)
+    platform = models.CharField(max_length=64, default="openai")
+    model_name = models.CharField(max_length=128, blank=True, default="")
+    raw_response = models.TextField(blank=True, default="")
+    prompt_hash = models.CharField(max_length=64, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        verbose_name = "AEO response snapshot"
+        verbose_name_plural = "AEO response snapshots"
+        indexes = [
+            models.Index(
+                fields=["profile", "prompt_hash", "created_at"],
+                name="accounts_aeo_rsp_ph_cr",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        short = (self.prompt_hash or "")[:12]
+        return f"AEOResponseSnapshot(profile_id={self.profile_id}, hash={short}...)"
+
+
+class AEOExtractionSnapshot(models.Model):
+    """
+    Structured fields extracted from a raw AEOResponseSnapshot via second-pass LLM.
+
+    Always tied to one response row for debugging and scoring pipelines.
+    """
+
+    MENTION_TOP = "top"
+    MENTION_MIDDLE = "middle"
+    MENTION_BOTTOM = "bottom"
+    MENTION_NONE = "none"
+    MENTION_POSITION_CHOICES = [
+        (MENTION_TOP, "Top"),
+        (MENTION_MIDDLE, "Middle"),
+        (MENTION_BOTTOM, "Bottom"),
+        (MENTION_NONE, "None"),
+    ]
+
+    SENTIMENT_POSITIVE = "positive"
+    SENTIMENT_NEUTRAL = "neutral"
+    SENTIMENT_NEGATIVE = "negative"
+    SENTIMENT_CHOICES = [
+        (SENTIMENT_POSITIVE, "Positive"),
+        (SENTIMENT_NEUTRAL, "Neutral"),
+        (SENTIMENT_NEGATIVE, "Negative"),
+    ]
+
+    response_snapshot = models.ForeignKey(
+        AEOResponseSnapshot,
+        on_delete=models.CASCADE,
+        related_name="extraction_snapshots",
+    )
+    brand_mentioned = models.BooleanField(default=False)
+    mention_position = models.CharField(
+        max_length=16,
+        choices=MENTION_POSITION_CHOICES,
+        default=MENTION_NONE,
+    )
+    mention_count = models.IntegerField(default=0)
+    competitors_json = models.JSONField(default=list, blank=True)
+    citations_json = models.JSONField(default=list, blank=True)
+    sentiment = models.CharField(
+        max_length=16,
+        choices=SENTIMENT_CHOICES,
+        default=SENTIMENT_NEUTRAL,
+    )
+    confidence_score = models.FloatField(null=True, blank=True)
+    extraction_model = models.CharField(max_length=128, blank=True, default="")
+    extraction_parse_failed = models.BooleanField(
+        default=False,
+        help_text="True when JSON could not be parsed after retry; row stores safe defaults.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        verbose_name = "AEO extraction snapshot"
+        verbose_name_plural = "AEO extraction snapshots"
+
+    def __str__(self) -> str:
+        return f"AEOExtractionSnapshot(response_id={self.response_snapshot_id}, ok={not self.extraction_parse_failed})"
+
+
+class AEOScoreSnapshot(models.Model):
+    """
+    Append-only AEO scoring run derived from extraction snapshots (trend / reporting).
+
+    New rows are created for each scoring pass; historical rows are never updated in place.
+    """
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_score_snapshots",
+    )
+    visibility_score = models.FloatField(default=0.0)
+    weighted_position_score = models.FloatField(default=0.0)
+    citation_share = models.FloatField(default=0.0)
+    competitor_dominance_json = models.JSONField(default=dict, blank=True)
+    total_prompts = models.IntegerField(default=0)
+    total_mentions = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        verbose_name = "AEO score snapshot"
+        verbose_name_plural = "AEO score snapshots"
+
+    def __str__(self) -> str:
+        return f"AEOScoreSnapshot(profile_id={self.profile_id}, prompts={self.total_prompts})"
+
+
+class AEORecommendationRun(models.Model):
+    """
+    Append-only recommendation pass from Phase 4 scores + Phase 3 extractions.
+
+    Tracks completed actions / effectiveness in JSON for future workflows (not enforced here).
+    """
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_recommendation_runs",
+    )
+    score_snapshot = models.ForeignKey(
+        AEOScoreSnapshot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recommendation_runs",
+    )
+    recommendations_json = models.JSONField(default=list, blank=True)
+    visibility_score_at_run = models.FloatField(default=0.0)
+    weighted_position_score_at_run = models.FloatField(default=0.0)
+    citation_share_at_run = models.FloatField(default=0.0)
+    actions_completed_json = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Optional log of completed actions (indices, timestamps) for trend tracking.",
+    )
+    effectiveness_json = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Placeholder for future outcome / effectiveness metrics per recommendation.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        verbose_name = "AEO recommendation run"
+        verbose_name_plural = "AEO recommendation runs"
+
+    def __str__(self) -> str:
+        recs = self.recommendations_json
+        n = len(recs) if isinstance(recs, list) else 0
+        return f"AEORecommendationRun(profile_id={self.profile_id}, items={n})"
 
 
 class OnPageAuditSnapshot(models.Model):

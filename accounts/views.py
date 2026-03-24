@@ -49,6 +49,12 @@ from .dataforseo_utils import (
 )
 from . import openai_utils
 from . import debug_log as _debug
+from .aeo.aeo_utils import (
+    AEO_ONBOARDING_PROMPT_COUNT,
+    aeo_business_input_from_profile,
+    build_full_aeo_prompt_plan,
+    plan_items_from_saved_prompt_strings,
+)
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -1542,6 +1548,10 @@ def business_profile(request: HttpRequest) -> Response:
 
     - GET: returns the user's main business profile (creates one if missing).
     - PATCH/PUT: updates main profile fields; creates a main profile if it does not exist yet.
+
+    Query param ``skip_heavy=1`` (GET and PATCH): omit DataForSEO and on-the-fly AEO readiness work
+    in the serializer (returns null/empty SEO fields and a stub AEO bundle). Use during onboarding
+    to avoid paid API calls when only updating basic fields.
     """
     profile_qs = BusinessProfile.objects.filter(user=request.user)
     profile = profile_qs.filter(is_main=True).first()
@@ -1555,13 +1565,19 @@ def business_profile(request: HttpRequest) -> Response:
 
     if request.method == "GET":
         force_aeo_refresh = str(request.GET.get("refresh_aeo", "")).strip().lower() in {"1", "true", "yes"}
+        skip_heavy = str(request.GET.get("skip_heavy", "")).strip().lower() in {"1", "true", "yes"}
         serializer = BusinessProfileSerializer(
             profile,
-            context={"force_aeo_refresh": force_aeo_refresh, "disable_seo_context_for_aeo": True},
+            context={
+                "force_aeo_refresh": force_aeo_refresh,
+                "disable_seo_context_for_aeo": True,
+                "skip_heavy_profile_metrics": skip_heavy,
+            },
         )
         return Response(serializer.data)
 
     # For PATCH/PUT, apply partial updates
+    skip_heavy = str(request.GET.get("skip_heavy", "")).strip().lower() in {"1", "true", "yes"}
     old_site_url = profile.website_url
     serializer = BusinessProfileSerializer(
         profile,
@@ -1584,7 +1600,14 @@ def business_profile(request: HttpRequest) -> Response:
             # Never block profile saves on DataForSEO errors.
             pass
 
-    return Response(serializer.data)
+    out = BusinessProfileSerializer(
+        serializer.instance,
+        context={
+            "disable_seo_context_for_aeo": True,
+            "skip_heavy_profile_metrics": skip_heavy,
+        },
+    )
+    return Response(out.data)
 
 
 @csrf_exempt
@@ -1646,6 +1669,162 @@ def refresh_aeo_snapshot(request: HttpRequest) -> Response:
         getattr(profile, "id", None),
     )
     return Response(serializer.data)
+
+
+def _serialize_aeo_prompt_items(items: list | None) -> list[dict]:
+    out: list[dict] = []
+    for p in items or []:
+        if not isinstance(p, dict):
+            continue
+        text = (p.get("prompt") or "").strip()
+        if not text:
+            continue
+        try:
+            w = float(p.get("weight", 1.0))
+        except (TypeError, ValueError):
+            w = 1.0
+        out.append(
+            {
+                "prompt": text,
+                "type": str(p.get("type") or ""),
+                "weight": w,
+                "dynamic": bool(p.get("dynamic", False)),
+            }
+        )
+    return out
+
+
+def _truthy_openai_param(raw: str | None) -> bool:
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _onboarding_plan_include_openai(request: HttpRequest, body: dict) -> bool:
+    if request.method == "GET":
+        return _truthy_openai_param(request.GET.get("include_openai"))
+    v = body.get("include_openai")
+    if v is None:
+        return True
+    if isinstance(v, bool):
+        return v
+    return _truthy_openai_param(str(v))
+
+
+def _onboarding_reuse_saved_prompts(request: HttpRequest, body: dict) -> bool:
+    v = body.get("reuse_saved") if isinstance(body, dict) else None
+    if isinstance(v, bool):
+        return v
+    if v is not None:
+        return _truthy_openai_param(str(v))
+    return _truthy_openai_param(request.GET.get("reuse_saved"))
+
+
+def _first_nonempty_str(*vals) -> str | None:
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return None
+
+
+@csrf_exempt
+@api_view(["GET", "POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
+    """
+    AEO onboarding prompt plan: fixed + dynamic templates + optional OpenAI expansion (~50 prompts).
+
+    Call after PATCH ``/api/business-profile/`` with name, URL, address, and optional industry.
+
+    **GET** or **POST** (same behavior). Query params and JSON body are merged; body wins on conflict.
+
+    Optional parameters (query and/or JSON):
+
+    - ``include_openai`` — default ``true``. Use ``0`` / ``false`` for template-only (faster).
+    - ``city`` — optional override for templates (overrides inference from ``business_address``; use
+      ``business_address`` on the profile so prompts use city/region, not street-level detail).
+    - ``industry`` — explicit industry for fixed/dynamic bucketing (overrides profile field).
+    - ``reuse_saved`` — when ``true`` and the profile already has ``selected_aeo_prompts`` of length
+      ``AEO_ONBOARDING_PROMPT_COUNT``, return that list without calling OpenAI or rebuilding templates.
+
+    Response ``meta`` includes ``openai_status`` (``ok`` | ``failed_empty`` | ``skipped_no_city`` |
+    ``disabled`` | ``reused_saved``) and ``openai_message`` when expansion fails or is skipped — never a silent tiny list.
+    """
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+
+    body = request.data if request.method == "POST" else {}
+    if not isinstance(body, dict):
+        body = {}
+
+    city_override = _first_nonempty_str(body.get("city"), request.GET.get("city"))
+    industry_override = _first_nonempty_str(body.get("industry"), request.GET.get("industry"))
+    include_openai = _onboarding_plan_include_openai(request, body)
+    reuse_saved = _onboarding_reuse_saved_prompts(request, body)
+
+    saved = profile.selected_aeo_prompts or []
+    if reuse_saved and isinstance(saved, list) and len(saved) == AEO_ONBOARDING_PROMPT_COUNT:
+        raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved])
+        if len(raw_items) == AEO_ONBOARDING_PROMPT_COUNT:
+            ser = _serialize_aeo_prompt_items(raw_items)
+            biz = aeo_business_input_from_profile(
+                profile,
+                city=city_override,
+                industry=industry_override,
+            ).as_dict()
+            return Response(
+                {
+                    "groups": {
+                        "fixed": [],
+                        "dynamic": [],
+                        "openai_generated": [],
+                        "saved": ser,
+                    },
+                    "combined": ser,
+                    "business": biz,
+                    "meta": {
+                        "openai_status": "reused_saved",
+                        "openai_message": "",
+                        "openai_prompt_count": 0,
+                        "combined_count": len(ser),
+                        "combined_target": AEO_ONBOARDING_PROMPT_COUNT,
+                        "combined_shortfall": 0,
+                    },
+                }
+            )
+
+    plan = build_full_aeo_prompt_plan(
+        profile,
+        city=city_override,
+        industry=industry_override,
+        include_openai=include_openai,
+        target_combined_count=AEO_ONBOARDING_PROMPT_COUNT,
+    )
+    fixed = _serialize_aeo_prompt_items(plan.get("fixed") or [])
+    dynamic = _serialize_aeo_prompt_items(plan.get("dynamic") or [])
+    openai_generated = _serialize_aeo_prompt_items(plan.get("openai_generated") or [])
+    combined = _serialize_aeo_prompt_items(plan.get("combined") or [])
+    return Response(
+        {
+            "groups": {
+                "fixed": fixed,
+                "dynamic": dynamic,
+                "openai_generated": openai_generated,
+                "saved": [],
+            },
+            "combined": combined,
+            "business": plan.get("business") or {},
+            "meta": plan.get("meta") or {},
+        }
+    )
 
 
 @csrf_exempt

@@ -9,6 +9,7 @@ from django.views.generic import DetailView
 from django.views.generic import RedirectView
 from django.views.generic import UpdateView
 from django.conf import settings
+from urllib.parse import urlencode
 
 from swivl.users.models import User
 
@@ -55,13 +56,13 @@ def google_login_redirect_view(request: HttpRequest) -> HttpResponseRedirect:
 
     Redirects into django-allauth's Google login view and passes along an
     optional `next` parameter so that, after Google completes, the user is
-    sent back to the desired frontend path (e.g. `/app`).
+    sent back to the desired frontend path (e.g. `/onboarding`).
     """
-    frontend_next = request.GET.get("next") or "/app"
+    frontend_next = request.GET.get("next") or "/onboarding"
+    if not frontend_next.startswith(("http://", "https://")):
+        base = getattr(settings, "FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+        path = frontend_next if frontend_next.startswith("/") else f"/{frontend_next}"
+        frontend_next = f"{base}{path}"
 
-    # Make sure it starts with the frontend base URL
-    if not frontend_next.startswith("http"):
-        frontend_next = f"{settings.FRONTEND_BASE_URL}{frontend_next}"
-
-    login_path = "/accounts/google/login/"
-    return redirect(f"{login_path}?next={frontend_next}")
+    qs = urlencode({"next": frontend_next})
+    return redirect(f"/accounts/google/login/?{qs}")

@@ -55,6 +55,11 @@ urlpatterns += [
     path("api/seo/profile/", accounts_views.seo_profile_data, name="seo-profile-data"),
     path("api/aeo/profile/", accounts_views.aeo_profile_data, name="aeo-profile-data"),
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
+    path(
+        "api/aeo/onboarding-prompt-plan/",
+        accounts_views.aeo_onboarding_prompt_plan,
+        name="aeo-onboarding-prompt-plan",
+    ),
     # SEO agent chat
     path("api/seo/chat/", accounts_views.seo_chat, name="seo-chat"),
     # API logout to clear Django/Google SSO session

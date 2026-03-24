@@ -6,6 +6,7 @@ import logging
 
 from .constants import AEO_RECOMMENDATIONS_TTL, SEO_SNAPSHOT_TTL
 from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot
+from .aeo.aeo_utils import AEO_ONBOARDING_PROMPT_COUNT
 from .dataforseo_utils import get_or_refresh_seo_score_for_user
 from .dataforseo_utils import (
     get_aeo_content_readiness_for_site,
@@ -57,6 +58,11 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         required=False,
         allow_blank=True,
     )
+    selected_aeo_prompts = serializers.ListField(
+        child=serializers.CharField(allow_blank=True, max_length=2000),
+        required=False,
+        allow_empty=True,
+    )
 
     class Meta:
         model = BusinessProfile
@@ -71,6 +77,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "phone",
             "description",
             "website_url",
+            "selected_aeo_prompts",
             "plan",
             "is_main",
             "seo_competitor_domains_override",
@@ -115,7 +122,34 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 value = "https://" + value
         return value
 
+    def validate_selected_aeo_prompts(self, value):
+        if value is None:
+            return []
+        out = [str(x).strip() for x in value if str(x).strip()]
+        return out[:AEO_ONBOARDING_PROMPT_COUNT]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if "selected_aeo_prompts" in attrs:
+            sp = attrs.get("selected_aeo_prompts")
+            if sp is not None:
+                n = len(sp)
+                if n != 0 and n != AEO_ONBOARDING_PROMPT_COUNT:
+                    raise serializers.ValidationError(
+                        {
+                            "selected_aeo_prompts": (
+                                f"Must be empty or exactly {AEO_ONBOARDING_PROMPT_COUNT} prompts; got {n}."
+                            )
+                        }
+                    )
+        return attrs
+
     def _get_seo_bundle(self, obj: BusinessProfile) -> dict | None:
+        context = getattr(self, "context", {}) or {}
+        if context.get("skip_heavy_profile_metrics"):
+            setattr(self, "_seo_bundle_cache", None)
+            return None
+
         user = getattr(obj, "user", None)
         site_url = obj.website_url or ""
 
@@ -224,8 +258,24 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         return bundle.get("seo_next_steps") or []
 
     def _get_aeo_bundle(self, obj: BusinessProfile) -> dict:
-        domain = normalize_domain(obj.website_url or "") or ""
         context = getattr(self, "context", {}) or {}
+        if context.get("skip_heavy_profile_metrics"):
+            return {
+                "question_coverage_score": 0,
+                "questions_found": [],
+                "questions_missing": [],
+                "faq_readiness_score": 0,
+                "faq_blocks_found": 0,
+                "faq_schema_present": False,
+                "snippet_readiness_score": 0,
+                "answer_blocks_found": 0,
+                "aeo_score": 0,
+                "aeo_recommendations": [],
+                "aeo_status": "skipped",
+                "aeo_last_computed_at": None,
+            }
+
+        domain = normalize_domain(obj.website_url or "") or ""
         force_aeo_refresh = bool(context.get("force_aeo_refresh"))
         default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
         resolved_location_code, _, resolved_location_label = get_profile_location_code(obj, default_location_code)
@@ -622,6 +672,7 @@ class BusinessProfileAEOSerializer(BusinessProfileSerializer):
             "phone",
             "description",
             "website_url",
+            "selected_aeo_prompts",
             "plan",
             "is_main",
             "seo_location_mode",

@@ -284,6 +284,9 @@ ACCOUNT_LOGIN_METHODS = {"username"}
 ACCOUNT_SIGNUP_FIELDS = ["email*", "username*", "password1*", "password2*"]
 # https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+# Google (and similar) already verify email; do not block OAuth users on Django email confirmation.
+# Without this, social login often redirects to /accounts/confirm-email/ instead of the SPA.
+SOCIALACCOUNT_EMAIL_VERIFICATION = "none"
 # https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_ADAPTER = "swivl.users.adapters.AccountAdapter"
 # https://docs.allauth.org/en/latest/account/forms.html
@@ -343,11 +346,10 @@ SPECTACULAR_SETTINGS = {
 
 FRONTEND_BASE_URL = os.environ.get(
     "FRONTEND_BASE_URL",
-    "http://localhost:3000"
-)
+    "http://localhost:3000",
+).rstrip("/")
 ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
-# settings.py
-LOGIN_REDIRECT_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000") + "/app"
+LOGIN_REDIRECT_URL = f"{FRONTEND_BASE_URL}/onboarding"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "123")
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/accounts/google/login/callback/")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "123")
@@ -355,8 +357,6 @@ GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "123")
 GOOGLE_ADS_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "123")
 DATAFORSEO_LOGIN = os.environ.get("DATAFORSEO_LOGIN", "123")
 DATAFORSEO_PASSWORD = os.environ.get("DATAFORSEO_PASSWORD", "123")
-FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
-
 # Meta (Facebook) – Ads app: OAuth login + Marketing API (connect button and ad campaigns)
 META_ADS_APP_ID = os.environ.get("META_ADS_APP_ID", "")
 META_ADS_APP_SECRET = os.environ.get("META_ADS_APP_SECRET", "")
