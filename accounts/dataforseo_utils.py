@@ -33,6 +33,7 @@ from .seo_metrics_service import (
 from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
+COMPETITOR_LOOKUP_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 # Lazy import to avoid circular dependency (openai_utils imports get_or_refresh_seo_score_for_user)
 def _get_llm_keyword_candidates(profile: Optional[BusinessProfile], homepage_meta: Optional[str]) -> List[str]:
@@ -353,14 +354,16 @@ def get_competitors_for_domain_intersection(
 
     override_domains = _parse_domain_csv(getattr(_profile, "seo_competitor_domains_override", "") or "")
 
-    # Always fetch raw competitors so we can output debug evidence.
-    # Use a larger initial limit to allow for filtering down to "limit".
-    raw_competitor_candidates = _get_competitor_domains(
-        domain,
-        location_code=location_code,
-        language_code=language_code,
-        limit=min(max(limit * 2, limit + 2), 10),
-    )
+    raw_competitor_candidates: List[str] = []
+    if not override_domains:
+        # Only fetch paid auto-competitors when no explicit profile override is configured.
+        # Use a larger initial limit to allow for filtering down to "limit".
+        raw_competitor_candidates = _get_competitor_domains(
+            domain,
+            location_code=location_code,
+            language_code=language_code,
+            limit=min(max(limit * 2, limit + 2), 10),
+        )
 
     # Filter out generic aggregators/social/map/listing domains.
     filtered_auto: List[str] = []
@@ -884,6 +887,24 @@ def _get_competitor_average_traffic(
     Call competitors_domain/live to estimate the average organic traffic/visibility
     of the top competitors for the given domain.
     """
+    if bool(getattr(settings, "DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS", False)):
+        logger.info(
+            "[DataForSEO] competitor lookup bypassed (kill switch) path=_get_competitor_average_traffic domain=%s",
+            target_domain,
+        )
+        return 0.0
+
+    cache_key = (
+        f"seo:competitors_domain:avg_traffic:v2:"
+        f"{target_domain.lower().strip()}:{int(location_code)}:{language_code}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        try:
+            return float(cached)
+        except (TypeError, ValueError):
+            pass
+
     payload = [
         {
             "target": target_domain,
@@ -894,19 +915,23 @@ def _get_competitor_average_traffic(
 
     data = _post("/v3/dataforseo_labs/google/competitors_domain/live", payload)
     if not data:
+        cache.set(cache_key, 0.0, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
         return 0.0
 
     try:
         tasks = data.get("tasks") or []
         if not tasks:
+            cache.set(cache_key, 0.0, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
             return 0.0
         task = tasks[0]
         results = task.get("result") or []
         if not results:
+            cache.set(cache_key, 0.0, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
             return 0.0
         result = results[0]
         items = result.get("items") or []
         if not items:
+            cache.set(cache_key, 0.0, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
             return 0.0
 
         competitor_scores: List[float] = []
@@ -926,14 +951,18 @@ def _get_competitor_average_traffic(
                 competitor_scores.append(vis)
 
         if not competitor_scores:
+            cache.set(cache_key, 0.0, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
             return 0.0
 
-        return sum(competitor_scores) / len(competitor_scores)
+        avg_traffic = sum(competitor_scores) / len(competitor_scores)
+        cache.set(cache_key, float(avg_traffic), timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
+        return avg_traffic
     except Exception:
         logger.exception(
             "[DataForSEO] competitors_domain parsing failed for target_domain=%s",
             target_domain,
         )
+        cache.set(cache_key, 0.0, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
         return 0.0
 
 
@@ -949,6 +978,21 @@ def _get_competitor_domains(
     (excluding the target). Used to feed get_keyword_gap_keywords for
     high-intent opportunity keywords.
     """
+    if bool(getattr(settings, "DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS", False)):
+        logger.info(
+            "[DataForSEO] competitor lookup bypassed (kill switch) path=_get_competitor_domains domain=%s",
+            target_domain,
+        )
+        return []
+
+    cache_key = (
+        f"seo:competitors_domain:domains:v2:"
+        f"{target_domain.lower().strip()}:{int(location_code)}:{language_code}:{int(limit)}"
+    )
+    cached = cache.get(cache_key)
+    if isinstance(cached, list):
+        return [str(x).strip().lower() for x in cached if str(x).strip()]
+
     payload = [
         {
             "target": target_domain,
@@ -959,18 +1003,24 @@ def _get_competitor_domains(
     ]
     data = _post("/v3/dataforseo_labs/google/competitors_domain/live", payload)
     if not data:
+        cache.set(cache_key, [], timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
         return []
 
     try:
         tasks = data.get("tasks") or []
         if not tasks:
+            cache.set(cache_key, [], timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
             return []
         task = tasks[0]
         results = task.get("result") or []
         if not results:
+            cache.set(cache_key, [], timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
             return []
         result = results[0]
         items = result.get("items") or []
+        if not items:
+            cache.set(cache_key, [], timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
+            return []
         target_lower = target_domain.lower().strip()
         domains: List[str] = []
         for item in items:
@@ -987,12 +1037,15 @@ def _get_competitor_domains(
             target_domain,
             domains[:limit],
         )
-        return domains[:limit]
+        final_domains = domains[:limit]
+        cache.set(cache_key, final_domains, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
+        return final_domains
     except Exception:
         logger.exception(
             "[DataForSEO] competitors_domain domain list parsing failed for target_domain=%s",
             target_domain,
         )
+        cache.set(cache_key, [], timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
         return []
 
 
