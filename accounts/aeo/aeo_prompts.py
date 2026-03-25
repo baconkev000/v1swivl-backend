@@ -255,6 +255,31 @@ DYNAMIC_PROMPT_SPECS: Final[tuple[AEOPromptTemplateSpec, ...]] = (
     ),
 )
 
+# Extra local-intent patterns when city is known — generic wording only.
+DYNAMIC_BUSINESS_NAME_SPECS: Final[tuple[AEOPromptTemplateSpec, ...]] = (
+    AEOPromptTemplateSpec(
+        key="dyn_brand_reviews",
+        template="Where should I read honest reviews of {provider_label}s before deciding?",
+        prompt_type=AEOPromptType.TRUST,
+        weight=1.0,
+        is_fixed=False,
+    ),
+    AEOPromptTemplateSpec(
+        key="dyn_brand_compare",
+        template="How do people shortlist {provider_label} options in {city} when many look similar?",
+        prompt_type=AEOPromptType.COMPARISON,
+        weight=0.95,
+        is_fixed=False,
+    ),
+    AEOPromptTemplateSpec(
+        key="dyn_brand_checks",
+        template="What should I verify before choosing a {provider_label} in {city}?",
+        prompt_type=AEOPromptType.AUTHORITY,
+        weight=0.9,
+        is_fixed=False,
+    ),
+)
+
 PROMPT_WEIGHTING_NOTES: Final[str] = (
     "Transactional prompts default highest priority. "
     "Comparison and authority prompts slightly lower for balanced scoring."
