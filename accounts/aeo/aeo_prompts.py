@@ -1,4 +1,3 @@
-```python
 """
 AEO (Answer Engine Optimization) prompt definitions only.
 
