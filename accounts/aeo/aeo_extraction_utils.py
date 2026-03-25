@@ -126,6 +126,41 @@ def root_domain_from_fragment(text: str) -> str | None:
     return candidate
 
 
+def _dedupe_preserve_order(items: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = str(item).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(str(item).strip())
+    return out
+
+
+def _extract_domains_from_raw_answer(raw_text: str) -> list[str]:
+    """
+    Best-effort domain extraction fallback from raw answer text.
+    Merges URL-like and bare-domain patterns, normalized to root domains.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return []
+    patterns = (
+        r"https?://[^\s)>\]\"']+",
+        r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b",
+    )
+    candidates: list[str] = []
+    for pat in patterns:
+        candidates.extend(re.findall(pat, text, flags=re.IGNORECASE))
+    domains: list[str] = []
+    for cand in candidates:
+        dom = root_domain_from_fragment(cand)
+        if dom:
+            domains.append(dom)
+    return _dedupe_preserve_order(domains)[:100]
+
+
 def _sanitize_competitors(items: Any) -> list[str]:
     out: list[str] = []
     if not isinstance(items, list):
@@ -145,6 +180,21 @@ def _sanitize_competitors(items: Any) -> list[str]:
     return out[:50]
 
 
+def _sanitize_ranking_order(items: Any) -> list[str]:
+    out: list[str] = []
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        name = str(item).strip()
+        if len(name) < 2 or len(name) > 200:
+            continue
+        low = name.lower()
+        if low in GENERIC_COMPETITOR_TOKENS:
+            continue
+        out.append(name)
+    return _dedupe_preserve_order(out)[:50]
+
+
 def _sanitize_citations(items: Any) -> list[str]:
     out: list[str] = []
     if not isinstance(items, list):
@@ -159,7 +209,7 @@ def _sanitize_citations(items: Any) -> list[str]:
     return out[:50]
 
 
-def normalize_extraction_payload(data: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_extraction_payload(data: Mapping[str, Any], *, raw_response: str = "") -> dict[str, Any]:
     """
     Coerce model JSON into canonical shape for storage and APIs.
     """
@@ -175,9 +225,18 @@ def normalize_extraction_payload(data: Mapping[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         count = 0
     count = max(0, min(1000, count))
+    if not brand:
+        count = 0
 
     competitors = _sanitize_competitors(data.get("competitors"))
-    citations = _sanitize_citations(data.get("citations"))
+    ranking_order = _sanitize_ranking_order(data.get("ranking_order"))
+    # Keep ranking order useful for weighted scoring: include named mentions in order.
+    if not ranking_order:
+        ranking_order = _dedupe_preserve_order([*competitors])
+
+    model_citations = _sanitize_citations(data.get("citations"))
+    regex_citations = _extract_domains_from_raw_answer(raw_response)
+    citations = _dedupe_preserve_order([*model_citations, *regex_citations])[:50]
 
     sent = str(data.get("sentiment") or "neutral").lower().strip()
     if sent not in _VALID_SENTIMENT:
@@ -198,6 +257,7 @@ def normalize_extraction_payload(data: Mapping[str, Any]) -> dict[str, Any]:
         "mention_position": pos,
         "mention_count": count,
         "competitors": competitors,
+        "ranking_order": ranking_order,
         "citations": citations,
         "sentiment": sent,
         "confidence_score": conf,
@@ -211,6 +271,7 @@ def _default_failed_payload() -> dict[str, Any]:
             "mention_position": "none",
             "mention_count": 0,
             "competitors": [],
+            "ranking_order": [],
             "citations": [],
             "sentiment": "neutral",
             "confidence_score": None,
@@ -324,7 +385,7 @@ def extract_aeo_response(
             "extraction_model": model,
         }
 
-    normalized = normalize_extraction_payload(parsed)
+    normalized = normalize_extraction_payload(parsed, raw_response=raw_response)
     return {
         **normalized,
         "parse_ok": True,
@@ -410,6 +471,7 @@ def run_single_extraction(
         "mention_position": result["mention_position"],
         "mention_count": result["mention_count"],
         "competitors": result["competitors"],
+        "ranking_order": result.get("ranking_order") or [],
         "citations": result["citations"],
         "sentiment": result["sentiment"],
         "confidence_score": result["confidence_score"],

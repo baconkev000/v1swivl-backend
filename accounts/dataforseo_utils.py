@@ -25,6 +25,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 from .models import AEOOverviewSnapshot, BusinessProfile, SEOOverviewSnapshot
+from .constants import AEO_SNAPSHOT_TTL
 from .seo_metrics_service import (
     build_seo_snapshot_api_metadata,
     effective_rank_for_aggregate_metrics,
@@ -1956,6 +1957,7 @@ def get_aeo_content_readiness_for_site(
         "faq_schema_present": False,
         "snippet_readiness_score": 0,
         "answer_blocks_found": 0,
+        "aeo_score": 0,
     }
     try:
         normalized_domain = normalize_domain(target_domain) if target_domain else ""
@@ -1965,7 +1967,7 @@ def get_aeo_content_readiness_for_site(
             f"aeo_readiness:{cache_seed}:{normalized_domain}:{normalized_niche}:"
             f"{int(location_code if location_code is not None else getattr(settings, 'DATAFORSEO_LOCATION_CODE', 2840))}:{language_code}"
         )
-        cache_ttl_seconds = int(timedelta(days=7).total_seconds())
+        cache_ttl_seconds = int(AEO_SNAPSHOT_TTL.total_seconds())
         if not force_refresh:
             cached = cache.get(cache_key)
             if isinstance(cached, dict):
@@ -2083,6 +2085,11 @@ def get_aeo_content_readiness_for_site(
             **(faq_data or {}),
             **(snippet_data or {}),
         }
+        # Canonical AEO score from the crawl-derived readiness metrics.
+        q_score = int(result.get("question_coverage_score") or 0)
+        faq_score = int(result.get("faq_readiness_score") or 0)
+        snip_score = int(result.get("snippet_readiness_score") or 0)
+        result["aeo_score"] = max(0, min(100, int(round((q_score * 0.4) + (faq_score * 0.3) + (snip_score * 0.3)))))
         # #region agent log
         _debug.log(
             "dataforseo_utils.py:get_aeo_content_readiness_for_site:computed",

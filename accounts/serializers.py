@@ -4,7 +4,7 @@ from django.utils import timezone
 from rest_framework import serializers
 import logging
 
-from .constants import AEO_RECOMMENDATIONS_TTL, SEO_SNAPSHOT_TTL
+from .constants import AEO_RECOMMENDATIONS_TTL, AEO_SNAPSHOT_TTL, SEO_SNAPSHOT_TTL
 from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot
 from .aeo.aeo_utils import AEO_ONBOARDING_PROMPT_COUNT
 from .dataforseo_utils import get_or_refresh_seo_score_for_user
@@ -324,7 +324,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 domain=domain or "",
                 location_code=int(resolved_location_code),
             ).first()
-            if snapshot and (timezone.now() - snapshot.refreshed_at) <= SEO_SNAPSHOT_TTL:
+            if snapshot and (timezone.now() - snapshot.refreshed_at) <= AEO_SNAPSHOT_TTL:
                 # #region agent log
                 _debug.log(
                     "serializers.py:BusinessProfileSerializer:_get_aeo_bundle:snapshot_cache_hit",
@@ -337,7 +337,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                         "snapshot_question_coverage_score": int(snapshot.question_coverage_score or 0),
                         "snapshot_faq_readiness_score": int(snapshot.faq_readiness_score or 0),
                         "snapshot_snippet_readiness_score": int(snapshot.snippet_readiness_score or 0),
-                        "ttl_seconds": int(SEO_SNAPSHOT_TTL.total_seconds()),
+                        "ttl_seconds": int(AEO_SNAPSHOT_TTL.total_seconds()),
                     },
                     "H1",
                 )
@@ -437,13 +437,28 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         question_coverage_score = int(safe_bundle.get("question_coverage_score") or 0)
         faq_readiness_score = int(safe_bundle.get("faq_readiness_score") or 0)
         snippet_readiness_score = int(safe_bundle.get("snippet_readiness_score") or 0)
-        aeo_score = int(
-            round(
-                (question_coverage_score * 0.4)
-                + (faq_readiness_score * 0.3)
-                + (snippet_readiness_score * 0.3),
+        # Use pipeline-provided AEO score when available (crawl-derived),
+        # and only fall back to local weighted composition if missing.
+        pipeline_score = data.get("aeo_score")
+        if pipeline_score is not None:
+            try:
+                aeo_score = int(round(float(pipeline_score)))
+            except (TypeError, ValueError):
+                aeo_score = int(
+                    round(
+                        (question_coverage_score * 0.4)
+                        + (faq_readiness_score * 0.3)
+                        + (snippet_readiness_score * 0.3),
+                    )
+                )
+        else:
+            aeo_score = int(
+                round(
+                    (question_coverage_score * 0.4)
+                    + (faq_readiness_score * 0.3)
+                    + (snippet_readiness_score * 0.3),
+                )
             )
-        )
         aeo_score = max(0, min(100, aeo_score))
 
         recommendations: list[str] = []

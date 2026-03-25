@@ -4,6 +4,7 @@ from datetime import timedelta
 
 # Main SEO/AEO snapshot cadence.
 SEO_SNAPSHOT_TTL = timedelta(days=7)
+AEO_SNAPSHOT_TTL = timedelta(days=30)
 
 # Async enrichment TTLs.
 SEO_KEYWORDS_ENRICHMENT_TTL = timedelta(days=7)
