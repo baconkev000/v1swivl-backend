@@ -26,6 +26,30 @@ NEXT_STEPS_TTL = timedelta(days=7)
 KEYWORD_ACTION_TTL = timedelta(days=7)
 
 
+def _aeo_target_prompt_count() -> int:
+    testing_mode = bool(getattr(settings, "AEO_TESTING_MODE", False))
+    if testing_mode:
+        try:
+            return max(1, int(getattr(settings, "AEO_TEST_PROMPT_COUNT", 10)))
+        except (TypeError, ValueError):
+            return 10
+    try:
+        return max(1, int(getattr(settings, "AEO_PROD_PROMPT_COUNT", 50)))
+    except (TypeError, ValueError):
+        return 50
+
+
+def _aeo_recommendation_stage_enabled() -> bool:
+    return bool(getattr(settings, "AEO_ENABLE_RECOMMENDATION_STAGE", False))
+
+
+def _enqueue_seo_after_aeo(run_id: int) -> None:
+    """
+    MVP sequencing: once AEO reaches terminal state, warm SEO in a separate task.
+    """
+    trigger_seo_warmup_after_aeo_task.delay(run_id)
+
+
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     """
@@ -434,4 +458,426 @@ def generate_keyword_action_suggestions_task(self, snapshot_id: int) -> None:
             "[SEO async] generate_keyword_action_suggestions_task save failed snapshot_id=%s: %s",
             snapshot_id,
             e,
+        )
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def run_aeo_phase1_execution_task(self, run_id: int, prompt_set: list[dict] | None = None) -> None:
+    """
+    Execute Phase 1 AEO prompt batch asynchronously with 30-day cache policy.
+    """
+    from .models import AEOExecutionRun
+    from .aeo.aeo_execution_utils import run_aeo_prompt_batch
+
+    run = (
+        AEOExecutionRun.objects.select_related("profile")
+        .filter(pk=run_id)
+        .first()
+    )
+    if not run:
+        logger.warning("[AEO phase1] run not found run_id=%s", run_id)
+        return
+
+    if run.status in {AEOExecutionRun.STATUS_COMPLETED, AEOExecutionRun.STATUS_FAILED, AEOExecutionRun.STATUS_SKIPPED_CACHED}:
+        return
+
+    profile = run.profile
+
+    duplicate_inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exclude(pk=run.pk).exists()
+    if duplicate_inflight:
+        run.status = AEOExecutionRun.STATUS_SKIPPED_CACHED
+        run.cache_hit = True
+        run.fetch_mode = AEOExecutionRun.FETCH_MODE_CACHE_HIT
+        run.extraction_status = AEOExecutionRun.STAGE_SKIPPED
+        run.error_message = "skipped_duplicate_inflight"
+        run.finished_at = django_tz.now()
+        run.save(
+            update_fields=[
+                "status",
+                "cache_hit",
+                "fetch_mode",
+                "extraction_status",
+                "error_message",
+                "finished_at",
+                "updated_at",
+            ]
+        )
+        logger.info(
+            "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=duplicate_inflight",
+            run.id,
+            profile.id,
+            run.status,
+        )
+        _enqueue_seo_after_aeo(run.id)
+        run_aeo_phase4_scoring_task.delay(run.id)
+        return
+
+    run.status = AEOExecutionRun.STATUS_RUNNING
+    run.started_at = django_tz.now()
+    run.save(update_fields=["status", "started_at", "updated_at"])
+
+    latest_success = (
+        AEOExecutionRun.objects.filter(
+            profile=profile,
+            status=AEOExecutionRun.STATUS_COMPLETED,
+            fetch_mode=AEOExecutionRun.FETCH_MODE_FRESH_FETCH,
+            finished_at__isnull=False,
+        )
+        .exclude(pk=run.pk)
+        .order_by("-finished_at")
+        .first()
+    )
+    if latest_success and latest_success.finished_at and (django_tz.now() - latest_success.finished_at) <= timedelta(days=30):
+        run.status = AEOExecutionRun.STATUS_SKIPPED_CACHED
+        run.cache_hit = True
+        run.fetch_mode = AEOExecutionRun.FETCH_MODE_CACHE_HIT
+        run.extraction_status = AEOExecutionRun.STAGE_SKIPPED
+        run.prompt_count_executed = 0
+        run.prompt_count_failed = 0
+        run.finished_at = django_tz.now()
+        run.save(
+            update_fields=[
+                "status",
+                "cache_hit",
+                "fetch_mode",
+                "extraction_status",
+                "prompt_count_executed",
+                "prompt_count_failed",
+                "finished_at",
+                "updated_at",
+            ]
+        )
+        logger.info("[AEO phase1] cache hit, skipping execution run_id=%s profile_id=%s", run.id, profile.id)
+        logger.info(
+            "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=skipped_cached",
+            run.id,
+            profile.id,
+            run.status,
+        )
+        _enqueue_seo_after_aeo(run.id)
+        run_aeo_phase4_scoring_task.delay(run.id)
+        return
+
+    selected = list(prompt_set or [])
+    target = _aeo_target_prompt_count()
+    selected = selected[:target]
+    run.prompt_count_requested = len(selected)
+    run.cache_hit = False
+    run.fetch_mode = AEOExecutionRun.FETCH_MODE_FRESH_FETCH
+    run.save(update_fields=["prompt_count_requested", "cache_hit", "fetch_mode", "updated_at"])
+
+    try:
+        batch = run_aeo_prompt_batch(
+            selected,
+            profile,
+            save=True,
+        )
+        response_snapshot_ids = [
+            int(one.get("snapshot_id"))
+            for one in (batch.get("results") or [])
+            if one.get("success") and one.get("snapshot_id") is not None
+        ]
+        run.prompt_count_executed = int(batch.get("executed") or 0)
+        run.prompt_count_failed = int(batch.get("failed") or 0)
+        run.status = AEOExecutionRun.STATUS_COMPLETED
+        run.finished_at = django_tz.now()
+        run.error_message = ""
+        run.save(
+            update_fields=[
+                "prompt_count_executed",
+                "prompt_count_failed",
+                "status",
+                "finished_at",
+                "error_message",
+                "updated_at",
+            ]
+        )
+        logger.info(
+            "[AEO phase1] execution complete run_id=%s profile_id=%s executed=%s failed=%s",
+            run.id,
+            profile.id,
+            run.prompt_count_executed,
+            run.prompt_count_failed,
+        )
+        run_aeo_phase3_extraction_task.delay(run.id, response_snapshot_ids)
+    except Exception as e:
+        run.status = AEOExecutionRun.STATUS_FAILED
+        run.error_message = f"{type(e).__name__}: {e}"
+        run.finished_at = django_tz.now()
+        run.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        logger.exception("[AEO phase1] run failed run_id=%s", run_id)
+        logger.info(
+            "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase1_failed",
+            run.id,
+            profile.id,
+            run.status,
+        )
+        _enqueue_seo_after_aeo(run.id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def run_aeo_phase3_extraction_task(
+    self,
+    run_id: int,
+    response_snapshot_ids: list[int] | None = None,
+) -> None:
+    from .models import AEOExecutionRun, AEOResponseSnapshot
+    from .aeo.aeo_extraction_utils import run_single_extraction
+
+    run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
+    if not run:
+        logger.warning("[AEO phase3] run not found run_id=%s", run_id)
+        return
+    if run.extraction_status == AEOExecutionRun.STAGE_COMPLETED:
+        run_aeo_phase4_scoring_task.delay(run.id)
+        return
+
+    run.extraction_status = AEOExecutionRun.STAGE_RUNNING
+    run.save(update_fields=["extraction_status", "updated_at"])
+    logger.info("[AEO phase3] extraction start run_id=%s profile_id=%s", run.id, run.profile_id)
+
+    qs = AEOResponseSnapshot.objects.filter(profile=run.profile)
+    if response_snapshot_ids:
+        qs = qs.filter(id__in=response_snapshot_ids)
+    responses = list(qs.order_by("id"))
+    created_count = 0
+    failed_count = 0
+    try:
+        for response in responses:
+            # Idempotency: don't write duplicate extraction rows during reruns of the same stage.
+            if run.started_at and response.extraction_snapshots.filter(created_at__gte=run.started_at).exists():
+                continue
+            result = run_single_extraction(response, save=True)
+            if result.get("save_error"):
+                failed_count += 1
+                continue
+            if result.get("extraction_snapshot_id"):
+                created_count += 1
+        run.extraction_count = created_count
+        run.extraction_status = AEOExecutionRun.STAGE_COMPLETED
+        run.save(update_fields=["extraction_count", "extraction_status", "updated_at"])
+        logger.info(
+            "[AEO phase3] extraction complete run_id=%s profile_id=%s created=%s failed=%s",
+            run.id,
+            run.profile_id,
+            created_count,
+            failed_count,
+        )
+        run_aeo_phase4_scoring_task.delay(run.id)
+    except Exception as exc:
+        run.extraction_status = AEOExecutionRun.STAGE_FAILED
+        run.error_message = f"{run.error_message}\nphase3:{type(exc).__name__}: {exc}".strip()
+        run.save(update_fields=["extraction_status", "error_message", "updated_at"])
+        logger.exception("[AEO phase3] extraction failed run_id=%s", run.id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
+    from .models import AEOExecutionRun
+    from .aeo.aeo_scoring_utils import calculate_aeo_scores_for_business
+
+    run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
+    if not run:
+        logger.warning("[AEO phase4] run not found run_id=%s", run_id)
+        return
+    if run.scoring_status == AEOExecutionRun.STAGE_COMPLETED and run.score_snapshot_id:
+        if _aeo_recommendation_stage_enabled():
+            run_aeo_phase5_recommendation_task.delay(run.id)
+        else:
+            run.recommendation_status = AEOExecutionRun.STAGE_SKIPPED
+            run.save(update_fields=["recommendation_status", "updated_at"])
+            logger.info(
+                "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase4_completed_no_phase5",
+                run.id,
+                run.profile_id,
+                run.status,
+            )
+            _enqueue_seo_after_aeo(run.id)
+        return
+
+    run.scoring_status = AEOExecutionRun.STAGE_RUNNING
+    run.save(update_fields=["scoring_status", "updated_at"])
+    logger.info("[AEO phase4] scoring start run_id=%s profile_id=%s", run.id, run.profile_id)
+    try:
+        score_data = calculate_aeo_scores_for_business(run.profile, save=True)
+        run.score_snapshot_id = score_data.get("snapshot_id")
+        run.scoring_status = AEOExecutionRun.STAGE_COMPLETED
+        run.save(update_fields=["score_snapshot_id", "scoring_status", "updated_at"])
+        logger.info(
+            "[AEO phase4] scoring complete run_id=%s profile_id=%s score_snapshot_id=%s total_prompts=%s",
+            run.id,
+            run.profile_id,
+            run.score_snapshot_id,
+            int(score_data.get("total_prompts") or 0),
+        )
+        if _aeo_recommendation_stage_enabled():
+            run_aeo_phase5_recommendation_task.delay(run.id)
+        else:
+            run.recommendation_status = AEOExecutionRun.STAGE_SKIPPED
+            run.save(update_fields=["recommendation_status", "updated_at"])
+            logger.info(
+                "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase4_completed_no_phase5",
+                run.id,
+                run.profile_id,
+                run.status,
+            )
+            _enqueue_seo_after_aeo(run.id)
+    except Exception as exc:
+        run.scoring_status = AEOExecutionRun.STAGE_FAILED
+        run.error_message = f"{run.error_message}\nphase4:{type(exc).__name__}: {exc}".strip()
+        run.save(update_fields=["scoring_status", "error_message", "updated_at"])
+        logger.exception("[AEO phase4] scoring failed run_id=%s", run.id)
+        logger.info(
+            "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase4_failed",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+        _enqueue_seo_after_aeo(run.id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def run_aeo_phase5_recommendation_task(self, run_id: int) -> None:
+    from .models import AEOExecutionRun
+    from .aeo.aeo_recommendation_utils import generate_aeo_recommendations
+
+    run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
+    if not run:
+        logger.warning("[AEO phase5] run not found run_id=%s", run_id)
+        return
+    if not _aeo_recommendation_stage_enabled():
+        run.recommendation_status = AEOExecutionRun.STAGE_SKIPPED
+        run.save(update_fields=["recommendation_status", "updated_at"])
+        logger.info(
+            "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase5_disabled",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+        _enqueue_seo_after_aeo(run.id)
+        return
+    if run.recommendation_status == AEOExecutionRun.STAGE_COMPLETED and run.recommendation_run_id:
+        return
+
+    run.recommendation_status = AEOExecutionRun.STAGE_RUNNING
+    run.save(update_fields=["recommendation_status", "updated_at"])
+    logger.info("[AEO phase5] recommendation start run_id=%s profile_id=%s", run.id, run.profile_id)
+    try:
+        data = generate_aeo_recommendations(run.profile, save=True)
+        run.recommendation_run_id = data.get("recommendation_run_id")
+        run.recommendation_status = AEOExecutionRun.STAGE_COMPLETED
+        run.save(update_fields=["recommendation_run_id", "recommendation_status", "updated_at"])
+        logger.info(
+            "[AEO phase5] recommendation complete run_id=%s profile_id=%s recommendation_run_id=%s count=%s",
+            run.id,
+            run.profile_id,
+            run.recommendation_run_id,
+            len(data.get("recommendations") or []),
+        )
+        logger.info(
+            "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase5_completed",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+        _enqueue_seo_after_aeo(run.id)
+    except Exception as exc:
+        run.recommendation_status = AEOExecutionRun.STAGE_FAILED
+        run.error_message = f"{run.error_message}\nphase5:{type(exc).__name__}: {exc}".strip()
+        run.save(update_fields=["recommendation_status", "error_message", "updated_at"])
+        logger.exception("[AEO phase5] recommendation failed run_id=%s", run.id)
+        logger.info(
+            "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase5_failed",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+        _enqueue_seo_after_aeo(run.id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
+    """
+    Sequential MVP handoff: AEO terminal -> SEO warmup.
+    Uses existing SEO helper for TTL/freshness behavior and avoids duplicate trigger replays.
+    """
+    from .models import AEOExecutionRun
+    from .dataforseo_utils import get_or_refresh_seo_score_for_user
+
+    run = AEOExecutionRun.objects.select_related("profile", "profile__user").filter(pk=run_id).first()
+    if not run:
+        logger.warning("[AEO->SEO] run not found aeo_run_id=%s", run_id)
+        return
+
+    terminal = run.status in {
+        AEOExecutionRun.STATUS_COMPLETED,
+        AEOExecutionRun.STATUS_FAILED,
+        AEOExecutionRun.STATUS_SKIPPED_CACHED,
+    }
+    if not terminal:
+        logger.info(
+            "[AEO->SEO] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=false seo_trigger_outcome=not_terminal",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+        return
+
+    if run.seo_triggered_at and (django_tz.now() - run.seo_triggered_at) <= timedelta(minutes=10):
+        logger.info(
+            "[AEO->SEO] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=false seo_trigger_outcome=duplicate_recent",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+        return
+
+    website = str(getattr(run.profile, "website_url", "") or "").strip()
+    if not website:
+        run.seo_triggered_at = django_tz.now()
+        run.seo_trigger_status = "skipped_no_website"
+        run.save(update_fields=["seo_triggered_at", "seo_trigger_status", "updated_at"])
+        logger.info(
+            "[AEO->SEO] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true seo_trigger_outcome=skipped_no_website",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+        return
+
+    try:
+        logger.info(
+            "[AEO->SEO] AEO terminal -> SEO start aeo_run_id=%s profile_id=%s aeo_status=%s website=%s",
+            run.id,
+            run.profile_id,
+            run.status,
+            website,
+        )
+        get_or_refresh_seo_score_for_user(
+            run.profile.user,
+            site_url=website,
+            force_refresh=False,
+        )
+        run.seo_triggered_at = django_tz.now()
+        run.seo_trigger_status = "success"
+        run.save(update_fields=["seo_triggered_at", "seo_trigger_status", "updated_at"])
+        logger.info(
+            "[AEO->SEO] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true seo_trigger_outcome=success",
+            run.id,
+            run.profile_id,
+            run.status,
+        )
+    except Exception as exc:
+        run.seo_triggered_at = django_tz.now()
+        run.seo_trigger_status = "failed"
+        run.error_message = f"{run.error_message}\nseo_trigger:{type(exc).__name__}: {exc}".strip()
+        run.save(update_fields=["seo_triggered_at", "seo_trigger_status", "error_message", "updated_at"])
+        logger.exception(
+            "[AEO->SEO] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true seo_trigger_outcome=failed",
+            run.id,
+            run.profile_id,
+            run.status,
         )

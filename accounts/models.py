@@ -496,6 +496,97 @@ class AEORecommendationRun(models.Model):
         return f"AEORecommendationRun(profile_id={self.profile_id}, items={n})"
 
 
+class AEOExecutionRun(models.Model):
+    """
+    Phase 1 AEO execution run tracker for prompt batch processing.
+    """
+
+    FETCH_MODE_CACHE_HIT = "cache_hit"
+    FETCH_MODE_FRESH_FETCH = "fresh_fetch"
+    FETCH_MODE_CHOICES = [
+        (FETCH_MODE_CACHE_HIT, "Cache Hit"),
+        (FETCH_MODE_FRESH_FETCH, "Fresh Fetch"),
+    ]
+
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    STATUS_SKIPPED_CACHED = "skipped_cached"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_RUNNING, "Running"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_SKIPPED_CACHED, "Skipped Cached"),
+    ]
+    STAGE_PENDING = "pending"
+    STAGE_RUNNING = "running"
+    STAGE_COMPLETED = "completed"
+    STAGE_FAILED = "failed"
+    STAGE_SKIPPED = "skipped"
+    STAGE_CHOICES = [
+        (STAGE_PENDING, "Pending"),
+        (STAGE_RUNNING, "Running"),
+        (STAGE_COMPLETED, "Completed"),
+        (STAGE_FAILED, "Failed"),
+        (STAGE_SKIPPED, "Skipped"),
+    ]
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_execution_runs",
+    )
+    prompt_count_requested = models.IntegerField(default=0)
+    prompt_count_executed = models.IntegerField(default=0)
+    prompt_count_failed = models.IntegerField(default=0)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    cache_hit = models.BooleanField(default=False)
+    fetch_mode = models.CharField(
+        max_length=16,
+        choices=FETCH_MODE_CHOICES,
+        default=FETCH_MODE_FRESH_FETCH,
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+    )
+    extraction_status = models.CharField(
+        max_length=16,
+        choices=STAGE_CHOICES,
+        default=STAGE_PENDING,
+    )
+    scoring_status = models.CharField(
+        max_length=16,
+        choices=STAGE_CHOICES,
+        default=STAGE_PENDING,
+    )
+    recommendation_status = models.CharField(
+        max_length=16,
+        choices=STAGE_CHOICES,
+        default=STAGE_PENDING,
+    )
+    extraction_count = models.IntegerField(default=0)
+    score_snapshot_id = models.IntegerField(null=True, blank=True)
+    recommendation_run_id = models.IntegerField(null=True, blank=True)
+    seo_triggered_at = models.DateTimeField(null=True, blank=True)
+    seo_trigger_status = models.CharField(max_length=32, blank=True, default="")
+    error_message = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        verbose_name = "AEO execution run"
+        verbose_name_plural = "AEO execution runs"
+
+    def __str__(self) -> str:
+        return f"AEOExecutionRun(profile_id={self.profile_id}, status={self.status})"
+
+
 class OnPageAuditSnapshot(models.Model):
     """
     Cached On-Page / Technical SEO audit metrics per user & domain.

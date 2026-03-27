@@ -224,6 +224,22 @@ def google_callback(request: HttpRequest) -> HttpResponse:
 
     login(request, user)
 
+    # Require a filled BusinessProfile before entering the app.
+    # Django's business_profile endpoint auto-creates a blank row; treat that as "not onboarded".
+    try:
+        qs = BusinessProfile.objects.filter(user=user)
+        profile = qs.filter(is_main=True).first() or qs.first()
+        if not profile:
+            next_url = frontend_base + "/onboarding"
+        else:
+            has_business_name = bool((profile.business_name or "").strip())
+            has_website_url = bool((profile.website_url or "").strip())
+            has_business_address = bool((profile.business_address or "").strip())
+            if not has_business_name or not has_website_url or not has_business_address:
+                next_url = frontend_base + "/onboarding"
+    except Exception:
+        logger.exception("[auth] business_profile existence check failed; continuing to next_url")
+
     return redirect(next_url)
 
 
@@ -1728,6 +1744,155 @@ def aeo_profile_data(request: HttpRequest) -> Response:
 
 
 @csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
+    """
+    Cached-only prompt coverage read for AI Visibility UI.
+    Returns monitored prompts from saved AEOResponseSnapshot rows plus latest extraction status.
+    """
+    from .models import AEOResponseSnapshot
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"prompts": [], "monitored_count": 0})
+
+    responses = (
+        AEOResponseSnapshot.objects.filter(profile=profile)
+        .order_by("-created_at", "-id")
+    )
+    prompts: list[dict] = []
+    for resp in responses:
+        latest_ex = resp.extraction_snapshots.order_by("-created_at", "-id").first()
+        competitors_count = 0
+        cited = False
+        if latest_ex is not None:
+            cited = bool(latest_ex.brand_mentioned)
+            comps = latest_ex.competitors_json or []
+            competitors_count = len(comps) if isinstance(comps, list) else 0
+        prompts.append(
+            {
+                "id": resp.id,
+                "prompt": (resp.prompt_text or "").strip(),
+                "prompt_type": str(resp.prompt_type or ""),
+                "weight": float(resp.weight or 1.0),
+                "cited": cited,
+                "competitors_cited": competitors_count,
+                "response_created_at": resp.created_at.isoformat() if resp.created_at else None,
+            }
+        )
+    return Response({"prompts": prompts, "monitored_count": len(prompts)})
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_pipeline_status_data(request: HttpRequest) -> Response:
+    """
+    Cached-only AEO pipeline status endpoint.
+    No OpenAI/DataForSEO calls are made in this read path.
+    """
+    from .models import AEOExecutionRun, AEORecommendationRun, AEOScoreSnapshot
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response(
+            {
+                "run": None,
+                "score_snapshot": None,
+                "recommendation_run": None,
+                "freshness": {"run_age_days": None, "score_age_days": None, "recommendation_age_days": None},
+            }
+        )
+
+    latest_run = (
+        AEOExecutionRun.objects.filter(profile=profile)
+        .order_by("-created_at")
+        .first()
+    )
+    latest_score = (
+        AEOScoreSnapshot.objects.filter(profile=profile)
+        .order_by("-created_at")
+        .first()
+    )
+    latest_reco = (
+        AEORecommendationRun.objects.filter(profile=profile)
+        .order_by("-created_at")
+        .first()
+    )
+    now = datetime.now(timezone.utc)
+
+    run_age_days = None
+    if latest_run and latest_run.finished_at:
+        run_age_days = max(0.0, (now - latest_run.finished_at).total_seconds() / 86400.0)
+    score_age_days = None
+    if latest_score:
+        score_age_days = max(0.0, (now - latest_score.created_at).total_seconds() / 86400.0)
+    reco_age_days = None
+    if latest_reco:
+        reco_age_days = max(0.0, (now - latest_reco.created_at).total_seconds() / 86400.0)
+
+    return Response(
+        {
+            "run": None
+            if not latest_run
+            else {
+                "id": latest_run.id,
+                "status": latest_run.status,
+                "fetch_mode": latest_run.fetch_mode,
+                "cache_hit": latest_run.cache_hit,
+                "prompt_count_requested": latest_run.prompt_count_requested,
+                "prompt_count_executed": latest_run.prompt_count_executed,
+                "prompt_count_failed": latest_run.prompt_count_failed,
+                "extraction_status": latest_run.extraction_status,
+                "scoring_status": latest_run.scoring_status,
+                "recommendation_status": latest_run.recommendation_status,
+                "extraction_count": latest_run.extraction_count,
+                "score_snapshot_id": latest_run.score_snapshot_id,
+                "recommendation_run_id": latest_run.recommendation_run_id,
+                "seo_triggered_at": latest_run.seo_triggered_at.isoformat() if latest_run.seo_triggered_at else None,
+                "seo_trigger_status": latest_run.seo_trigger_status or "",
+                "started_at": latest_run.started_at.isoformat() if latest_run.started_at else None,
+                "finished_at": latest_run.finished_at.isoformat() if latest_run.finished_at else None,
+                "error_message": latest_run.error_message or "",
+            },
+            "score_snapshot": None
+            if not latest_score
+            else {
+                "id": latest_score.id,
+                "visibility_score": float(latest_score.visibility_score),
+                "weighted_position_score": float(latest_score.weighted_position_score),
+                "citation_share": float(latest_score.citation_share),
+                "total_prompts": int(latest_score.total_prompts),
+                "total_mentions": int(latest_score.total_mentions),
+                "created_at": latest_score.created_at.isoformat(),
+            },
+            "recommendation_run": None
+            if not latest_reco
+            else {
+                "id": latest_reco.id,
+                "score_snapshot_id": latest_reco.score_snapshot_id,
+                "recommendation_count": len(latest_reco.recommendations_json or []),
+                "created_at": latest_reco.created_at.isoformat(),
+            },
+            "freshness": {
+                "run_age_days": run_age_days,
+                "score_age_days": score_age_days,
+                "recommendation_age_days": reco_age_days,
+            },
+        }
+    )
+
+
+@csrf_exempt
 @api_view(["POST"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -1804,6 +1969,19 @@ def _onboarding_reuse_saved_prompts(request: HttpRequest, body: dict) -> bool:
     return _truthy_openai_param(request.GET.get("reuse_saved"))
 
 
+def _aeo_prompt_target_count() -> int:
+    testing_mode = bool(getattr(settings, "AEO_TESTING_MODE", False))
+    if testing_mode:
+        try:
+            return max(1, int(getattr(settings, "AEO_TEST_PROMPT_COUNT", 10)))
+        except (TypeError, ValueError):
+            return 10
+    try:
+        return max(1, int(getattr(settings, "AEO_PROD_PROMPT_COUNT", 50)))
+    except (TypeError, ValueError):
+        return 50
+
+
 def _first_nonempty_str(*vals) -> str | None:
     for v in vals:
         if v is None:
@@ -1820,7 +1998,7 @@ def _first_nonempty_str(*vals) -> str | None:
 @permission_classes([IsAuthenticated])
 def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     """
-    AEO onboarding prompt plan: fixed + dynamic templates + optional OpenAI expansion (~50 prompts).
+    AEO onboarding prompt plan: OpenAI-generated prompt set (target count from settings).
 
     Call after PATCH ``/api/business-profile/`` with name, URL, address, and optional industry.
 
@@ -1828,15 +2006,15 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
 
     Optional parameters (query and/or JSON):
 
-    - ``include_openai`` — default ``true``. Use ``0`` / ``false`` for template-only (faster).
+    - ``include_openai`` — accepted for backward compatibility; prompt planning is OpenAI-only.
     - ``city`` — optional override for templates (overrides inference from ``business_address``; use
       ``business_address`` on the profile so prompts use city/region, not street-level detail).
-    - ``industry`` — explicit industry for fixed/dynamic bucketing (overrides profile field).
+    - ``industry`` — explicit industry override for prompt context.
     - ``reuse_saved`` — when ``true`` and the profile already has ``selected_aeo_prompts`` of length
       ``AEO_ONBOARDING_PROMPT_COUNT``, return that list without calling OpenAI or rebuilding templates.
 
-    Response ``meta`` includes ``openai_status`` (``ok`` | ``failed_empty`` | ``skipped_no_city`` |
-    ``disabled`` | ``reused_saved``) and ``openai_message`` when expansion fails or is skipped — never a silent tiny list.
+    Response ``meta`` includes ``openai_status`` (``ok`` | ``partial`` | ``failed_empty`` |
+    ``reused_saved``) and ``openai_message`` when generation cannot hit target count.
     """
     profile = (
         BusinessProfile.objects.filter(user=request.user, is_main=True).first()
@@ -1854,16 +2032,39 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     include_openai = _onboarding_plan_include_openai(request, body)
     reuse_saved = _onboarding_reuse_saved_prompts(request, body)
 
+    target_prompt_count = _aeo_prompt_target_count()
+
     saved = profile.selected_aeo_prompts or []
-    if reuse_saved and isinstance(saved, list) and len(saved) == AEO_ONBOARDING_PROMPT_COUNT:
+    if reuse_saved and isinstance(saved, list) and len(saved) == target_prompt_count:
         raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved])
-        if len(raw_items) == AEO_ONBOARDING_PROMPT_COUNT:
+        if len(raw_items) == target_prompt_count:
             ser = _serialize_aeo_prompt_items(raw_items)
             biz = aeo_business_input_from_profile(
                 profile,
                 city=city_override,
                 industry=industry_override,
             ).as_dict()
+            try:
+                from .models import AEOExecutionRun
+                from .tasks import run_aeo_phase1_execution_task
+
+                inflight = AEOExecutionRun.objects.filter(
+                    profile=profile,
+                    status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+                ).exists()
+                if not inflight:
+                    run = AEOExecutionRun.objects.create(
+                        profile=profile,
+                        prompt_count_requested=len(ser),
+                        status=AEOExecutionRun.STATUS_PENDING,
+                    )
+                    transaction.on_commit(
+                        lambda run_id=run.id, prompt_payload=ser: run_aeo_phase1_execution_task.delay(
+                            run_id, prompt_payload
+                        )
+                    )
+            except Exception:
+                logger.exception("[AEO onboarding] failed to enqueue phase1 execution (reuse_saved)")
             return Response(
                 {
                     "groups": {
@@ -1879,7 +2080,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                         "openai_message": "",
                         "openai_prompt_count": 0,
                         "combined_count": len(ser),
-                        "combined_target": AEO_ONBOARDING_PROMPT_COUNT,
+                        "combined_target": target_prompt_count,
                         "combined_shortfall": 0,
                     },
                 }
@@ -1890,12 +2091,40 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
         city=city_override,
         industry=industry_override,
         include_openai=include_openai,
-        target_combined_count=AEO_ONBOARDING_PROMPT_COUNT,
+        target_combined_count=target_prompt_count,
     )
     fixed = _serialize_aeo_prompt_items(plan.get("fixed") or [])
     dynamic = _serialize_aeo_prompt_items(plan.get("dynamic") or [])
     openai_generated = _serialize_aeo_prompt_items(plan.get("openai_generated") or [])
     combined = _serialize_aeo_prompt_items(plan.get("combined") or [])
+    try:
+        profile.selected_aeo_prompts = [str(x.get("prompt") or "") for x in combined if str(x.get("prompt") or "").strip()]
+        profile.save(update_fields=["selected_aeo_prompts", "updated_at"])
+    except Exception:
+        logger.exception("[AEO onboarding] failed saving selected_aeo_prompts")
+
+    try:
+        from .models import AEOExecutionRun
+        from .tasks import run_aeo_phase1_execution_task
+
+        inflight = AEOExecutionRun.objects.filter(
+            profile=profile,
+            status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+        ).exists()
+        if not inflight:
+            run = AEOExecutionRun.objects.create(
+                profile=profile,
+                prompt_count_requested=min(len(combined), target_prompt_count),
+                status=AEOExecutionRun.STATUS_PENDING,
+            )
+            transaction.on_commit(
+                lambda run_id=run.id, prompt_payload=combined: run_aeo_phase1_execution_task.delay(
+                    run_id, prompt_payload
+                )
+            )
+    except Exception:
+        logger.exception("[AEO onboarding] failed to enqueue phase1 execution")
+
     return Response(
         {
             "groups": {

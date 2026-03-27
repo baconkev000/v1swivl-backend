@@ -55,6 +55,8 @@ urlpatterns += [
     path("api/seo/profile/", accounts_views.seo_profile_data, name="seo-profile-data"),
     path("api/seo/score-history/", accounts_views.seo_score_history_data, name="seo-score-history-data"),
     path("api/aeo/profile/", accounts_views.aeo_profile_data, name="aeo-profile-data"),
+    path("api/aeo/prompt-coverage/", accounts_views.aeo_prompt_coverage_data, name="aeo-prompt-coverage-data"),
+    path("api/aeo/pipeline-status/", accounts_views.aeo_pipeline_status_data, name="aeo-pipeline-status-data"),
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
     path(
         "api/aeo/onboarding-prompt-plan/",

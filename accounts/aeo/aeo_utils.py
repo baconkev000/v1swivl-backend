@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from string import Formatter
 from typing import Any, Final, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -26,13 +27,23 @@ from .aeo_prompts import (
     AEO_BATCH_JSON_SCHEMA_INSTRUCTION,
     AEO_BATCH_USER_PROMPT_INTRO,
     AEO_EXTRACTION_PREP_SYSTEM_PROMPT,
+    AEO_PROMPT_ENGINE_SYSTEM_PROMPT_AUTHORITY,
+    AEO_PROMPT_ENGINE_SYSTEM_PROMPT_COMPARISON,
     AEO_PROMPT_ENGINE_SYSTEM_PROMPT,
+    AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL,
+    AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRUST,
     DYNAMIC_BUSINESS_NAME_SPECS,
     DYNAMIC_PROMPT_SPECS,
-    FIXED_INDUSTRY_PROMPT_SPECS,
-    provider_label_for_bucket,
-    resolve_industry_bucket,
 )
+
+OPENAI_ONBOARDING_TYPE_RATIO: Final[dict[str, float]] = {
+    AEOPromptType.TRANSACTIONAL.value: 0.35,
+    AEOPromptType.TRUST.value: 0.25,
+    AEOPromptType.COMPARISON.value: 0.25,
+    AEOPromptType.AUTHORITY.value: 0.15,
+}
+OPENAI_ONBOARDING_MAX_ROUNDS: Final[int] = 6
+OPENAI_ONBOARDING_MAX_BATCH_SIZE: Final[int] = 24
 
 
 @dataclass
@@ -158,22 +169,28 @@ def _format_template(
     spec: AEOPromptTemplateSpec,
     *,
     city: str,
-    provider_label: str,
     service: str = "",
     modifier: str = "",
     differentiator: str = "",
     business_name: str = "",
     website_domain: str = "",
 ) -> str:
-    return spec.template.format(
-        city=city,
-        provider_label=provider_label,
-        service=service,
-        modifier=modifier,
-        differentiator=differentiator,
-        business_name=business_name,
-        website_domain=website_domain,
-    )
+    values = {
+        "city": city,
+        "service": service,
+        "modifier": modifier,
+        "differentiator": differentiator,
+        "business_name": business_name,
+        "website_domain": website_domain,
+    }
+    fields = {
+        field_name
+        for _, field_name, _, _ in Formatter().parse(spec.template)
+        if field_name
+    }
+    # Prevent runtime KeyError if any unexpected placeholder is introduced.
+    safe_values = {k: values.get(k, "") for k in fields}
+    return spec.template.format(**safe_values)
 
 
 def plan_items_from_saved_prompt_strings(texts: Sequence[str]) -> list[dict[str, Any]]:
@@ -204,7 +221,7 @@ def _split_combined_into_source_groups(
     fixed: list[dict[str, Any]],
     dynamic: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Partition ``combined`` (in order) into fixed / dynamic / openai buckets by prompt text."""
+    """Partition ``combined`` (in order) into fixed / dynamic / openai groups by prompt text."""
     fixed_texts = {str(x.get("prompt", "")).strip() for x in fixed}
     dynamic_texts = {str(x.get("prompt", "")).strip() for x in dynamic}
     out_fixed: list[dict[str, Any]] = []
@@ -239,32 +256,10 @@ def prompt_record(
 
 def generate_fixed_prompts(industry: str, city: str) -> list[dict[str, Any]]:
     """
-    Deterministic industry benchmark prompts from FIXED_INDUSTRY_PROMPT_SPECS.
+    Fixed prompt generation is disabled for current onboarding flow.
+    Keep function for API/backward compatibility.
     """
-    bucket = resolve_industry_bucket(industry)
-    specs = FIXED_INDUSTRY_PROMPT_SPECS.get(bucket) or FIXED_INDUSTRY_PROMPT_SPECS["default"]
-    provider = provider_label_for_bucket(bucket)
-    c = _normalize_city(city)
-    out: list[dict[str, Any]] = []
-    for spec in specs:
-        text = _format_template(
-            spec,
-            city=c,
-            provider_label=provider,
-            business_name="",
-            website_domain="",
-        )
-        if not text:
-            continue
-        out.append(
-            prompt_record(
-                text,
-                prompt_type=spec.prompt_type,
-                weight=spec.weight,
-                dynamic=False,
-            )
-        )
-    return out
+    return []
 
 
 def _clean_token(s: str) -> str:
@@ -297,8 +292,6 @@ def generate_dynamic_prompts(
             differentiators=list(m.get("differentiators") or []),
         )
 
-    bucket = resolve_industry_bucket(ctx.industry)
-    provider = provider_label_for_bucket(bucket)
     c = _normalize_city(ctx.city)
     if not c:
         return []
@@ -310,61 +303,50 @@ def generate_dynamic_prompts(
     modifiers = [_clean_token(x) for x in ctx.niche_modifiers if _clean_token(x)]
     diffs = [_clean_token(x) for x in ctx.differentiators if _clean_token(x)]
 
+    def _template_fields(template: str) -> set[str]:
+        return {
+            field_name
+            for _, field_name, _, _ in Formatter().parse(template)
+            if field_name
+        }
+
+    def _value_sets_for_spec(spec: AEOPromptTemplateSpec) -> list[dict[str, str]]:
+        fields = _template_fields(spec.template)
+        candidates: list[dict[str, str]] = [{}]
+        if "service" in fields:
+            if not services:
+                return []
+            candidates = [{**c, "service": svc} for c in candidates for svc in services]
+        if "modifier" in fields:
+            if not modifiers:
+                return []
+            candidates = [{**c, "modifier": mod} for c in candidates for mod in modifiers]
+        if "differentiator" in fields:
+            if not diffs:
+                return []
+            candidates = [{**c, "differentiator": d} for c in candidates for d in diffs]
+        return candidates
+
     for spec in DYNAMIC_PROMPT_SPECS:
-        if spec.key.startswith("dyn_modifier") and modifiers:
-            for mod in modifiers:
-                text = _format_template(
-                    spec, city=c, provider_label=provider, modifier=mod
+        for params in _value_sets_for_spec(spec):
+            text = _format_template(spec, city=c, **params)
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                prompt_record(
+                    text,
+                    prompt_type=spec.prompt_type,
+                    weight=spec.weight,
+                    dynamic=True,
                 )
-                key = text.lower()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(
-                        prompt_record(
-                            text,
-                            prompt_type=spec.prompt_type,
-                            weight=spec.weight,
-                            dynamic=True,
-                        )
-                    )
-        elif spec.key.startswith("dyn_service") and services:
-            for svc in services:
-                text = _format_template(
-                    spec, city=c, provider_label=provider, service=svc
-                )
-                key = text.lower()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(
-                        prompt_record(
-                            text,
-                            prompt_type=spec.prompt_type,
-                            weight=spec.weight,
-                            dynamic=True,
-                        )
-                    )
-        elif spec.key.startswith("dyn_diff") and diffs:
-            for d in diffs:
-                text = _format_template(
-                    spec, city=c, provider_label=provider, differentiator=d
-                )
-                key = text.lower()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(
-                        prompt_record(
-                            text,
-                            prompt_type=spec.prompt_type,
-                            weight=spec.weight,
-                            dynamic=True,
-                        )
-                    )
+            )
 
     for spec in DYNAMIC_BUSINESS_NAME_SPECS:
         text = _format_template(
             spec,
             city=c,
-            provider_label=provider,
             business_name="",
             website_domain="",
         )
@@ -471,7 +453,9 @@ def run_prompt_batch_via_openai(
                 {"role": "system", "content": sys_p},
                 {"role": "user", "content": user_content},
             ],
-            temperature=0.4,
+            temperature=0.2,
+            top_p=0.9,
+            max_tokens=500
         )
         raw = (completion.choices[0].message.content or "").strip()
     except Exception:
@@ -529,14 +513,15 @@ def build_full_aeo_prompt_plan(
     target_combined_count: int | None = None,
 ) -> dict[str, Any]:
     """
-    Convenience bundler for Django services: fixed + dynamic [+ optional OpenAI expansion].
+    Build onboarding prompt plan using OpenAI generation only.
 
-    Onboarding returns exactly ``AEO_ONBOARDING_PROMPT_COUNT`` prompts when enough distinct
-    templates + LLM rows exist; otherwise ``meta.combined_shortfall`` reports the gap.
-    OpenAI batches repeat (up to a few rounds) until the target is reached or the API stops
-    returning new rows (48 prompts max per call).
+    Output schema remains backward compatible:
+    - fixed: []
+    - dynamic: []
+    - openai_generated: generated prompts
+    - combined: same generated prompts (capped to target)
     """
-    target = AEO_ONBOARDING_PROMPT_COUNT
+    target = int(target_combined_count or AEO_ONBOARDING_PROMPT_COUNT)
 
     ctx = aeo_business_input_from_profile(
         profile,
@@ -546,65 +531,133 @@ def build_full_aeo_prompt_plan(
         niche_modifiers=niche_modifiers,
         differentiators=differentiators,
     )
-    fixed = generate_fixed_prompts(ctx.industry, ctx.city)
-    dynamic = generate_dynamic_prompts(ctx)
-    combined = combine_prompt_set(fixed, dynamic)
-    llm_extra: list[dict[str, Any]] = []
-    openai_status = "disabled"
-    openai_message = ""
+    _ = include_openai  # kept for API compatibility; onboarding plan is OpenAI-only.
+    type_prompts: dict[str, str] = {
+        AEOPromptType.TRANSACTIONAL.value: AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL,
+        AEOPromptType.TRUST.value: AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRUST,
+        AEOPromptType.COMPARISON.value: AEO_PROMPT_ENGINE_SYSTEM_PROMPT_COMPARISON,
+        AEOPromptType.AUTHORITY.value: AEO_PROMPT_ENGINE_SYSTEM_PROMPT_AUTHORITY,
+    }
+    type_order = [
+        AEOPromptType.TRANSACTIONAL.value,
+        AEOPromptType.TRUST.value,
+        AEOPromptType.COMPARISON.value,
+        AEOPromptType.AUTHORITY.value,
+    ]
 
-    max_rounds = 5
-    round_i = 0
-    if include_openai and ctx.city:
-        openai_status = "attempted"
-        while len(combined) < target and round_i < max_rounds:
-            if max_openai_prompts is not None and len(llm_extra) >= max_openai_prompts:
+    def _allocate_type_quotas(total: int) -> dict[str, int]:
+        quotas = {t: int(total * OPENAI_ONBOARDING_TYPE_RATIO.get(t, 0.0)) for t in type_order}
+        assigned = sum(quotas.values())
+        i = 0
+        while assigned < total:
+            t = type_order[i % len(type_order)]
+            quotas[t] += 1
+            assigned += 1
+            i += 1
+        return quotas
+
+    def _typed_batch(batch: list[dict[str, Any]], forced_type: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for item in batch:
+            text = str(item.get("prompt", "") or "").strip()
+            if not text:
+                continue
+            try:
+                weight = float(item.get("weight", 1.0))
+            except (TypeError, ValueError):
+                weight = 1.0
+            out.append(prompt_record(text, prompt_type=forced_type, weight=weight, dynamic=True))
+        return out
+
+    combined: list[dict[str, Any]] = []
+    openai_status = "attempted"
+    openai_message = ""
+    max_rounds = int(
+        getattr(settings, "AEO_ONBOARDING_OPENAI_MAX_ROUNDS", OPENAI_ONBOARDING_MAX_ROUNDS)
+    )
+    max_batch_size = int(
+        getattr(
+            settings,
+            "AEO_ONBOARDING_OPENAI_MAX_BATCH_SIZE",
+            OPENAI_ONBOARDING_MAX_BATCH_SIZE,
+        )
+    )
+    quotas = _allocate_type_quotas(target)
+
+    for prompt_type in type_order:
+        need = quotas[prompt_type]
+        rounds = 0
+        while need > 0 and rounds < max_rounds:
+            if max_openai_prompts is not None and len(combined) >= max_openai_prompts:
                 break
-            need = min(48, target - len(combined))
-            if need <= 0:
-                break
+            req = min(max_batch_size, need)
             batch = run_prompt_batch_via_openai(
                 ctx,
                 seed_prompts=combined,
-                max_additional=need,
+                max_additional=req,
+                system_prompt=type_prompts[prompt_type],
             )
-            round_i += 1
-            if not batch:
+            rounds += 1
+            typed = _typed_batch(batch, prompt_type)
+            if not typed:
                 break
-            llm_extra.extend(batch)
-            combined = combine_prompt_set(combined, batch)
-        if not llm_extra and len(combined) < target:
-            openai_status = "failed_empty"
-            openai_message = (
-                "Additional AI-generated prompts could not be loaded (API error or empty response). "
-                "Showing template-based prompts only."
+            before = len(combined)
+            combined = combine_prompt_set(combined, typed)
+            added = len(combined) - before
+            if added <= 0:
+                break
+            need -= added
+
+    topup_round = 0
+    while len(combined) < target and topup_round < max_rounds:
+        if max_openai_prompts is not None and len(combined) >= max_openai_prompts:
+            break
+        progress = False
+        remaining = target - len(combined)
+        for prompt_type in type_order:
+            if remaining <= 0:
+                break
+            req = min(max_batch_size, remaining)
+            batch = run_prompt_batch_via_openai(
+                ctx,
+                seed_prompts=combined,
+                max_additional=req,
+                system_prompt=type_prompts[prompt_type],
             )
-        elif len(combined) >= target:
-            openai_status = "ok" if llm_extra else "disabled"
-        elif llm_extra:
-            openai_status = "ok"
-    elif include_openai and not ctx.city:
-        openai_status = "skipped_no_city"
-        openai_message = (
-            "A city or region could not be inferred from your business address; AI expansion was skipped. "
-            "Add an address that includes at least city and state or region (street is optional) for fuller coverage."
-        )
+            typed = _typed_batch(batch, prompt_type)
+            if not typed:
+                continue
+            before = len(combined)
+            combined = combine_prompt_set(combined, typed)
+            added = len(combined) - before
+            if added > 0:
+                progress = True
+                remaining = target - len(combined)
+        topup_round += 1
+        if not progress:
+            break
 
     if len(combined) > target:
         combined = combined[:target]
 
     shortfall = max(0, target - len(combined))
-    if shortfall and openai_message:
-        openai_message = f"{openai_message} ({shortfall} short of {target} distinct prompts.)"
-    elif shortfall:
+    if len(combined) >= target:
+        openai_status = "ok"
+    elif len(combined) == 0:
+        openai_status = "failed_empty"
+        openai_message = "AI prompt generation returned no usable prompts."
+    else:
+        openai_status = "partial"
         openai_message = f"Only {len(combined)} distinct prompts available; target is {target}."
 
-    out_fixed, out_dynamic, out_openai = _split_combined_into_source_groups(combined, fixed, dynamic)
+    out_fixed: list[dict[str, Any]] = []
+    out_dynamic: list[dict[str, Any]] = []
+    out_openai = combined[:]
 
     meta = {
         "openai_status": openai_status,
         "openai_message": openai_message.strip(),
-        "openai_prompt_count": len(llm_extra),
+        "openai_prompt_count": len(out_openai),
         "combined_count": len(combined),
         "combined_target": target,
         "combined_shortfall": shortfall,

@@ -37,6 +37,24 @@ _VALID_POSITIONS = frozenset({"top", "middle", "bottom", "none"})
 _VALID_SENTIMENT = frozenset({"positive", "neutral", "negative"})
 
 
+def _strict_parse_bool(value: Any) -> bool:
+    """
+    Strict bool parser for model outputs.
+    - Accept bool directly
+    - Accept "true"/"false" strings (case-insensitive)
+    - Default False for all other types/values
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v == "true":
+            return True
+        if v == "false":
+            return False
+    return False
+
+
 def _extraction_model() -> str:
     return getattr(settings, "AEO_EXTRACTION_PARSER_MODEL", None) or _get_model()
 
@@ -213,7 +231,7 @@ def normalize_extraction_payload(data: Mapping[str, Any], *, raw_response: str =
     """
     Coerce model JSON into canonical shape for storage and APIs.
     """
-    brand = bool(data.get("brand_mentioned"))
+    brand = _strict_parse_bool(data.get("brand_mentioned"))
     pos = str(data.get("mention_position") or "none").lower().strip()
     if pos not in _VALID_POSITIONS:
         pos = "none"
@@ -297,6 +315,11 @@ def _parse_extraction_json(raw_text: str) -> dict[str, Any] | None:
     )
     if not all(k in obj for k in required):
         return None
+    # Strict type guard for brand_mentioned to avoid truthy coercion bugs.
+    bm = obj.get("brand_mentioned")
+    if not isinstance(bm, bool):
+        if not (isinstance(bm, str) and bm.strip().lower() in {"true", "false"}):
+            return None
     return obj
 
 
@@ -372,6 +395,7 @@ def extract_aeo_response(
             logger.warning("AEO extraction JSON parse failed; retrying once")
             raw_llm = _call_extraction_openai(user_content + AEO_STRUCTURED_EXTRACTION_RETRY_SUFFIX)
             parsed = _parse_extraction_json(raw_llm)
+            print("PROM", parsed)
     except Exception as exc:
         logger.exception("AEO extraction OpenAI call failed: %s", exc)
         parsed = None

@@ -1,9 +1,14 @@
+import csv
+from datetime import datetime
+
 from django.contrib import admin
+from django.http import HttpResponse
 
 from .models import (
     AEOExtractionSnapshot,
     AEOResponseSnapshot,
     AEORecommendationRun,
+    AEOExecutionRun,
     AEOScoreSnapshot,
     BusinessProfile,
     GoogleSearchConsoleConnection,
@@ -20,8 +25,35 @@ from .models import (
 )
 
 
+class CsvExportAdminMixin:
+    """
+    Adds a generic "export selected rows to CSV" action.
+    """
+
+    actions = ("export_as_csv",)
+
+    @admin.action(description="Export selected rows to CSV")
+    def export_as_csv(self, request, queryset):
+        model = self.model
+        field_names = [field.name for field in model._meta.fields]
+
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"{model._meta.model_name}_{ts}.csv"
+
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow(field_names)
+
+        for obj in queryset:
+            writer.writerow([getattr(obj, field) for field in field_names])
+
+        return response
+
+
 @admin.register(AEORecommendationRun)
-class AEORecommendationRunAdmin(admin.ModelAdmin):
+class AEORecommendationRunAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "profile",
@@ -36,7 +68,7 @@ class AEORecommendationRunAdmin(admin.ModelAdmin):
 
 
 @admin.register(AEOScoreSnapshot)
-class AEOScoreSnapshotAdmin(admin.ModelAdmin):
+class AEOScoreSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "profile",
@@ -53,7 +85,7 @@ class AEOScoreSnapshotAdmin(admin.ModelAdmin):
 
 
 @admin.register(AEOExtractionSnapshot)
-class AEOExtractionSnapshotAdmin(admin.ModelAdmin):
+class AEOExtractionSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "response_snapshot",
@@ -71,7 +103,7 @@ class AEOExtractionSnapshotAdmin(admin.ModelAdmin):
 
 
 @admin.register(AEOResponseSnapshot)
-class AEOResponseSnapshotAdmin(admin.ModelAdmin):
+class AEOResponseSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "profile",
@@ -86,8 +118,26 @@ class AEOResponseSnapshotAdmin(admin.ModelAdmin):
     raw_id_fields = ("profile",)
 
 
+@admin.register(AEOExecutionRun)
+class AEOExecutionRunAdmin(CsvExportAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "id",
+        "profile",
+        "status",
+        "fetch_mode",
+        "prompt_count_requested",
+        "prompt_count_executed",
+        "prompt_count_failed",
+        "created_at",
+        "finished_at",
+    )
+    list_filter = ("status", "fetch_mode", "created_at")
+    search_fields = ("profile__business_name", "profile__user__email")
+    raw_id_fields = ("profile",)
+
+
 @admin.register(BusinessProfile)
-class BusinessProfileAdmin(admin.ModelAdmin):
+class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "user",
@@ -102,67 +152,67 @@ class BusinessProfileAdmin(admin.ModelAdmin):
 
 
 @admin.register(GoogleSearchConsoleConnection)
-class GoogleSearchConsoleConnectionAdmin(admin.ModelAdmin):
+class GoogleSearchConsoleConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "created_at", "updated_at")
     search_fields = ("user__email", "user__username")
 
 
 @admin.register(GoogleBusinessProfileConnection)
-class GoogleBusinessProfileConnectionAdmin(admin.ModelAdmin):
+class GoogleBusinessProfileConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "created_at", "updated_at")
     search_fields = ("user__email", "user__username")
 
 
 @admin.register(GoogleAdsConnection)
-class GoogleAdsConnectionAdmin(admin.ModelAdmin):
+class GoogleAdsConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "created_at", "updated_at")
     search_fields = ("user__email", "user__username")
 
 
 @admin.register(MetaAdsConnection)
-class MetaAdsConnectionAdmin(admin.ModelAdmin):
+class MetaAdsConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "expires_at", "created_at", "updated_at")
     search_fields = ("user__email", "user__username")
 
 
 @admin.register(ReviewsOverviewSnapshot)
-class ReviewsOverviewSnapshotAdmin(admin.ModelAdmin):
+class ReviewsOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "star_rating", "total_reviews", "response_rate_pct", "last_fetched_at")
     search_fields = ("user__email", "user__username")
 
 
 @admin.register(SEOOverviewSnapshot)
-class SEOOverviewSnapshotAdmin(admin.ModelAdmin):
+class SEOOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "period_start", "organic_visitors", "keywords_ranking", "top3_positions", "last_fetched_at")
     search_fields = ("user__email", "user__username")
 
 
 @admin.register(GoogleAdsKeywordIdea)
-class GoogleAdsKeywordIdeaAdmin(admin.ModelAdmin):
+class GoogleAdsKeywordIdeaAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "keyword", "avg_monthly_searches", "competition", "last_fetched_at")
     search_fields = ("user__email", "user__username", "keyword")
 
 
 @admin.register(AgentConversation)
-class AgentConversationAdmin(admin.ModelAdmin):
+class AgentConversationAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "agent", "title", "created_at", "updated_at")
     search_fields = ("user__email", "user__username", "title", "agent")
 
 
 @admin.register(AgentMessage)
-class AgentMessageAdmin(admin.ModelAdmin):
+class AgentMessageAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "conversation", "role", "created_at")
     search_fields = ("conversation__user__email", "conversation__user__username", "content")
 
 
 @admin.register(ReviewsConversation)
-class ReviewsConversationAdmin(admin.ModelAdmin):
+class ReviewsConversationAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "title", "created_at", "updated_at")
     search_fields = ("user__email", "user__username", "title")
 
 
 @admin.register(ReviewsMessage)
-class ReviewsMessageAdmin(admin.ModelAdmin):
+class ReviewsMessageAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "conversation", "role", "created_at")
     search_fields = ("conversation__user__email", "conversation__user__username", "content")
 

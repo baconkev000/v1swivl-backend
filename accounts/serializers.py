@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
+def _aeo_prompt_target_count() -> int:
+    testing_mode = bool(getattr(settings, "AEO_TESTING_MODE", False))
+    if testing_mode:
+        try:
+            return max(1, int(getattr(settings, "AEO_TEST_PROMPT_COUNT", 10)))
+        except (TypeError, ValueError):
+            return 10
+    try:
+        return max(1, int(getattr(settings, "AEO_PROD_PROMPT_COUNT", AEO_ONBOARDING_PROMPT_COUNT)))
+    except (TypeError, ValueError):
+        return AEO_ONBOARDING_PROMPT_COUNT
+
+
 class BusinessProfileSerializer(serializers.ModelSerializer):
     website_url = serializers.CharField(
         required=False,
@@ -126,7 +139,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if value is None:
             return []
         out = [str(x).strip() for x in value if str(x).strip()]
-        return out[:AEO_ONBOARDING_PROMPT_COUNT]
+        return out[:_aeo_prompt_target_count()]
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -134,11 +147,12 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             sp = attrs.get("selected_aeo_prompts")
             if sp is not None:
                 n = len(sp)
-                if n != 0 and n != AEO_ONBOARDING_PROMPT_COUNT:
+                target_count = _aeo_prompt_target_count()
+                if n != 0 and n != target_count:
                     raise serializers.ValidationError(
                         {
                             "selected_aeo_prompts": (
-                                f"Must be empty or exactly {AEO_ONBOARDING_PROMPT_COUNT} prompts; got {n}."
+                                f"Must be empty or exactly {target_count} prompts; got {n}."
                             )
                         }
                     )

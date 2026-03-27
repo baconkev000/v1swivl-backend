@@ -361,6 +361,10 @@ DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS = env.bool(
     "DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS",
     default=False,
 )
+AEO_TESTING_MODE = env.bool("AEO_TESTING_MODE", default=False)
+AEO_TEST_PROMPT_COUNT = env.int("AEO_TEST_PROMPT_COUNT", default=10)
+AEO_PROD_PROMPT_COUNT = env.int("AEO_PROD_PROMPT_COUNT", default=50)
+AEO_ENABLE_RECOMMENDATION_STAGE = env.bool("AEO_ENABLE_RECOMMENDATION_STAGE", default=False)
 # Meta (Facebook) – Ads app: OAuth login + Marketing API (connect button and ad campaigns)
 META_ADS_APP_ID = os.environ.get("META_ADS_APP_ID", "")
 META_ADS_APP_SECRET = os.environ.get("META_ADS_APP_SECRET", "")
