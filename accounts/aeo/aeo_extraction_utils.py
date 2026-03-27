@@ -13,6 +13,7 @@ Optional settings:
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -35,6 +36,82 @@ logger = logging.getLogger(__name__)
 DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
 _VALID_POSITIONS = frozenset({"top", "middle", "bottom", "none"})
 _VALID_SENTIMENT = frozenset({"positive", "neutral", "negative"})
+_NAME_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "for",
+        "in",
+        "at",
+        "to",
+        "inc",
+        "llc",
+        "ltd",
+        "plc",
+        "pc",
+        "llp",
+        "co",
+    }
+)
+
+
+def _normalize_for_brand_match(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (s or "").lower())).strip()
+
+
+def _significant_name_tokens(name: str) -> list[str]:
+    n = _normalize_for_brand_match(name)
+    toks = [t for t in n.split() if len(t) >= 2 and t not in _NAME_STOPWORDS]
+    return toks if toks else ([n] if n else [])
+
+
+def _domain_grounds_brand(raw_text: str, website_domain: str) -> bool:
+    if not website_domain:
+        return False
+    d = website_domain.strip().lower()
+    if not d:
+        return False
+    raw_compact = re.sub(r"\s+", "", (raw_text or "").lower())
+    if d in raw_compact:
+        return True
+    first = d.split(".", 1)[0]
+    if len(first) >= 4 and first in raw_compact:
+        return True
+    return False
+
+
+def _tracked_brand_grounded_in_text(
+    raw_text: str,
+    *,
+    business_name: str,
+    website_domain: str = "",
+) -> bool:
+    """
+    True if the tracked business is present in the raw answer (case-insensitive),
+    via full-name substring, all significant name tokens, or website domain.
+    """
+    raw_norm = _normalize_for_brand_match(raw_text)
+    if not raw_norm:
+        return False
+    if _domain_grounds_brand(raw_text, website_domain):
+        return True
+    bn = (business_name or "").strip()
+    if not bn:
+        return False
+    full = _normalize_for_brand_match(bn)
+    if len(full) >= 3 and full in raw_norm:
+        return True
+    tokens = _significant_name_tokens(bn)
+    if not tokens:
+        return False
+    if len(tokens) == 1:
+        t = tokens[0]
+        return len(t) >= 3 and t in raw_norm
+    return all(t in raw_norm for t in tokens)
 
 
 def _strict_parse_bool(value: Any) -> bool:
@@ -179,22 +256,154 @@ def _extract_domains_from_raw_answer(raw_text: str) -> list[str]:
     return _dedupe_preserve_order(domains)[:100]
 
 
-def _sanitize_competitors(items: Any) -> list[str]:
-    out: list[str] = []
+def _coerce_dict_like_string(s: str) -> dict[str, Any] | None:
+    """
+    Parse a string that is either JSON or a Python repr of a dict (e.g. LLM output
+    ``"{'name': 'X', 'url': '...'}"`` stored as a string instead of a real JSON object).
+    """
+    raw = (s or "").strip()
+    if not raw.startswith("{"):
+        return None
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    try:
+        obj = ast.literal_eval(raw)
+        if isinstance(obj, dict):
+            return obj
+    except (ValueError, SyntaxError, MemoryError):
+        pass
+    return None
+
+
+def flatten_competitor_name_field(value: Any) -> str:
+    """
+    Coerce a competitor ``name`` field to a plain string.
+
+    The model sometimes nests objects (e.g. ``name: { name: \"X\" }``); ``str(dict)``
+    would otherwise produce a Python repr shown in the UI. String values may also be
+    an entire ``{'name':..., 'url':...}`` blob.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        s = value.strip()
+        coerced = _coerce_dict_like_string(s)
+        if coerced is not None:
+            return flatten_competitor_name_field(coerced.get("name"))
+        return s
+    if isinstance(value, dict):
+        inner = value.get("name") or value.get("Name") or value.get("title")
+        if inner is None:
+            return ""
+        if isinstance(inner, dict):
+            return flatten_competitor_name_field(inner)
+        return str(inner).strip()
+    return str(value).strip()
+
+
+def flatten_competitor_url_field(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        s = value.strip()
+        coerced = _coerce_dict_like_string(s)
+        if coerced is not None:
+            return flatten_competitor_url_field(coerced.get("url"))
+        return s
+    if isinstance(value, dict):
+        inner = value.get("url") or value.get("URL") or value.get("href")
+        if inner is None:
+            return ""
+        if isinstance(inner, dict):
+            return flatten_competitor_url_field(inner)
+        return str(inner).strip()
+    return str(value).strip()
+
+
+def parse_competitor_raw_item(item: Any) -> dict[str, str]:
+    """
+    Normalize one competitor from the model or DB to ``{"name": str, "url": str}``.
+
+    Handles real dicts, JSON strings, Python repr strings, and plain business names.
+    """
+    if item is None:
+        return {"name": "", "url": ""}
+    if isinstance(item, dict):
+        return {
+            "name": flatten_competitor_name_field(item.get("name")),
+            "url": flatten_competitor_url_field(item.get("url")),
+        }
+    if isinstance(item, str):
+        s = item.strip()
+        if not s:
+            return {"name": "", "url": ""}
+        coerced = _coerce_dict_like_string(s)
+        if coerced is not None:
+            return {
+                "name": flatten_competitor_name_field(coerced.get("name")),
+                "url": flatten_competitor_url_field(coerced.get("url")),
+            }
+        return {"name": s, "url": ""}
+    return {"name": str(item).strip(), "url": ""}
+
+
+def competitor_entry_display_name(entry: Any) -> str:
+    """Normalize a stored competitor entry (``{name, url}`` object or legacy string) to a display name."""
+    return parse_competitor_raw_item(entry)["name"]
+
+
+def _competitor_url_dedupe_key(url: str) -> str | None:
+    """
+    Root domain used to treat duplicate competitor rows as the same business (same site).
+    Returns None when no usable domain (dedupe by name only).
+    """
+    s = (url or "").strip()
+    if not s:
+        return None
+    dom = root_domain_from_fragment(s)
+    return dom
+
+
+def _sanitize_competitors(items: Any) -> list[dict[str, str]]:
+    """
+    Coerce model output to ``[{"name": str, "url": str}, ...]``.
+
+    Drops duplicate businesses: same root URL as a prior entry, or same name (case-insensitive)
+    when URL is missing or not parseable to a domain.
+    """
+    out: list[dict[str, str]] = []
     if not isinstance(items, list):
         return out
-    seen: set[str] = set()
+    seen_domains: set[str] = set()
+    seen_name_only: set[str] = set()
+
     for item in items:
-        name = str(item).strip()
+        parsed = parse_competitor_raw_item(item)
+        name = parsed["name"]
+        url = parsed["url"]
         if len(name) < 2 or len(name) > 200:
             continue
         low = name.lower()
         if low in GENERIC_COMPETITOR_TOKENS:
             continue
-        if low in seen:
-            continue
-        seen.add(low)
-        out.append(name)
+        url = url[:2048] if url else ""
+
+        dom_key = _competitor_url_dedupe_key(url)
+        if dom_key:
+            if dom_key in seen_domains:
+                continue
+            seen_domains.add(dom_key)
+        else:
+            nk = name.casefold()
+            if nk in seen_name_only:
+                continue
+            seen_name_only.add(nk)
+
+        out.append({"name": name, "url": url})
     return out[:50]
 
 
@@ -227,15 +436,23 @@ def _sanitize_citations(items: Any) -> list[str]:
     return out[:50]
 
 
-def normalize_extraction_payload(data: Mapping[str, Any], *, raw_response: str = "") -> dict[str, Any]:
+def normalize_extraction_payload(
+    data: Mapping[str, Any],
+    *,
+    raw_response: str = "",
+    tracked_business_name: str = "",
+    tracked_website_domain: str = "",
+) -> dict[str, Any]:
     """
     Coerce model JSON into canonical shape for storage and APIs.
+
+    When ``tracked_business_name`` and ``raw_response`` are provided, ``brand_mentioned`` is
+    grounded in the raw answer text (not only the model boolean). Competitors/citations from
+    the model are kept even when brand flags are cleared.
     """
     brand = _strict_parse_bool(data.get("brand_mentioned"))
     pos = str(data.get("mention_position") or "none").lower().strip()
     if pos not in _VALID_POSITIONS:
-        pos = "none"
-    if not brand:
         pos = "none"
 
     try:
@@ -243,6 +460,53 @@ def normalize_extraction_payload(data: Mapping[str, Any], *, raw_response: str =
     except (TypeError, ValueError):
         count = 0
     count = max(0, min(1000, count))
+
+    name = (tracked_business_name or "").strip()
+    raw = (raw_response or "").strip()
+    domain = (tracked_website_domain or "").strip().lower()
+
+    if name and not raw:
+        if brand:
+            logger.warning(
+                "AEO extraction: brand_mentioned=True but no raw_response for grounding; overriding. business=%s",
+                name,
+            )
+        brand = False
+        pos = "none"
+        count = 0
+    elif name and raw:
+        grounded = _tracked_brand_grounded_in_text(
+            raw,
+            business_name=name,
+            website_domain=domain,
+        )
+        if brand and not grounded:
+            logger.warning(
+                "AEO extraction: model brand_mentioned=True but text did not ground target; overriding. "
+                "business=%s snippet=%s",
+                name,
+                raw[:200],
+            )
+        if not grounded:
+            brand = False
+            pos = "none"
+            count = 0
+        else:
+            brand = True
+            if count == 0 and pos == "none":
+                count = 1
+                pos = "middle"
+            elif count == 0:
+                count = 1
+            elif pos == "none":
+                pos = "middle"
+            count = max(1, count)
+
+    if count == 0 and pos == "none":
+        brand = False
+
+    if not brand:
+        pos = "none"
     if not brand:
         count = 0
 
@@ -250,7 +514,8 @@ def normalize_extraction_payload(data: Mapping[str, Any], *, raw_response: str =
     ranking_order = _sanitize_ranking_order(data.get("ranking_order"))
     # Keep ranking order useful for weighted scoring: include named mentions in order.
     if not ranking_order:
-        ranking_order = _dedupe_preserve_order([*competitors])
+        comp_names = [c["name"] for c in competitors if c.get("name")]
+        ranking_order = _dedupe_preserve_order(comp_names)
 
     model_citations = _sanitize_citations(data.get("citations"))
     regex_citations = _extract_domains_from_raw_answer(raw_response)
@@ -395,7 +660,6 @@ def extract_aeo_response(
             logger.warning("AEO extraction JSON parse failed; retrying once")
             raw_llm = _call_extraction_openai(user_content + AEO_STRUCTURED_EXTRACTION_RETRY_SUFFIX)
             parsed = _parse_extraction_json(raw_llm)
-            print("PROM", parsed)
     except Exception as exc:
         logger.exception("AEO extraction OpenAI call failed: %s", exc)
         parsed = None
@@ -409,7 +673,13 @@ def extract_aeo_response(
             "extraction_model": model,
         }
 
-    normalized = normalize_extraction_payload(parsed, raw_response=raw_response)
+    normalized = normalize_extraction_payload(
+        parsed,
+        raw_response=raw_response,
+        tracked_business_name=(getattr(business_profile, "business_name", None) or "").strip(),
+        tracked_website_domain=root_domain_from_fragment(getattr(business_profile, "website_url", None) or "")
+        or "",
+    )
     return {
         **normalized,
         "parse_ok": True,
@@ -428,7 +698,20 @@ def save_extraction_result(
     """
     Persist extraction output linked to the Phase 2 response row.
     """
-    norm = normalize_extraction_payload(data) if not parse_failed else _default_failed_payload()
+    profile = response_snapshot.profile
+    tracked_name = (getattr(profile, "business_name", None) or "").strip()
+    tracked_domain = root_domain_from_fragment(getattr(profile, "website_url", None) or "") or ""
+    raw = response_snapshot.raw_response or ""
+    norm = (
+        normalize_extraction_payload(
+            data,
+            raw_response=raw,
+            tracked_business_name=tracked_name,
+            tracked_website_domain=tracked_domain,
+        )
+        if not parse_failed
+        else _default_failed_payload()
+    )
     return AEOExtractionSnapshot.objects.create(
         response_snapshot=response_snapshot,
         brand_mentioned=norm["brand_mentioned"],

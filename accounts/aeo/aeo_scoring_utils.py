@@ -1,7 +1,8 @@
 """
 Phase 4: deterministic AEO metrics from extraction snapshots.
 
-Formulas are explicit (no hidden multipliers). Does not import extraction or execution modules.
+Formulas are explicit (no hidden multipliers). Imports only flatten helpers from
+``aeo_extraction_utils`` for competitor JSON shapes.
 """
 
 from __future__ import annotations
@@ -12,6 +13,16 @@ from typing import Any, Protocol, Sequence
 from django.db.models import Prefetch
 
 from ..models import AEOExtractionSnapshot, AEOScoreSnapshot, AEOResponseSnapshot, BusinessProfile
+from .aeo_extraction_utils import parse_competitor_raw_item
+
+
+def _competitor_entry_name(raw: Any) -> str:
+    """Display name from a stored competitor (dict, JSON/repr string, or legacy string)."""
+    return parse_competitor_raw_item(raw)["name"]
+
+
+def _competitor_entry_url(raw: Any) -> str:
+    return parse_competitor_raw_item(raw)["url"][:2048]
 
 
 class _ExtractionLike(Protocol):
@@ -68,7 +79,7 @@ def calculate_citation_share(extractions: Sequence[_ExtractionLike]) -> float:
     Target share of modeled \"named business\" mention units across extractions.
 
     Numerator: sum of mention_count (target brand mentions from extraction).
-    Denominator: that sum plus one unit per competitor string listed per extraction.
+    Denominator: that sum plus one unit per competitor entry listed per extraction.
 
     Formula: (target mention units) / (target + competitor mention units) × 100
 
@@ -105,7 +116,7 @@ def calculate_competitor_dominance(extractions: Sequence[_ExtractionLike]) -> di
         if not isinstance(comps, list):
             continue
         for raw in comps:
-            name = str(raw).strip()
+            name = _competitor_entry_name(raw)
             if not name:
                 continue
             key = name.casefold()
@@ -119,6 +130,118 @@ def calculate_competitor_dominance(extractions: Sequence[_ExtractionLike]) -> di
         "ranked": ranked,
         "total_competitor_mentions": int(sum(counter.values())),
     }
+
+
+_COMP_SOV_COLORS = ("#1d1d1f", "#636366", "#9CA3AF")
+
+
+def aggregate_aeo_share_of_voice_from_extractions(
+    extractions: Sequence[_ExtractionLike],
+    *,
+    business_display_name: str,
+    business_website_url: str = "",
+) -> dict[str, Any]:
+    """
+    Share of named-mention units across latest extractions (one per prompt).
+
+    Denominator matches ``calculate_citation_share``: your_units = sum(mention_count);
+    competitor units = one per entry in each extraction's ``competitors_json`` list.
+
+    Returns UI rows: you, top 3 competitors by mention count, then Others (remaining
+    competitor mentions). Percentages sum to ~100 when total_units > 0.
+    """
+    n = len(extractions)
+    your_units = 0
+    for e in extractions:
+        try:
+            your_units += max(0, int(e.mention_count))
+        except (TypeError, ValueError):
+            pass
+
+    counter: Counter[str] = Counter()
+    display: dict[str, str] = {}
+    url_by_name_key: dict[str, str] = {}
+    for e in extractions:
+        comps = getattr(e, "competitors_json", None) or []
+        if not isinstance(comps, list):
+            continue
+        for raw in comps:
+            name = _competitor_entry_name(raw)
+            if not name:
+                continue
+            key = name.casefold()
+            counter[key] += 1
+            display.setdefault(key, name)
+            u = _competitor_entry_url(raw)
+            if u and key not in url_by_name_key:
+                url_by_name_key[key] = u
+
+    competitor_total = int(sum(counter.values()))
+    total_units = your_units + competitor_total
+    top3 = counter.most_common(3)
+    top3_keys = {k for k, _ in top3}
+    others_units = sum(cnt for k, cnt in counter.items() if k not in top3_keys)
+
+    def pct(units: int) -> float:
+        if total_units <= 0:
+            return 0.0
+        return round(100.0 * float(units) / float(total_units), 1)
+
+    label_you = (business_display_name or "").strip() or "Your business"
+    you_url = (business_website_url or "").strip()[:2048]
+
+    rows: list[dict[str, Any]] = [
+        {
+            "name": label_you,
+            "url": you_url,
+            "pct": pct(your_units),
+            "units": your_units,
+            "you": True,
+            "color": "#000000",
+        }
+    ]
+    for i, (key, cnt) in enumerate(top3):
+        rows.append(
+            {
+                "name": display[key],
+                "url": url_by_name_key.get(key, ""),
+                "pct": pct(cnt),
+                "units": int(cnt),
+                "you": False,
+                "color": _COMP_SOV_COLORS[i],
+            }
+        )
+    if others_units > 0:
+        rows.append(
+            {
+                "name": "Others",
+                "url": "",
+                "pct": pct(others_units),
+                "units": others_units,
+                "you": False,
+                "color": "#E5E7EB",
+            }
+        )
+
+    return {
+        "total_prompts": n,
+        "total_mention_units": total_units,
+        "your_mention_units": your_units,
+        "competitor_mention_units": competitor_total,
+        "has_data": total_units > 0,
+        "rows": rows,
+    }
+
+
+def aggregate_aeo_share_of_voice(business_profile: BusinessProfile) -> dict[str, Any]:
+    extractions = latest_extraction_per_response(business_profile)
+    name = (getattr(business_profile, "business_name", None) or "").strip() or "Your business"
+    site = (getattr(business_profile, "website_url", None) or "").strip()
+    return aggregate_aeo_share_of_voice_from_extractions(
+        extractions,
+        business_display_name=name,
+        business_website_url=site,
+    )
 
 
 def latest_extraction_per_response(

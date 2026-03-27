@@ -99,13 +99,16 @@ AEO_EXTRACTION_PREP_SYSTEM_PROMPT: Final[str] = (
 AEO_STRUCTURED_EXTRACTION_SYSTEM_PROMPT: Final[str] = (
     "You are an extraction engine. Read the answer carefully and return only structured JSON. "
     "Do not explain. Do not use markdown code fences. Do not add keys beyond those requested. "
-    "Do not infer beyond what the text reasonably supports."
-    "Treat close brand variants as the same business when clearly referring to the same entity. "
-    "If the target brand is not clearly referenced, set brand_mentioned to false. "
+    "Do not infer beyond what the text reasonably supports. "
+    "Set brand_mentioned to true only when the target business name (or an accepted variant clearly referring to the same entity) "
+    "appears verbatim or clearly as the same entity in the raw assistant answer. "
+    "Naming other businesses, competitors, or generic phrases (for example \"dental offices\" or \"local dentists\") does not count as mentioning the target brand. "
+    "Treat close brand variants as the same business only when clearly referring to the tracked entity. "
+    "If the target brand is not clearly referenced in the answer text, set brand_mentioned to false. "
     "Competitors must be clearly named businesses only. "
     "Exclude generic categories, directories, specialties, and descriptive phrases. "
     "ranking_order must contain only explicitly named businesses in exact first-mention order. "
-    "Include the tracked business if it appears. "
+    "Include the tracked business in ranking_order only if it appears in the answer. "
     "Citations must be root domains only when URLs or domains appear."
 )
 
@@ -115,12 +118,16 @@ AEO_STRUCTURED_EXTRACTION_USER_TEMPLATE: Final[str] = (
     "Optional competitor hints:\n{competitor_hints}\n\n"
     "Original prompt:\n{prompt_text}\n\n"
     "Raw assistant answer:\n---\n{raw_response}\n---\n\n"
+    "Rules for brand_mentioned: set it to true only if the target business name given above "
+    "(or a clear variant of that specific business) appears in the raw assistant answer. "
+    "Listing or naming other businesses, competitors, or generic category language does not count. "
+    "Do not include duplicate competitors if the urls are the same.\n"
     "Return ONLY one JSON object with exactly these keys:\n"
     '- "brand_mentioned": boolean\n'
     '- "mention_position": one of "top", "middle", "bottom", "none"\n'
     '- "mention_count": integer\n'
     '- "mention_strength": one of "primary", "secondary", "incidental", "none"\n'
-    '- "competitors": array of strings\n'
+    '- "competitors": array of objects, each with "name" and "url" fields\n'
     '- "ranking_order": array of strings\n'
     '- "citations": array of strings\n'
     '- "sentiment": one of "positive", "neutral", "negative"\n'
@@ -136,7 +143,7 @@ AEO_STRUCTURED_EXTRACTION_RETRY_SUFFIX: Final[str] = (
 # --- Execution prompt --------------------------------------------------------
 
 AEO_EXECUTION_SYSTEM_PROMPT: Final[str] = (
-    "Answer only with a list of the company names"
+    "Answer only with a list of the company names and their business website url."
     "Do not invent fake businesses."
     "Avoid filler, disclaimers, hedging, and generic advice."
 )

@@ -1792,6 +1792,36 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
 @api_view(["GET"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
+def aeo_share_of_voice_data(request: HttpRequest) -> Response:
+    """
+    Aggregated AI share-of-voice from latest AEO extraction per response snapshot:
+    your mention units vs competitor name mentions (top 3 names + Others).
+    """
+    from .aeo.aeo_scoring_utils import aggregate_aeo_share_of_voice
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response(
+            {
+                "total_prompts": 0,
+                "total_mention_units": 0,
+                "your_mention_units": 0,
+                "competitor_mention_units": 0,
+                "has_data": False,
+                "rows": [],
+            }
+        )
+    payload = aggregate_aeo_share_of_voice(profile)
+    return Response(payload)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
 def aeo_pipeline_status_data(request: HttpRequest) -> Response:
     """
     Cached-only AEO pipeline status endpoint.
