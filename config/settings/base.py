@@ -365,6 +365,10 @@ AEO_TESTING_MODE = env.bool("AEO_TESTING_MODE", default=False)
 AEO_TEST_PROMPT_COUNT = env.int("AEO_TEST_PROMPT_COUNT", default=10)
 AEO_PROD_PROMPT_COUNT = env.int("AEO_PROD_PROMPT_COUNT", default=50)
 AEO_ENABLE_RECOMMENDATION_STAGE = env.bool("AEO_ENABLE_RECOMMENDATION_STAGE", default=False)
+# Google Gemini — optional Phase 2 AEO execution alongside OpenAI (see accounts.gemini_utils).
+# Also accepted: GOOGLE_GEMINI_API_KEY if this is empty (read in gemini_utils).
+GEMINI_API_KEY = env("GEMINI_API_KEY", default="").strip()
+AEO_GEMINI_EXECUTION_MODEL = env("AEO_GEMINI_EXECUTION_MODEL", default="gemini-2.5-flash")
 # Meta (Facebook) – Ads app: OAuth login + Marketing API (connect button and ad campaigns)
 META_ADS_APP_ID = os.environ.get("META_ADS_APP_ID", "")
 META_ADS_APP_SECRET = os.environ.get("META_ADS_APP_SECRET", "")

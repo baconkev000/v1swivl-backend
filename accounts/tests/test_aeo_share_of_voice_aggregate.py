@@ -5,6 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from accounts.aeo.aeo_scoring_utils import aggregate_aeo_share_of_voice_from_extractions
+from django.contrib.auth import get_user_model
+
+from accounts.aeo.aeo_scoring_utils import aggregate_aeo_share_of_voice
+from accounts.models import AEOExtractionSnapshot, AEOResponseSnapshot, BusinessProfile
 
 
 def _ex(mention_count: int, competitors: list[str]) -> SimpleNamespace:
@@ -60,3 +64,52 @@ def test_share_of_voice_empty_extractions():
     assert out["total_prompts"] == 0
     assert out["has_data"] is False
     assert out["rows"][0]["pct"] == 0.0
+
+
+@pytest.mark.django_db
+def test_share_of_voice_aggregates_openai_and_gemini_rows():
+    user = get_user_model().objects.create_user(username="sovmix", email="sovmix@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Mix Co")
+
+    r_openai = AEOResponseSnapshot.objects.create(
+        profile=profile,
+        prompt_text="q1",
+        prompt_hash="h1",
+        raw_response="openai row",
+        platform="openai",
+    )
+    r_gemini = AEOResponseSnapshot.objects.create(
+        profile=profile,
+        prompt_text="q2",
+        prompt_hash="h2",
+        raw_response="gemini row",
+        platform="gemini",
+    )
+    AEOExtractionSnapshot.objects.create(
+        response_snapshot=r_openai,
+        brand_mentioned=True,
+        mention_position="top",
+        mention_count=2,
+        competitors_json=["Alpha"],
+        citations_json=[],
+        sentiment="neutral",
+        extraction_model="m",
+        extraction_parse_failed=False,
+    )
+    AEOExtractionSnapshot.objects.create(
+        response_snapshot=r_gemini,
+        brand_mentioned=True,
+        mention_position="middle",
+        mention_count=1,
+        competitors_json=["Beta"],
+        citations_json=[],
+        sentiment="neutral",
+        extraction_model="m",
+        extraction_parse_failed=False,
+    )
+
+    out = aggregate_aeo_share_of_voice(profile)
+    # Total mention units should include both providers: your 3 + competitors 2.
+    assert out["your_mention_units"] == 3
+    assert out["competitor_mention_units"] == 2
+    assert out["total_mention_units"] == 5

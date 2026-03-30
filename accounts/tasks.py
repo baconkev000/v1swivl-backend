@@ -462,9 +462,18 @@ def generate_keyword_action_suggestions_task(self, snapshot_id: int) -> None:
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
-def run_aeo_phase1_execution_task(self, run_id: int, prompt_set: list[dict] | None = None) -> None:
+def run_aeo_phase1_execution_task(
+    self,
+    run_id: int,
+    prompt_set: list[dict] | None = None,
+    providers: list[str] | None = None,
+    force_refresh: bool = False,
+) -> None:
     """
     Execute Phase 1 AEO prompt batch asynchronously with 30-day cache policy.
+
+    ``providers`` — optional ``['openai']`` or ``['gemini']`` for single-provider dashboard refresh.
+    ``force_refresh`` — when True, skip the 30-day execution cache (explicit user refresh).
     """
     from .models import AEOExecutionRun
     from .aeo.aeo_execution_utils import run_aeo_prompt_batch
@@ -482,6 +491,8 @@ def run_aeo_phase1_execution_task(self, run_id: int, prompt_set: list[dict] | No
         return
 
     profile = run.profile
+    provider_set = {str(p).strip().lower() for p in (providers or []) if str(p).strip()}
+    extraction_platform: str | None = "gemini" if provider_set == {"gemini"} else None
 
     duplicate_inflight = AEOExecutionRun.objects.filter(
         profile=profile,
@@ -519,18 +530,25 @@ def run_aeo_phase1_execution_task(self, run_id: int, prompt_set: list[dict] | No
     run.started_at = django_tz.now()
     run.save(update_fields=["status", "started_at", "updated_at"])
 
-    latest_success = (
-        AEOExecutionRun.objects.filter(
-            profile=profile,
-            status=AEOExecutionRun.STATUS_COMPLETED,
-            fetch_mode=AEOExecutionRun.FETCH_MODE_FRESH_FETCH,
-            finished_at__isnull=False,
+    latest_success = None
+    if not force_refresh:
+        latest_success = (
+            AEOExecutionRun.objects.filter(
+                profile=profile,
+                status=AEOExecutionRun.STATUS_COMPLETED,
+                fetch_mode=AEOExecutionRun.FETCH_MODE_FRESH_FETCH,
+                finished_at__isnull=False,
+            )
+            .exclude(pk=run.pk)
+            .order_by("-finished_at")
+            .first()
         )
-        .exclude(pk=run.pk)
-        .order_by("-finished_at")
-        .first()
-    )
-    if latest_success and latest_success.finished_at and (django_tz.now() - latest_success.finished_at) <= timedelta(days=30):
+    if (
+        not force_refresh
+        and latest_success
+        and latest_success.finished_at
+        and (django_tz.now() - latest_success.finished_at) <= timedelta(days=30)
+    ):
         run.status = AEOExecutionRun.STATUS_SKIPPED_CACHED
         run.cache_hit = True
         run.fetch_mode = AEOExecutionRun.FETCH_MODE_CACHE_HIT
@@ -574,6 +592,8 @@ def run_aeo_phase1_execution_task(self, run_id: int, prompt_set: list[dict] | No
             selected,
             profile,
             save=True,
+            execution_run=run,
+            providers=providers,
         )
         response_snapshot_ids = [
             int(one.get("snapshot_id"))
@@ -602,7 +622,15 @@ def run_aeo_phase1_execution_task(self, run_id: int, prompt_set: list[dict] | No
             run.prompt_count_executed,
             run.prompt_count_failed,
         )
-        run_aeo_phase3_extraction_task.delay(run.id, response_snapshot_ids)
+        logger.info(
+            "[AEO phase1] provider_scope run_id=%s profile_id=%s provider=%s created_ids=%s count=%s",
+            run.id,
+            profile.id,
+            extraction_platform or "any",
+            response_snapshot_ids,
+            len(response_snapshot_ids),
+        )
+        run_aeo_phase3_extraction_task.delay(run.id, response_snapshot_ids, extraction_platform)
     except Exception as e:
         run.status = AEOExecutionRun.STATUS_FAILED
         run.error_message = f"{type(e).__name__}: {e}"
@@ -619,10 +647,63 @@ def run_aeo_phase1_execution_task(self, run_id: int, prompt_set: list[dict] | No
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def run_aeo_gemini_refresh_task(
+    self,
+    run_id: int,
+    prompt_set: list[dict] | None = None,
+) -> None:
+    """
+    Explicit Gemini-only refresh path (dashboard button).
+
+    Prompt source defaults to BusinessProfile.selected_aeo_prompts on the run profile.
+    This task always forces refresh and never executes OpenAI provider calls.
+    """
+    from .aeo.aeo_utils import plan_items_from_saved_prompt_strings
+    from .models import AEOExecutionRun
+
+    run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
+    if not run:
+        logger.warning("[AEO gemini refresh] run not found run_id=%s", run_id)
+        return
+
+    profile = run.profile
+    selected = list(prompt_set or [])
+    if not selected:
+        saved = profile.selected_aeo_prompts or []
+        selected = plan_items_from_saved_prompt_strings([str(x) for x in saved if str(x).strip()])
+
+    if not selected:
+        run.status = AEOExecutionRun.STATUS_FAILED
+        run.error_message = "gemini_refresh_no_selected_prompts"
+        run.finished_at = django_tz.now()
+        run.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        logger.warning(
+            "[AEO gemini refresh] provider=gemini run_id=%s profile_id=%s status=failed reason=no_prompts",
+            run.id,
+            profile.id,
+        )
+        return
+
+    logger.info(
+        "[AEO gemini refresh] provider=gemini run_id=%s profile_id=%s prompts=%s status=queued_phase1",
+        run.id,
+        profile.id,
+        len(selected),
+    )
+    run_aeo_phase1_execution_task(
+        run.id,
+        prompt_set=selected,
+        providers=["gemini"],
+        force_refresh=True,
+    )
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def run_aeo_phase3_extraction_task(
     self,
     run_id: int,
     response_snapshot_ids: list[int] | None = None,
+    response_platform: str | None = None,
 ) -> None:
     from .models import AEOExecutionRun, AEOResponseSnapshot
     from .aeo.aeo_extraction_utils import run_single_extraction
@@ -640,9 +721,20 @@ def run_aeo_phase3_extraction_task(
     logger.info("[AEO phase3] extraction start run_id=%s profile_id=%s", run.id, run.profile_id)
 
     qs = AEOResponseSnapshot.objects.filter(profile=run.profile)
-    if response_snapshot_ids:
+    # Critical scoping: if caller provided IDs (even empty), never broaden to profile-wide query.
+    if response_snapshot_ids is not None:
         qs = qs.filter(id__in=response_snapshot_ids)
+    if response_platform:
+        qs = qs.filter(platform=response_platform)
     responses = list(qs.order_by("id"))
+    logger.info(
+        "[AEO phase3] scoped extraction run_id=%s profile_id=%s provider=%s response_ids=%s selected=%s parser_provider=openai",
+        run.id,
+        run.profile_id,
+        response_platform or "any",
+        response_snapshot_ids if response_snapshot_ids is not None else "all_profile",
+        len(responses),
+    )
     created_count = 0
     failed_count = 0
     try:

@@ -55,6 +55,7 @@ from .aeo.aeo_utils import (
     build_full_aeo_prompt_plan,
     plan_items_from_saved_prompt_strings,
 )
+from .gemini_utils import gemini_execution_enabled
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -1950,6 +1951,180 @@ def refresh_aeo_snapshot(request: HttpRequest) -> Response:
         getattr(profile, "id", None),
     )
     return Response(serializer.data)
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_refresh_execution(request: HttpRequest) -> Response:
+    """
+    Re-run Phase 2 (LLM answers) and downstream extraction/scoring for prompts already saved on the profile.
+
+    JSON body: ``{"platform": "openai" | "gemini"}`` — refresh ChatGPT (OpenAI) or Gemini only.
+    Does not regenerate the prompt list (onboarding / OpenAI prompt planning unchanged).
+    """
+    from .models import AEOExecutionRun
+    from .tasks import _aeo_target_prompt_count, run_aeo_phase1_execution_task
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"detail": "No main business profile is configured."}, status=400)
+
+    body = request.data if isinstance(request.data, dict) else {}
+    platform = str(body.get("platform") or "").strip().lower()
+    if platform not in ("openai", "gemini"):
+        return Response(
+            {"detail": 'Invalid or missing "platform"; expected "openai" or "gemini".'},
+            status=400,
+        )
+
+    if platform == "gemini" and not gemini_execution_enabled():
+        return Response(
+            {"detail": "Gemini is not configured (set GEMINI_API_KEY)."},
+            status=400,
+        )
+
+    saved = profile.selected_aeo_prompts or []
+    if not isinstance(saved, list) or not any(str(x).strip() for x in saved):
+        return Response(
+            {"detail": "No saved AEO prompts to refresh. Complete onboarding first."},
+            status=400,
+        )
+
+    raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved])
+    if not raw_items:
+        return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
+
+    target = _aeo_target_prompt_count()
+    selected = raw_items[:target]
+
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exists()
+    if inflight:
+        return Response(
+            {"detail": "An AEO run is already in progress. Try again when it finishes."},
+            status=409,
+        )
+
+    providers = ["openai"] if platform == "openai" else ["gemini"]
+
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        prompt_count_requested=len(selected),
+        status=AEOExecutionRun.STATUS_PENDING,
+    )
+    transaction.on_commit(
+        lambda rid=run.id, payload=selected, prov=providers: run_aeo_phase1_execution_task.delay(
+            rid,
+            payload,
+            providers=prov,
+            force_refresh=True,
+        )
+    )
+
+    logger.info(
+        "[AEO refresh_execution] user_id=%s profile_id=%s platform=%s run_id=%s prompts=%s",
+        getattr(request.user, "id", None),
+        profile.id,
+        platform,
+        run.id,
+        len(selected),
+    )
+
+    return Response(
+        {
+            "run_id": run.id,
+            "platform": platform,
+            "prompt_count": len(selected),
+            "status": "pending",
+        },
+        status=202,
+    )
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def refresh_aeo_gemini(request: HttpRequest) -> Response:
+    """
+    Dedicated Gemini-only AEO refresh endpoint.
+
+    Reuses prompt strings stored in BusinessProfile.selected_aeo_prompts and enqueues
+    the Gemini-only execution/extraction path.
+    """
+    from .models import AEOExecutionRun
+    from .tasks import run_aeo_gemini_refresh_task
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"detail": "No main business profile is configured."}, status=400)
+
+    if not gemini_execution_enabled():
+        return Response({"detail": "Gemini is not configured (set GEMINI_API_KEY)."}, status=400)
+
+    saved = profile.selected_aeo_prompts or []
+    if not isinstance(saved, list):
+        saved = []
+    saved_nonempty = [str(x).strip() for x in saved if str(x).strip()]
+    if not saved_nonempty:
+        return Response(
+            {"detail": "No saved AEO prompts to refresh. Complete onboarding first."},
+            status=400,
+        )
+
+    target = _aeo_prompt_target_count()
+    selected = plan_items_from_saved_prompt_strings(saved_nonempty)[:target]
+    if not selected:
+        return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
+
+    marker = "refresh_provider=gemini"
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+        error_message__icontains=marker,
+    ).exists()
+    if inflight:
+        return Response(
+            {"detail": "A Gemini refresh is already in progress for this profile."},
+            status=409,
+        )
+
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        prompt_count_requested=len(selected),
+        status=AEOExecutionRun.STATUS_PENDING,
+        error_message=marker,
+    )
+    transaction.on_commit(
+        lambda rid=run.id, payload=selected: run_aeo_gemini_refresh_task.delay(rid, payload)
+    )
+
+    logger.info(
+        "[AEO refresh_gemini] provider=gemini run_id=%s profile_id=%s prompts=%s status=pending",
+        run.id,
+        profile.id,
+        len(selected),
+    )
+    return Response(
+        {
+            "run_id": run.id,
+            "status": "pending",
+            "provider": "gemini",
+            "prompt_count_requested": len(selected),
+            "message": "Gemini refresh queued.",
+        },
+        status=202,
+    )
 
 
 def _serialize_aeo_prompt_items(items: list | None) -> list[dict]:

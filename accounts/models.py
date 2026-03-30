@@ -324,13 +324,28 @@ class AEOResponseSnapshot(models.Model):
     """
     Raw OpenAI (or other platform) answer for a single AEO visibility prompt.
 
-    One row per prompt execution; prompt_hash enables reruns and trend comparison.
+    One row per prompt × provider execution; prompt_hash enables reruns and trend comparison.
+    Rows from the same dual-provider call share execution_pair_id and execution_run.
     """
 
     profile = models.ForeignKey(
         BusinessProfile,
         on_delete=models.CASCADE,
         related_name="aeo_response_snapshots",
+    )
+    execution_run = models.ForeignKey(
+        "AEOExecutionRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="response_snapshots",
+        help_text="Pipeline run that produced this row (if any).",
+    )
+    execution_pair_id = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Shared by OpenAI + Gemini snapshots from the same logical prompt execution.",
     )
     prompt_text = models.TextField()
     prompt_type = models.CharField(max_length=32, blank=True, default="")
@@ -350,6 +365,13 @@ class AEOResponseSnapshot(models.Model):
             models.Index(
                 fields=["profile", "prompt_hash", "created_at"],
                 name="accounts_aeo_rsp_ph_cr",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["execution_run", "prompt_hash", "platform"],
+                condition=models.Q(execution_run__isnull=False),
+                name="accounts_aeo_rsp_run_hash_platform_uq",
             ),
         ]
 

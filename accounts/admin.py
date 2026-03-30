@@ -107,6 +107,8 @@ class AEOResponseSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "profile",
+        "execution_run",
+        "execution_pair_id",
         "prompt_hash",
         "prompt_type",
         "model_name",
@@ -114,8 +116,8 @@ class AEOResponseSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "created_at",
     )
     list_filter = ("platform", "prompt_type", "is_dynamic")
-    search_fields = ("prompt_hash", "prompt_text", "profile__business_name")
-    raw_id_fields = ("profile",)
+    search_fields = ("prompt_hash", "prompt_text", "profile__business_name", "execution_pair_id")
+    raw_id_fields = ("profile", "execution_run")
 
 
 @admin.register(AEOExecutionRun)

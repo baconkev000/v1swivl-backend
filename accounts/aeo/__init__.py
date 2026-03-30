@@ -27,9 +27,9 @@ Example (inside a view or service):
     # more = run_prompt_batch_via_openai(ctx, seed_prompts=prompts)
     # prompts = combine_prompt_set(prompts, more)
 
-    # Phase 2 — execute and store raw answers (one OpenAI call per prompt):
+    # Phase 2 — execute and store raw answers (OpenAI; Gemini in parallel when GEMINI_API_KEY is set):
     # from accounts.aeo import run_aeo_prompt_batch
-    # run_aeo_prompt_batch(prompts, profile, save=True)
+    # run_aeo_prompt_batch(prompts, profile, save=True, execution_run=run)
 
     # Phase 3 — structured extraction from stored raw rows:
     # from accounts.aeo import run_single_extraction

@@ -1,8 +1,12 @@
 """
-AEO prompt execution: one OpenAI call per prompt, raw response capture, DB storage.
+AEO prompt execution: OpenAI per prompt, optional parallel Google Gemini, raw response capture.
 
 Uses existing OpenAI client resolution from accounts.openai_utils.
-Execution *system* prompt text lives in aeo_prompts.py (AEO_EXECUTION_SYSTEM_PROMPT).
+Execution *system* prompt text lives in aeo_prompts.py (AEO_EXECUTION_SYSTEM_PROMPT);
+Gemini mirrors the same instruction via accounts.aeo.gemini_prompts.
+
+When ``GEMINI_API_KEY`` is set, each prompt runs OpenAI and Gemini concurrently (ThreadPoolExecutor);
+partial provider failure still persists the other provider's row.
 
 Optional Django settings (defaults are conservative for repeatable runs):
     AEO_EXECUTION_MODEL — override model id (else settings.OPENAI_MODEL / gpt-4o-mini)
@@ -19,19 +23,24 @@ import logging
 import re
 import time
 import unicodedata
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
+from uuid import UUID
 
 from django.conf import settings
 
-from ..models import AEOResponseSnapshot, BusinessProfile
+from ..models import AEOExecutionRun, AEOResponseSnapshot, BusinessProfile
 from ..openai_utils import _get_client, _get_model
 from .aeo_prompts import AEO_EXECUTION_SYSTEM_PROMPT
 from .aeo_utils import normalize_aeo_prompt_dict
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PLATFORM = "openai"
+PLATFORM_OPENAI = "openai"
+PLATFORM_GEMINI = "gemini"
+DEFAULT_PLATFORM = PLATFORM_OPENAI
 DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
 
 
@@ -127,6 +136,8 @@ def save_aeo_response(
     model_name: str,
     platform: str = DEFAULT_PLATFORM,
     prompt_hash: str | None = None,
+    execution_run: AEOExecutionRun | None = None,
+    execution_pair_id: UUID | None = None,
 ) -> AEOResponseSnapshot:
     """
     Persist one execution row. Computes prompt_hash when omitted.
@@ -134,6 +145,8 @@ def save_aeo_response(
     ph = prompt_hash or hash_prompt(prompt_text)
     return AEOResponseSnapshot.objects.create(
         profile=business_profile,
+        execution_run=execution_run,
+        execution_pair_id=execution_pair_id,
         prompt_text=prompt_text,
         prompt_type=(prompt_type or "")[:32],
         weight=float(weight),
@@ -153,6 +166,8 @@ def run_single_aeo_prompt(
     save: bool = True,
     platform: str = DEFAULT_PLATFORM,
     api_key_env: str = DEFAULT_API_KEY_ENV,
+    execution_run: AEOExecutionRun | None = None,
+    execution_pair_id: UUID | None = None,
 ) -> dict[str, Any]:
     """
     Execute one AEO prompt via OpenAI; optionally save AEOResponseSnapshot.
@@ -234,6 +249,8 @@ def run_single_aeo_prompt(
             model_name=model,
             platform=platform,
             prompt_hash=ph,
+            execution_run=execution_run,
+            execution_pair_id=execution_pair_id,
         )
         snapshot_id = snap.id
 
@@ -284,6 +301,27 @@ def _result_dict(
     }
 
 
+def _normalize_providers_arg(
+    providers: Sequence[str] | None,
+) -> tuple[str | None, str | None]:
+    """
+    Returns (openai_mode, gemini_mode) where each is 'only' | 'include' | None (omit).
+
+    None / empty providers → dual-provider when Gemini key exists (auto).
+    ('openai',) → OpenAI only; ('gemini',) → Gemini only.
+    """
+    if not providers:
+        return (None, None)
+    low = [str(p).strip().lower() for p in providers if str(p).strip()]
+    if set(low) == {"openai"}:
+        return ("only", None)
+    if set(low) == {"gemini"}:
+        return (None, "only")
+    if set(low) >= {"openai", "gemini"}:
+        return (None, None)
+    return (None, None)
+
+
 def run_aeo_prompt_batch(
     prompt_set: Sequence[Mapping[str, Any]],
     business_profile: BusinessProfile,
@@ -291,41 +329,124 @@ def run_aeo_prompt_batch(
     save: bool = True,
     platform: str = DEFAULT_PLATFORM,
     api_key_env: str = DEFAULT_API_KEY_ENV,
+    execution_run: AEOExecutionRun | None = None,
+    providers: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """
-    Run each prompt independently (Celery-friendly). Failures do not stop the batch.
+    Run each prompt (OpenAI; plus Gemini in parallel when an API key is configured).
 
-    Returns aggregate stats plus per-prompt result dicts.
+    ``providers`` — optional filter: ``['openai']`` or ``['gemini']`` runs that provider only
+    (for dashboard refreshes). When omitted, uses dual execution if ``GEMINI_API_KEY`` is set.
+
+    ``executed`` counts successful provider saves; ``failed`` counts provider attempts that
+    errored (excluding Gemini skipped when no key). Celery-friendly; one provider failing
+    does not block the other.
+
+    Returns aggregate stats plus per-provider result dicts (two per prompt when dual-provider).
     """
-    exec_client = _execution_openai_client(api_key_env)
-    try:
-        results: list[dict[str, Any]] = []
-        ok = 0
-        failed = 0
-        for prompt_obj in prompt_set:
+    from ..gemini_utils import gemini_execution_enabled
+    from .gemini_execution_utils import run_single_aeo_prompt_gemini
+
+    openai_p, gemini_p = _normalize_providers_arg(providers)
+    openai_only = openai_p == "only"
+    gemini_only = gemini_p == "only"
+
+    results: list[dict[str, Any]] = []
+    ok = 0
+    failed = 0
+    dual = gemini_execution_enabled() and not openai_only and not gemini_only
+    exec_client: Any | None = None
+    if not dual and not gemini_only:
+        exec_client = _execution_openai_client(api_key_env)
+
+    for prompt_obj in prompt_set:
+        pair_id = uuid.uuid4() if execution_run else None
+
+        if gemini_only:
+            one = run_single_aeo_prompt_gemini(
+                prompt_obj,
+                business_profile,
+                save=save,
+                execution_run=execution_run,
+                execution_pair_id=pair_id,
+            )
+            results.append(one)
+            if one["success"]:
+                ok += 1
+            else:
+                err = (one.get("error") or "").strip()
+                if err != "skipped_no_api_key":
+                    failed += 1
+            continue
+
+        if dual:
+
+            def openai_job(
+                po: Mapping[str, Any] = prompt_obj,
+                pid: UUID | None = pair_id,
+            ) -> dict[str, Any]:
+                return run_single_aeo_prompt(
+                    po,
+                    business_profile,
+                    client=None,
+                    save=save,
+                    platform=PLATFORM_OPENAI,
+                    api_key_env=api_key_env,
+                    execution_run=execution_run,
+                    execution_pair_id=pid,
+                )
+
+            def gemini_job(
+                po: Mapping[str, Any] = prompt_obj,
+                pid: UUID | None = pair_id,
+            ) -> dict[str, Any]:
+                return run_single_aeo_prompt_gemini(
+                    po,
+                    business_profile,
+                    save=save,
+                    execution_run=execution_run,
+                    execution_pair_id=pid,
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_o = pool.submit(openai_job)
+                fut_g = pool.submit(gemini_job)
+                ordered = (fut_o.result(), fut_g.result())
+            for one in ordered:
+                results.append(one)
+                if one["success"]:
+                    ok += 1
+                else:
+                    err = (one.get("error") or "").strip()
+                    if err != "skipped_no_api_key":
+                        failed += 1
+        else:
             one = run_single_aeo_prompt(
                 prompt_obj,
                 business_profile,
                 client=exec_client,
                 save=save,
-                platform=platform,
+                platform=PLATFORM_OPENAI if openai_only else platform,
                 api_key_env=api_key_env,
+                execution_run=execution_run,
+                execution_pair_id=pair_id,
             )
             results.append(one)
             if one["success"]:
                 ok += 1
             else:
                 failed += 1
-        return {
-            "profile_id": business_profile.id,
-            "executed": ok,
-            "failed": failed,
-            "total": len(results),
-            "results": results,
-        }
-    finally:
-        if hasattr(exec_client, "close"):
-            try:
-                exec_client.close()
-            except Exception:
-                pass
+
+    if exec_client is not None and hasattr(exec_client, "close"):
+        try:
+            exec_client.close()
+        except Exception:
+            pass
+
+    return {
+        "profile_id": business_profile.id,
+        "executed": ok,
+        "failed": failed,
+        "total": len(results),
+        "results": results,
+    }

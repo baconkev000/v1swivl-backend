@@ -59,6 +59,12 @@ urlpatterns += [
     path("api/aeo/share-of-voice/", accounts_views.aeo_share_of_voice_data, name="aeo-share-of-voice-data"),
     path("api/aeo/pipeline-status/", accounts_views.aeo_pipeline_status_data, name="aeo-pipeline-status-data"),
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
+    path("api/aeo/refresh-gemini/", accounts_views.refresh_aeo_gemini, name="refresh-aeo-gemini"),
+    path(
+        "api/aeo/refresh-execution/",
+        accounts_views.aeo_refresh_execution,
+        name="aeo-refresh-execution",
+    ),
     path(
         "api/aeo/onboarding-prompt-plan/",
         accounts_views.aeo_onboarding_prompt_plan,

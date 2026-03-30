@@ -3,6 +3,11 @@ Phase 4: deterministic AEO metrics from extraction snapshots.
 
 Formulas are explicit (no hidden multipliers). Imports only flatten helpers from
 ``aeo_extraction_utils`` for competitor JSON shapes.
+
+Dual-provider Phase 2 (OpenAI + Gemini) creates two ``AEOResponseSnapshot`` rows per prompt.
+Headline scores and share-of-voice use **OpenAI responses only** (``platform="openai"``) so prompts
+are not double-counted. Use ``latest_extraction_per_response(..., response_platform=None)`` to include
+every platform (e.g. custom reporting).
 """
 
 from __future__ import annotations
@@ -14,6 +19,8 @@ from django.db.models import Prefetch
 
 from ..models import AEOExtractionSnapshot, AEOScoreSnapshot, AEOResponseSnapshot, BusinessProfile
 from .aeo_extraction_utils import parse_competitor_raw_item
+
+PRIMARY_AEO_SCORING_PLATFORM = "openai"
 
 
 def _competitor_entry_name(raw: Any) -> str:
@@ -234,7 +241,9 @@ def aggregate_aeo_share_of_voice_from_extractions(
 
 
 def aggregate_aeo_share_of_voice(business_profile: BusinessProfile) -> dict[str, Any]:
-    extractions = latest_extraction_per_response(business_profile)
+    # Share-of-voice should reflect all monitored providers (OpenAI + Gemini).
+    # Phase-4 headline scoring remains OpenAI-primary via default platform filtering elsewhere.
+    extractions = latest_extraction_per_response(business_profile, response_platform=None)
     name = (getattr(business_profile, "business_name", None) or "").strip() or "Your business"
     site = (getattr(business_profile, "website_url", None) or "").strip()
     return aggregate_aeo_share_of_voice_from_extractions(
@@ -246,12 +255,20 @@ def aggregate_aeo_share_of_voice(business_profile: BusinessProfile) -> dict[str,
 
 def latest_extraction_per_response(
     business_profile: BusinessProfile,
+    *,
+    response_platform: str | None = PRIMARY_AEO_SCORING_PLATFORM,
 ) -> list[AEOExtractionSnapshot]:
     """
     One extraction per response snapshot: prefer latest successful parse, else latest row.
+
+    Default ``response_platform`` is OpenAI so dual-provider runs do not double-count prompts
+    in Phase 4 aggregates. Use ``None`` to consider every ``AEOResponseSnapshot`` row.
     """
     out: list[AEOExtractionSnapshot] = []
-    responses = business_profile.aeo_response_snapshots.prefetch_related(
+    rsp_qs = business_profile.aeo_response_snapshots.all()
+    if response_platform is not None:
+        rsp_qs = rsp_qs.filter(platform=response_platform)
+    responses = rsp_qs.prefetch_related(
         Prefetch(
             "extraction_snapshots",
             queryset=AEOExtractionSnapshot.objects.select_related("response_snapshot").order_by(

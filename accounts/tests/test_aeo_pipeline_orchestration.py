@@ -49,7 +49,9 @@ def test_phase1_completion_enqueues_extraction_on_partial_failures(monkeypatch):
     queued = []
     monkeypatch.setattr(
         "accounts.tasks.run_aeo_phase3_extraction_task.delay",
-        lambda run_id, snapshot_ids=None: queued.append((run_id, snapshot_ids or [])),
+        lambda run_id, snapshot_ids=None, response_platform=None: queued.append(
+            (run_id, snapshot_ids or [], response_platform)
+        ),
     )
 
     run_aeo_phase1_execution_task(run.id, [{"prompt": "q1"}])
@@ -57,7 +59,7 @@ def test_phase1_completion_enqueues_extraction_on_partial_failures(monkeypatch):
     assert run.status == AEOExecutionRun.STATUS_COMPLETED
     assert run.prompt_count_executed == 1
     assert run.prompt_count_failed == 1
-    assert queued == [(run.id, [snap.id])]
+    assert queued == [(run.id, [snap.id], None)]
 
 
 @pytest.mark.django_db
