@@ -277,6 +277,18 @@ def _pick_extraction_for_response(resp: AEOResponseSnapshot) -> AEOExtractionSna
     return rows[0]
 
 
+def composite_aeo_score_from_snapshot(snap: AEOScoreSnapshot) -> int:
+    """
+    Single 0–100 headline score from a Phase-4 AEOScoreSnapshot.
+
+    Equal-weight blend of visibility %, weighted average position %, and citation share %.
+    """
+    v = max(0.0, min(100.0, float(snap.visibility_score)))
+    w = max(0.0, min(100.0, float(snap.weighted_position_score)))
+    c = max(0.0, min(100.0, float(snap.citation_share)))
+    return max(0, min(100, int(round((v + w + c) / 3.0))))
+
+
 def save_aeo_score_snapshot(
     business_profile: BusinessProfile,
     *,

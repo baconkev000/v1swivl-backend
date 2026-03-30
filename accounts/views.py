@@ -1827,6 +1827,7 @@ def aeo_pipeline_status_data(request: HttpRequest) -> Response:
     Cached-only AEO pipeline status endpoint.
     No OpenAI/DataForSEO calls are made in this read path.
     """
+    from .aeo.aeo_scoring_utils import composite_aeo_score_from_snapshot
     from .models import AEOExecutionRun, AEORecommendationRun, AEOScoreSnapshot
 
     profile = (
@@ -1898,6 +1899,7 @@ def aeo_pipeline_status_data(request: HttpRequest) -> Response:
             if not latest_score
             else {
                 "id": latest_score.id,
+                "aeo_score": composite_aeo_score_from_snapshot(latest_score),
                 "visibility_score": float(latest_score.visibility_score),
                 "weighted_position_score": float(latest_score.weighted_position_score),
                 "citation_share": float(latest_score.citation_share),

@@ -164,6 +164,7 @@ def test_aeo_pipeline_status_endpoint_uses_cached_snapshots_only(monkeypatch):
     body = resp.json()
     assert body["run"]["id"] == run.id
     assert body["score_snapshot"]["id"] == score.id
+    assert body["score_snapshot"]["aeo_score"] == 28  # round((50 + 25 + 10) / 3)
     assert "freshness" in body
 
 
