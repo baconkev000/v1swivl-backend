@@ -7,6 +7,7 @@ import requests
 from django.conf import settings
 from django.core.cache import cache
 from django.db import transaction
+from django.utils import timezone as django_timezone
 from django.contrib.auth import get_user_model, login, logout as django_logout
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import redirect
@@ -1751,7 +1752,7 @@ def aeo_profile_data(request: HttpRequest) -> Response:
 def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     """
     Cached-only prompt coverage read for AI Visibility UI.
-    Returns monitored prompts from saved AEOResponseSnapshot rows plus latest extraction status.
+    One row per unique prompt text; per-platform (OpenAI / Gemini) citation from latest snapshot each.
     """
     from .models import AEOResponseSnapshot
 
@@ -1762,15 +1763,40 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     if not profile:
         return Response({"prompts": [], "monitored_count": 0})
 
-    responses = (
-        AEOResponseSnapshot.objects.filter(profile=profile)
-        .order_by("-created_at", "-id")
-    )
     selected_prompt_count = len(
         [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
     )
-    prompts: list[dict] = []
+
+    responses = list(
+        AEOResponseSnapshot.objects.filter(profile=profile).order_by("-created_at", "-id")
+    )
+
+    by_prompt: dict[str, list] = {}
     for resp in responses:
+        key = (resp.prompt_text or "").strip()
+        if not key:
+            continue
+        by_prompt.setdefault(key, []).append(resp)
+
+    def _response_sort_key(x):
+        c = x.created_at
+        if c is None:
+            return (datetime.min.replace(tzinfo=timezone.utc), x.id)
+        if django_timezone.is_naive(c):
+            c = django_timezone.make_aware(c, timezone.utc)
+        return (c, x.id)
+
+    def latest_snapshot_per_platform(rows: list) -> dict[str, object]:
+        best: dict[str, object] = {}
+        for r in sorted(rows, key=_response_sort_key, reverse=True):
+            plat = str(r.platform or "").strip().lower()
+            if plat not in ("openai", "gemini"):
+                continue
+            if plat not in best:
+                best[plat] = r
+        return best
+
+    def platform_cell(resp) -> dict:
         latest_ex = resp.extraction_snapshots.order_by("-created_at", "-id").first()
         competitors_count = 0
         cited = False
@@ -1778,18 +1804,52 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
             cited = bool(latest_ex.brand_mentioned)
             comps = latest_ex.competitors_json or []
             competitors_count = len(comps) if isinstance(comps, list) else 0
+        return {
+            "has_data": True,
+            "cited": cited,
+            "competitors_cited": competitors_count,
+            "response_created_at": resp.created_at.isoformat() if resp.created_at else None,
+        }
+
+    empty_cell = {"has_data": False, "cited": None, "competitors_cited": None, "response_created_at": None}
+
+    ordered_keys: list[str] = []
+    seen: set[str] = set()
+    for raw in profile.selected_aeo_prompts or []:
+        k = str(raw).strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        ordered_keys.append(k)
+    for k in sorted(by_prompt.keys()):
+        if k not in seen:
+            ordered_keys.append(k)
+
+    prompts: list[dict] = []
+    for key in ordered_keys:
+        rows = by_prompt.get(key, [])
+        plat_latest = latest_snapshot_per_platform(rows)
+        platforms = {
+            "openai": platform_cell(plat_latest["openai"]) if "openai" in plat_latest else dict(empty_cell),
+            "gemini": platform_cell(plat_latest["gemini"]) if "gemini" in plat_latest else dict(empty_cell),
+        }
+        max_comp = 0
+        for cell in platforms.values():
+            if cell["has_data"] and isinstance(cell.get("competitors_cited"), int):
+                max_comp = max(max_comp, int(cell["competitors_cited"]))
+        any_row = next(iter(rows), None)
+        prompt_type = ""
+        if any_row is not None:
+            prompt_type = str(any_row.prompt_type or "")
         prompts.append(
             {
-                "id": resp.id,
-                "prompt": (resp.prompt_text or "").strip(),
-                "prompt_type": str(resp.prompt_type or ""),
-                "platform": str(resp.platform or ""),
-                "weight": float(resp.weight or 1.0),
-                "cited": cited,
-                "competitors_cited": competitors_count,
-                "response_created_at": resp.created_at.isoformat() if resp.created_at else None,
+                "prompt": key,
+                "prompt_type": prompt_type,
+                "competitors_cited": max_comp,
+                "platforms": platforms,
             }
         )
+
     return Response({"prompts": prompts, "monitored_count": selected_prompt_count})
 
 
