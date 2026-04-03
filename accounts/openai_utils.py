@@ -6,6 +6,7 @@ Keeps all OpenAI client usage and message formatting in one place.
 
 import json
 import os
+from typing import Any
 
 from django.conf import settings
 from django.http import HttpRequest
@@ -93,7 +94,29 @@ def _get_client(api_key_env: str | None = None) -> OpenAI:
 
 
 def _get_model() -> str:
-    return getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+    """Resolve chat model from ``settings.OPENAI_MODEL`` (env ``OPENAI_MODEL``)."""
+    raw = getattr(settings, "OPENAI_MODEL", "") or ""
+    s = str(raw).strip()
+    return s or "gpt-4o-mini"
+
+
+def chat_completion_create_logged(
+    client: OpenAI,
+    *,
+    operation: str,
+    business_profile: BusinessProfile | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Call ``client.chat.completions.create`` and append a usage log row (best-effort)."""
+    from accounts.third_party_usage import record_openai_chat_completion
+
+    completion = client.chat.completions.create(**kwargs)
+    record_openai_chat_completion(
+        operation=operation,
+        response=completion,
+        business_profile=business_profile,
+    )
+    return completion
 
 
 def _get_chat_reply(
@@ -101,6 +124,7 @@ def _get_chat_reply(
     recent_messages: list,
     conversation_summary: str | None = None,
     api_key_env: str | None = None,
+    business_profile: BusinessProfile | None = None,
 ) -> str:
     """
     Call OpenAI chat completion. recent_messages must have .role and .content.
@@ -124,7 +148,10 @@ def _get_chat_reply(
 
     client = _get_client(api_key_env)
     model = _get_model()
-    completion = client.chat.completions.create(
+    completion = chat_completion_create_logged(
+        client,
+        operation="openai.chat.seo_agent_reply",
+        business_profile=business_profile,
         model=model,
         messages=openai_messages,
     )
@@ -135,6 +162,8 @@ def get_seo_chat_reply(
     system_prompt: str,
     recent_messages: list[AgentMessage],
     conversation_summary: str | None = None,
+    *,
+    business_profile: BusinessProfile | None = None,
 ) -> str:
     """Call OpenAI for SEO agent using OPEN_AI_SEO_API_KEY."""
     return _get_chat_reply(
@@ -142,10 +171,15 @@ def get_seo_chat_reply(
         recent_messages,
         conversation_summary,
         api_key_env="OPEN_AI_SEO_API_KEY",
+        business_profile=business_profile,
     )
 
 
-def summarize_seo_conversation(messages: list[AgentMessage]) -> str:
+def summarize_seo_conversation(
+    messages: list[AgentMessage],
+    *,
+    business_profile: BusinessProfile | None = None,
+) -> str:
     """
     Ask OpenAI to summarize a list of messages into concise memory notes.
     """
@@ -163,7 +197,10 @@ def summarize_seo_conversation(messages: list[AgentMessage]) -> str:
 
     client = _get_client("OPEN_AI_SEO_API_KEY")
     model = _get_model()
-    completion = client.chat.completions.create(
+    completion = chat_completion_create_logged(
+        client,
+        operation="openai.chat.summarize_seo_conversation",
+        business_profile=business_profile,
         model=model,
         messages=payload,
     )
@@ -207,7 +244,10 @@ def generate_seo_keyword_candidates(
     try:
         client = _get_client("OPEN_AI_SEO_API_KEY")
         model = _get_model()
-        completion = client.chat.completions.create(
+        completion = chat_completion_create_logged(
+            client,
+            operation="openai.chat.seo_keyword_candidates",
+            business_profile=profile,
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -282,7 +322,10 @@ def generate_seo_next_steps(seo_data: dict) -> list[dict]:
     try:
         client = _get_client("OPEN_AI_SEO_API_KEY")
         model = _get_model()
-        completion = client.chat.completions.create(
+        completion = chat_completion_create_logged(
+            client,
+            operation="openai.chat.seo_next_steps",
+            business_profile=None,
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -354,7 +397,10 @@ def generate_keyword_action_suggestions(keywords: list[dict]) -> list[dict]:
     try:
         client = _get_client("OPEN_AI_SEO_API_KEY")
         model = _get_model()
-        completion = client.chat.completions.create(
+        completion = chat_completion_create_logged(
+            client,
+            operation="openai.chat.keyword_action_suggestions",
+            business_profile=None,
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -431,7 +477,10 @@ def generate_aeo_recommendations(aeo_data: dict, seo_data: dict | None = None) -
     try:
         client = _get_client("OPEN_AI_SEO_API_KEY")
         model = _get_model()
-        completion = client.chat.completions.create(
+        completion = chat_completion_create_logged(
+            client,
+            operation="openai.chat.aeo_recommendations",
+            business_profile=None,
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -454,7 +503,11 @@ def generate_aeo_recommendations(aeo_data: dict, seo_data: dict | None = None) -
         return []
 
 
-def summarize_reviews_conversation(messages: list[ReviewsMessage]) -> str:
+def summarize_reviews_conversation(
+    messages: list[ReviewsMessage],
+    *,
+    business_profile: BusinessProfile | None = None,
+) -> str:
     """
     Ask OpenAI to summarize a Reviews conversation into concise memory notes.
     """
@@ -472,7 +525,10 @@ def summarize_reviews_conversation(messages: list[ReviewsMessage]) -> str:
 
     client = _get_client("OPEN_AI_REVIEWS_API_KEY")
     model = _get_model()
-    completion = client.chat.completions.create(
+    completion = chat_completion_create_logged(
+        client,
+        operation="openai.chat.summarize_reviews_conversation",
+        business_profile=business_profile,
         model=model,
         messages=payload,
     )
@@ -554,6 +610,7 @@ def seo_chat(request: HttpRequest) -> Response:
         system_prompt,
         recent_messages,
         conversation_summary=conversation.summary or None,
+        business_profile=profile,
     )
 
     # Store assistant reply
@@ -569,7 +626,10 @@ def seo_chat(request: HttpRequest) -> Response:
         summary_messages = list(
             conversation.messages.order_by("created_at")[:80],
         )
-        conversation.summary = summarize_seo_conversation(summary_messages)
+        conversation.summary = summarize_seo_conversation(
+            summary_messages,
+            business_profile=profile,
+        )
         conversation.save(update_fields=["summary", "updated_at"])
 
     return Response(
@@ -629,6 +689,7 @@ def reviews_chat(request: HttpRequest) -> Response:
         recent_messages,
         conversation_summary=conversation.summary or None,
         api_key_env="OPEN_AI_REVIEWS_API_KEY",
+        business_profile=profile,
     )
 
     ReviewsMessage.objects.create(
@@ -642,7 +703,10 @@ def reviews_chat(request: HttpRequest) -> Response:
         summary_messages = list(
             conversation.messages.order_by("created_at")[:80],
         )
-        conversation.summary = summarize_reviews_conversation(summary_messages)
+        conversation.summary = summarize_reviews_conversation(
+            summary_messages,
+            business_profile=profile,
+        )
         conversation.save(update_fields=["summary", "updated_at"])
 
     return Response(

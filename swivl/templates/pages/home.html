@@ -1,3 +1,328 @@
 {% extends "base.html" %}
+{% load i18n static %}
 
+{% block title %}
+  {% translate "Home" %} — {{ block.super }}
+{% endblock title %}
 
+{% block content %}
+  <h1 class="h3 mb-3">{% translate "Home" %}</h1>
+  {% if not show_api_usage_chart %}
+    <p>{% translate "Use this document as a way to quick start any new project." %}</p>
+  {% else %}
+    <section class="mb-4" aria-label="{% translate 'Third-party API usage' %}">
+      <h2 class="h5">{% translate "Third-party API usage (last 12 months)" %}</h2>
+      <p class="text-muted small mb-2">
+        {% translate "Totals in this range:" %}
+        {{ api_usage_total_requests }}
+        {% translate "requests;" %}
+        {% translate "estimated" %}
+        ${{ api_usage_total_cost_usd|floatformat:4 }}
+        {% translate "USD (DataForSEO task cost when provided; token-based estimates for OpenAI/Gemini)." %}
+      </p>
+      <form method="get" class="row g-2 align-items-end mb-4">
+        <div class="col-auto">
+          <label for="id_profile" class="form-label mb-0">{% translate "Business profile" %}</label>
+          <select name="profile" id="id_profile" class="form-select form-select-sm" onchange="this.form.submit()">
+            <option value="all" {% if selected_profile_filter == "all" %}selected{% endif %}>{% translate "All profiles" %}</option>
+            {% for p in business_profiles_for_usage %}
+              <option value="{{ p.id }}" {% if selected_profile_filter == p.id|stringformat:"s" %}selected{% endif %}>
+                {% if p.business_name %}{{ p.business_name }}{% else %}{% translate "Unnamed" %}{% endif %} ({{ p.id }})
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-auto">
+          <label for="id_tokens_platform" class="form-label mb-0">{% translate "Token charts: API" %}</label>
+          <select name="tokens_platform" id="id_tokens_platform" class="form-select form-select-sm" onchange="this.form.submit()">
+            <option value="all" {% if selected_tokens_platform_filter == "all" %}selected{% endif %}>{% translate "All" %}</option>
+            <option value="dataforseo" {% if selected_tokens_platform_filter == "dataforseo" %}selected{% endif %}>DataForSEO</option>
+            <option value="openai" {% if selected_tokens_platform_filter == "openai" %}selected{% endif %}>OpenAI</option>
+            <option value="gemini" {% if selected_tokens_platform_filter == "gemini" %}selected{% endif %}>Gemini</option>
+          </select>
+        </div>
+      </form>
+      <div class="row g-4">
+        <div class="col-lg-6">
+          <h3 class="h6">{% translate "Requests per month" %}</h3>
+          <div class="position-relative w-100 overflow-hidden" style="height: 300px; max-height: 45vh">
+            <canvas id="apiUsageCountChart" aria-label="{% translate 'Request count chart' %}"></canvas>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <h3 class="h6">{% translate "Estimated cost (USD) per month" %}</h3>
+          <div class="position-relative w-100 overflow-hidden" style="height: 300px; max-height: 45vh">
+            <canvas id="apiUsageCostChart" aria-label="{% translate 'Cost chart' %}"></canvas>
+          </div>
+        </div>
+      </div>
+      <h3 class="h6 mt-4">{% translate "Tokens sent vs received" %}</h3>
+      <p class="text-muted small mb-2">
+        {% translate "Input (prompt) and output (completion) tokens from OpenAI and Gemini when the provider reports usage. DataForSEO has no token counts." %}
+        {% translate "Chart window totals — sent:" %}
+        {{ token_usage_totals.sent }}
+        {% translate "received:" %}
+        {{ token_usage_totals.received }}
+      </p>
+      <div class="row g-4">
+        <div class="col-lg-6">
+          <h4 class="h6 text-muted">{% translate "Tokens sent (input / prompt)" %}</h4>
+          <div class="position-relative w-100 overflow-hidden" style="height: 300px; max-height: 45vh">
+            <canvas id="apiTokensSentChart" aria-label="{% translate 'Tokens sent chart' %}"></canvas>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <h4 class="h6 text-muted">{% translate "Tokens received (output / completion)" %}</h4>
+          <div class="position-relative w-100 overflow-hidden" style="height: 300px; max-height: 45vh">
+            <canvas id="apiTokensRecvChart" aria-label="{% translate 'Tokens received chart' %}"></canvas>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="mb-4 mt-5" aria-label="{% translate 'AEO visibility trend' %}">
+      <h2 class="h5">{% translate "AEO brand visibility" %}</h2>
+      <p class="text-muted small mb-2">
+        {% translate "Monthly visibility is the share of AEO prompts where your brand is effectively cited, based on extractions for responses recorded that month. Use the profile filter above to scope data." %}
+        {% translate 'With "All profiles", up to 200 businesses that have AEO response data in this window are averaged per month.' %}
+      </p>
+      <div class="btn-group btn-group-sm mb-3 flex-wrap" role="group" aria-label="{% translate 'Visibility breakdown' %}">
+        <input type="radio" class="btn-check" name="aeoVisMode" id="aeoVisTotal" value="total" checked autocomplete="off" />
+        <label class="btn btn-outline-secondary" for="aeoVisTotal">{% translate "All platforms combined" %}</label>
+        <input type="radio" class="btn-check" name="aeoVisMode" id="aeoVisByPlat" value="by_platform" autocomplete="off" />
+        <label class="btn btn-outline-secondary" for="aeoVisByPlat">{% translate "Each platform separately" %}</label>
+      </div>
+      <div class="position-relative w-100 overflow-hidden" style="height: 300px; max-height: 45vh">
+        <canvas id="aeoVisibilityChart" aria-label="{% translate 'AEO visibility chart' %}"></canvas>
+      </div>
+    </section>
+
+    {{ api_usage_chart_payload|json_script:"api-usage-chart-data" }}
+    {{ token_chart_payload|json_script:"api-token-chart-data" }}
+    {{ aeo_visibility_chart_payload|json_script:"aeo-visibility-chart-data" }}
+      <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" crossorigin="anonymous"></script>
+      <script>
+        (function () {
+          if (typeof Chart === "undefined") return;
+
+          const apiEl = document.getElementById("api-usage-chart-data");
+          if (apiEl) {
+            const payload = JSON.parse(apiEl.textContent);
+            const common = {
+              type: "bar",
+              data: { labels: payload.labels, datasets: [] },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                layout: { padding: { top: 4, bottom: 4 } },
+                plugins: { legend: { position: "bottom" } },
+                scales: {
+                  x: { stacked: true },
+                  y: { stacked: true, beginAtZero: true },
+                },
+              },
+            };
+            new Chart(document.getElementById("apiUsageCountChart"), {
+              ...common,
+              data: {
+                labels: payload.labels,
+                datasets: (payload.countDatasets || []).map(function (d) {
+                  return {
+                    label: d.label,
+                    data: d.data.slice(),
+                    backgroundColor: d.backgroundColor,
+                  };
+                }),
+              },
+            });
+            new Chart(document.getElementById("apiUsageCostChart"), {
+              ...common,
+              data: {
+                labels: payload.labels,
+                datasets: (payload.costDatasets || []).map(function (d) {
+                  return {
+                    label: d.label,
+                    data: d.data.slice(),
+                    backgroundColor: d.backgroundColor,
+                  };
+                }),
+              },
+              options: {
+                ...common.options,
+                scales: {
+                  x: { stacked: true },
+                  y: {
+                    stacked: true,
+                    beginAtZero: true,
+                    ticks: {
+                      callback: function (v) {
+                        return "$" + Number(v).toFixed(2);
+                      },
+                    },
+                  },
+                },
+              },
+            });
+          }
+
+          const tokEl = document.getElementById("api-token-chart-data");
+          if (tokEl) {
+            const tok = JSON.parse(tokEl.textContent);
+            const tokCommon = {
+              type: "bar",
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                layout: { padding: { top: 4, bottom: 4 } },
+                plugins: {
+                  legend: { position: "bottom" },
+                  tooltip: {
+                    callbacks: {
+                      label: function (ctx) {
+                        var n = ctx.parsed.y;
+                        if (n == null || isNaN(n)) return ctx.dataset.label + ": —";
+                        return ctx.dataset.label + ": " + Number(n).toLocaleString();
+                      },
+                    },
+                  },
+                },
+                scales: {
+                  x: { stacked: true },
+                  y: {
+                    stacked: true,
+                    beginAtZero: true,
+                    ticks: {
+                      callback: function (v) {
+                        return Number(v).toLocaleString();
+                      },
+                    },
+                  },
+                },
+              },
+            };
+            new Chart(document.getElementById("apiTokensSentChart"), {
+              ...tokCommon,
+              data: {
+                labels: tok.labels,
+                datasets: (tok.sentDatasets || []).map(function (d) {
+                  return {
+                    label: d.label,
+                    data: d.data.slice(),
+                    backgroundColor: d.backgroundColor,
+                  };
+                }),
+              },
+            });
+            new Chart(document.getElementById("apiTokensRecvChart"), {
+              ...tokCommon,
+              data: {
+                labels: tok.labels,
+                datasets: (tok.recvDatasets || []).map(function (d) {
+                  return {
+                    label: d.label,
+                    data: d.data.slice(),
+                    backgroundColor: d.backgroundColor,
+                  };
+                }),
+              },
+            });
+          }
+
+          const aeoEl = document.getElementById("aeo-visibility-chart-data");
+          const aeoCanvas = document.getElementById("aeoVisibilityChart");
+          if (aeoEl && aeoCanvas) {
+            const aeoPayload = JSON.parse(aeoEl.textContent);
+            const labels = aeoPayload.labels || [];
+            const totalSeries = {
+              label: aeoPayload.totalLegend || "All platforms combined",
+              data: (aeoPayload.total || []).map(Number),
+              borderColor: "rgb(99, 102, 241)",
+              backgroundColor: "rgba(99, 102, 241, 0.08)",
+              tension: 0.25,
+              fill: true,
+              pointRadius: 3,
+            };
+            const byPlatformSeries = (aeoPayload.byPlatform || []).map(function (d) {
+              return {
+                label: d.label,
+                data: (d.data || []).map(Number),
+                borderColor: d.borderColor || "rgb(108, 117, 125)",
+                backgroundColor: "transparent",
+                tension: 0.25,
+                fill: false,
+                pointRadius: 3,
+              };
+            });
+            const aeoChart = new Chart(aeoCanvas, {
+              type: "line",
+              data: {
+                labels: labels.slice(),
+                datasets: [totalSeries],
+              },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: "index", intersect: false },
+                plugins: {
+                  legend: { position: "bottom" },
+                  tooltip: {
+                    callbacks: {
+                      label: function (ctx) {
+                        var v = ctx.parsed.y;
+                        if (v == null || isNaN(v)) return ctx.dataset.label + ": —";
+                        return ctx.dataset.label + ": " + Number(v).toFixed(1) + "%";
+                      },
+                    },
+                  },
+                },
+                scales: {
+                  y: {
+                    min: 0,
+                    max: 100,
+                    ticks: {
+                      callback: function (v) {
+                        return v + "%";
+                      },
+                    },
+                  },
+                },
+              },
+            });
+            function applyAeoMode(mode) {
+              if (mode === "by_platform" && byPlatformSeries.length) {
+                aeoChart.data.datasets = byPlatformSeries.map(function (ds) {
+                  return {
+                    label: ds.label,
+                    data: ds.data.slice(),
+                    borderColor: ds.borderColor,
+                    backgroundColor: ds.backgroundColor,
+                    tension: ds.tension,
+                    fill: ds.fill,
+                    pointRadius: ds.pointRadius,
+                  };
+                });
+              } else {
+                aeoChart.data.datasets = [
+                  {
+                    label: totalSeries.label,
+                    data: totalSeries.data.slice(),
+                    borderColor: totalSeries.borderColor,
+                    backgroundColor: totalSeries.backgroundColor,
+                    tension: totalSeries.tension,
+                    fill: totalSeries.fill,
+                    pointRadius: totalSeries.pointRadius,
+                  },
+                ];
+              }
+              aeoChart.update();
+            }
+            document.querySelectorAll('input[name="aeoVisMode"]').forEach(function (radio) {
+              radio.addEventListener("change", function () {
+                if (this.checked) applyAeoMode(this.value);
+              });
+            });
+          }
+        })();
+      </script>
+  {% endif %}
+{% endblock content %}

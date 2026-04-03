@@ -1,8 +1,10 @@
-from django.contrib.auth import get_user_model
+import logging
+from urllib.parse import urlparse
+
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import serializers
-import logging
 
 from .constants import AEO_RECOMMENDATIONS_TTL, AEO_SNAPSHOT_TTL, SEO_SNAPSHOT_TTL
 from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot
@@ -20,6 +22,37 @@ from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+def _normalize_stored_website_url(value: str) -> str | None:
+    """
+    Reduce a user-entered URL to scheme + host for storage (BusinessProfile.website_url is max 200).
+
+    Strips path, query string, fragment, and userinfo. Drops leading www. on the host.
+    Returns None if no usable host can be parsed (caller may treat as validation error).
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if not v.startswith(("http://", "https://")):
+        v = "https://" + v
+    parsed = urlparse(v)
+    netloc = (parsed.netloc or "").strip().lower()
+    if not netloc:
+        path_part = (parsed.path or "").lstrip("/")
+        first = path_part.split("/")[0] if path_part else ""
+        if first and ".." not in first and "/" not in first and not first.startswith("."):
+            netloc = first.lower()
+        else:
+            return None
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    if not netloc:
+        return None
+    scheme = parsed.scheme if parsed.scheme in ("http", "https") else "https"
+    return f"{scheme}://{netloc}"
 
 
 def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> list:
@@ -168,12 +201,15 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         return _aeo_prompt_target_count()
 
     def validate_website_url(self, value):
-        """Normalize URL to include scheme."""
-        if value:
-            value = value.strip()
-            if not value.startswith(("http://", "https://")):
-                value = "https://" + value
-        return value
+        """Normalize to origin (scheme + host only) so paths/query strings do not exceed URLField(200)."""
+        if value is None or str(value).strip() == "":
+            return ""
+        normalized = _normalize_stored_website_url(str(value))
+        if normalized is None:
+            raise serializers.ValidationError("Enter a valid website URL.")
+        if len(normalized) > 200:
+            raise serializers.ValidationError("Website URL exceeds maximum length.")
+        return normalized
 
     def validate_selected_aeo_prompts(self, value):
         if value is None:
@@ -445,14 +481,17 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 return safe_bundle
 
         try:
-            data = get_aeo_content_readiness_for_site(
-                target_domain=domain,
-                niche=niche,
-                cache_key_seed=f"user:{getattr(getattr(obj, 'user', None), 'id', 'unknown')}",
-                force_refresh=force_aeo_refresh,
-                location_code=resolved_location_code,
-                profile_id=getattr(obj, "id", None),
-            ) or {}
+            from accounts.third_party_usage import usage_profile_context
+
+            with usage_profile_context(obj):
+                data = get_aeo_content_readiness_for_site(
+                    target_domain=domain,
+                    niche=niche,
+                    cache_key_seed=f"user:{getattr(getattr(obj, 'user', None), 'id', 'unknown')}",
+                    force_refresh=force_aeo_refresh,
+                    location_code=resolved_location_code,
+                    profile_id=getattr(obj, "id", None),
+                ) or {}
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "[BusinessProfileSerializer] get_aeo_bundle failed for profile id=%s",

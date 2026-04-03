@@ -5,15 +5,16 @@ Uses existing OpenAI client resolution from accounts.openai_utils.
 Execution *system* prompt text lives in aeo_prompts.py (AEO_EXECUTION_SYSTEM_PROMPT);
 Gemini mirrors the same instruction via accounts.aeo.gemini_prompts.
 
-When ``GEMINI_API_KEY`` is set, each prompt runs OpenAI and Gemini concurrently (ThreadPoolExecutor);
-partial provider failure still persists the other provider's row.
+When ``GEMINI_API_KEY`` is set, batch runs use a shared ThreadPoolExecutor (see ``AEO_EXECUTION_MAX_WORKERS``)
+so many prompts’ OpenAI and Gemini calls can overlap; partial provider failure still persists the other provider’s row.
 
 Optional Django settings (defaults are conservative for repeatable runs):
-    AEO_EXECUTION_MODEL — override model id (else settings.OPENAI_MODEL / gpt-4o-mini)
+    AEO_EXECUTION_MODEL — env override; defaults to settings.OPENAI_MODEL
     AEO_EXECUTION_TEMPERATURE — default 0.2
     AEO_EXECUTION_MAX_TOKENS — default 1200 (clamped 256–4096)
     AEO_OPENAI_TIMEOUT — HTTP timeout seconds, default 45
     AEO_EXECUTION_MAX_ATTEMPTS — per-prompt retries for transient errors, default 2
+    AEO_EXECUTION_MAX_WORKERS — ThreadPoolExecutor size for batch runs, default 20 (clamped 1–64)
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from uuid import UUID
 from django.conf import settings
 
 from ..models import AEOExecutionRun, AEOResponseSnapshot, BusinessProfile
-from ..openai_utils import _get_client, _get_model
+from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
 from .aeo_prompts import AEO_EXECUTION_SYSTEM_PROMPT
 from .aeo_utils import normalize_aeo_prompt_dict
 
@@ -45,7 +46,9 @@ DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
 
 
 def _execution_model() -> str:
-    return getattr(settings, "AEO_EXECUTION_MODEL", None) or _get_model()
+    raw = getattr(settings, "AEO_EXECUTION_MODEL", "") or ""
+    s = str(raw).strip()
+    return s or _get_model()
 
 
 def _execution_temperature() -> float:
@@ -78,6 +81,15 @@ def _execution_max_attempts() -> int:
         return max(1, min(5, int(v)))
     except (TypeError, ValueError):
         return 2
+
+
+def _execution_max_workers() -> int:
+    v = getattr(settings, "AEO_EXECUTION_MAX_WORKERS", 20)
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        n = 20
+    return max(1, min(64, n))
 
 
 def normalize_prompt_for_hash(prompt_text: str) -> str:
@@ -205,7 +217,10 @@ def run_single_aeo_prompt(
     attempts = _execution_max_attempts()
     for attempt in range(attempts):
         try:
-            completion = exec_client.chat.completions.create(
+            completion = chat_completion_create_logged(
+                exec_client,
+                operation="openai.chat.aeo_prompt_execution",
+                business_profile=business_profile,
                 model=model,
                 messages=[
                     {"role": "system", "content": AEO_EXECUTION_SYSTEM_PROMPT},
@@ -355,93 +370,111 @@ def run_aeo_prompt_batch(
     ok = 0
     failed = 0
     dual = gemini_execution_enabled() and not openai_only and not gemini_only
-    exec_client: Any | None = None
-    if not dual and not gemini_only:
-        exec_client = _execution_openai_client(api_key_env)
+    max_workers = _execution_max_workers()
 
-    for prompt_obj in prompt_set:
-        pair_id = uuid.uuid4() if execution_run else None
-
-        if gemini_only:
-            one = run_single_aeo_prompt_gemini(
-                prompt_obj,
-                business_profile,
-                save=save,
-                execution_run=execution_run,
-                execution_pair_id=pair_id,
-            )
-            results.append(one)
-            if one["success"]:
-                ok += 1
-            else:
-                err = (one.get("error") or "").strip()
-                if err != "skipped_no_api_key":
-                    failed += 1
-            continue
-
-        if dual:
-
-            def openai_job(
-                po: Mapping[str, Any] = prompt_obj,
-                pid: UUID | None = pair_id,
-            ) -> dict[str, Any]:
-                return run_single_aeo_prompt(
-                    po,
-                    business_profile,
-                    client=None,
-                    save=save,
-                    platform=PLATFORM_OPENAI,
-                    api_key_env=api_key_env,
-                    execution_run=execution_run,
-                    execution_pair_id=pid,
-                )
-
-            def gemini_job(
-                po: Mapping[str, Any] = prompt_obj,
-                pid: UUID | None = pair_id,
-            ) -> dict[str, Any]:
-                return run_single_aeo_prompt_gemini(
-                    po,
-                    business_profile,
-                    save=save,
-                    execution_run=execution_run,
-                    execution_pair_id=pid,
-                )
-
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_o = pool.submit(openai_job)
-                fut_g = pool.submit(gemini_job)
-                ordered = (fut_o.result(), fut_g.result())
-            for one in ordered:
-                results.append(one)
-                if one["success"]:
-                    ok += 1
-                else:
-                    err = (one.get("error") or "").strip()
-                    if err != "skipped_no_api_key":
-                        failed += 1
+    def _accumulate(one: dict[str, Any]) -> None:
+        nonlocal ok, failed
+        if one["success"]:
+            ok += 1
         else:
-            one = run_single_aeo_prompt(
-                prompt_obj,
-                business_profile,
-                client=exec_client,
-                save=save,
-                platform=PLATFORM_OPENAI if openai_only else platform,
-                api_key_env=api_key_env,
-                execution_run=execution_run,
-                execution_pair_id=pair_id,
-            )
-            results.append(one)
-            if one["success"]:
-                ok += 1
-            else:
+            err = (one.get("error") or "").strip()
+            if err != "skipped_no_api_key":
                 failed += 1
 
-    if exec_client is not None and hasattr(exec_client, "close"):
-        try:
-            exec_client.close()
-        except Exception:
-            pass
+    if not prompt_set:
+        return {
+            "profile_id": business_profile.id,
+            "executed": ok,
+            "failed": failed,
+            "total": 0,
+            "results": results,
+        }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        if gemini_only:
+            futures = []
+            for prompt_obj in prompt_set:
+                pair_id = uuid.uuid4() if execution_run else None
+
+                def gemini_job(
+                    po: Mapping[str, Any] = prompt_obj,
+                    pid: UUID | None = pair_id,
+                ) -> dict[str, Any]:
+                    return run_single_aeo_prompt_gemini(
+                        po,
+                        business_profile,
+                        save=save,
+                        execution_run=execution_run,
+                        execution_pair_id=pid,
+                    )
+
+                futures.append(pool.submit(gemini_job))
+            for fut in futures:
+                one = fut.result()
+                results.append(one)
+                _accumulate(one)
+        elif dual:
+            pair_futures: list[tuple[Any, Any]] = []
+            for prompt_obj in prompt_set:
+                pair_id = uuid.uuid4() if execution_run else None
+
+                def openai_job(
+                    po: Mapping[str, Any] = prompt_obj,
+                    pid: UUID | None = pair_id,
+                ) -> dict[str, Any]:
+                    return run_single_aeo_prompt(
+                        po,
+                        business_profile,
+                        client=None,
+                        save=save,
+                        platform=PLATFORM_OPENAI,
+                        api_key_env=api_key_env,
+                        execution_run=execution_run,
+                        execution_pair_id=pid,
+                    )
+
+                def gemini_job(
+                    po: Mapping[str, Any] = prompt_obj,
+                    pid: UUID | None = pair_id,
+                ) -> dict[str, Any]:
+                    return run_single_aeo_prompt_gemini(
+                        po,
+                        business_profile,
+                        save=save,
+                        execution_run=execution_run,
+                        execution_pair_id=pid,
+                    )
+
+                pair_futures.append((pool.submit(openai_job), pool.submit(gemini_job)))
+            for fut_o, fut_g in pair_futures:
+                for one in (fut_o.result(), fut_g.result()):
+                    results.append(one)
+                    _accumulate(one)
+        else:
+            futures = []
+            for prompt_obj in prompt_set:
+                pair_id = uuid.uuid4() if execution_run else None
+
+                def openai_only_job(
+                    po: Mapping[str, Any] = prompt_obj,
+                    pid: UUID | None = pair_id,
+                ) -> dict[str, Any]:
+                    return run_single_aeo_prompt(
+                        po,
+                        business_profile,
+                        client=None,
+                        save=save,
+                        platform=PLATFORM_OPENAI if openai_only else platform,
+                        api_key_env=api_key_env,
+                        execution_run=execution_run,
+                        execution_pair_id=pid,
+                    )
+
+                futures.append(pool.submit(openai_only_job))
+            for fut in futures:
+                one = fut.result()
+                results.append(one)
+                _accumulate(one)
 
     return {
         "profile_id": business_profile.id,

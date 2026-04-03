@@ -11,6 +11,7 @@ from .models import (
     AEOExecutionRun,
     AEOScoreSnapshot,
     BusinessProfile,
+    ThirdPartyApiRequestLog,
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
     GoogleAdsConnection,
@@ -244,4 +245,36 @@ class ReviewsConversationAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 class ReviewsMessageAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "conversation", "role", "created_at")
     search_fields = ("conversation__user__email", "conversation__user__username", "content")
+
+
+@admin.register(ThirdPartyApiRequestLog)
+class ThirdPartyApiRequestLogAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "provider",
+        "business_profile",
+        "operation",
+        "tokens_sent",
+        "tokens_received",
+        "cost_usd",
+        "created_at",
+    )
+    list_filter = ("provider", "created_at")
+    search_fields = ("operation", "business_profile__business_name")
+    raw_id_fields = ("business_profile",)
+    readonly_fields = (
+        "provider",
+        "business_profile",
+        "operation",
+        "tokens_sent",
+        "tokens_received",
+        "cost_usd",
+        "created_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 

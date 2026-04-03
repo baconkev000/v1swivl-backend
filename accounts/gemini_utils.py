@@ -13,6 +13,9 @@ import time
 
 from django.conf import settings
 
+from .models import BusinessProfile
+from .third_party_usage import record_gemini_request
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,6 +78,7 @@ def generate_gemini_execution_text(
     user_text: str,
     temperature: float,
     max_output_tokens: int,
+    business_profile: BusinessProfile | None = None,
 ) -> tuple[str, str | None]:
     """
     Call Gemini with system + user content.
@@ -112,6 +116,11 @@ def generate_gemini_execution_text(
                 user_text,
                 generation_config=generation_config,
                 request_options={"timeout": int(timeout)},
+            )
+            record_gemini_request(
+                operation="gemini.generate_content.aeo_execution",
+                response=response,
+                business_profile=business_profile,
             )
             try:
                 out = (response.text or "").strip()

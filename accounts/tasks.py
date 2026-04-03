@@ -81,6 +81,10 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
     user = snapshot.user
+    profile_for_usage = (
+        user.business_profiles.filter(is_main=True).first()
+        or user.business_profiles.first()
+    )
 
     # Copy so we don't mutate in-place until we're ready to save
     top_keywords: List[Dict[str, Any]] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]
@@ -109,6 +113,8 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         pass
 
     try:
+        from accounts.third_party_usage import usage_profile_context
+
         from .dataforseo_utils import (
             enrich_with_gap_keywords,
             enrich_with_llm_keywords,
@@ -117,15 +123,16 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             normalize_seo_snapshot_metrics,
         )
 
-        enrich_with_gap_keywords(domain, location_code, language_code, user, top_keywords)
-        enrich_with_llm_keywords(user, location_code, top_keywords)
-        rank_stats = enrich_keyword_ranks_from_labs(
-            domain=domain,
-            location_code=location_code,
-            language_code=language_code,
-            top_keywords=top_keywords,
-            user=user,
-        )
+        with usage_profile_context(profile_for_usage):
+            enrich_with_gap_keywords(domain, location_code, language_code, user, top_keywords)
+            enrich_with_llm_keywords(user, location_code, top_keywords)
+            rank_stats = enrich_keyword_ranks_from_labs(
+                domain=domain,
+                location_code=location_code,
+                language_code=language_code,
+                top_keywords=top_keywords,
+                user=user,
+            )
         total = int(rank_stats.get("total") or 0)
         ranked_after = int(rank_stats.get("non_null_after") or 0)
         coverage = (ranked_after / total) if total > 0 else 0.0
@@ -587,14 +594,17 @@ def run_aeo_phase1_execution_task(
     run.fetch_mode = AEOExecutionRun.FETCH_MODE_FRESH_FETCH
     run.save(update_fields=["prompt_count_requested", "cache_hit", "fetch_mode", "updated_at"])
 
+    from accounts.third_party_usage import usage_profile_context
+
     try:
-        batch = run_aeo_prompt_batch(
-            selected,
-            profile,
-            save=True,
-            execution_run=run,
-            providers=providers,
-        )
+        with usage_profile_context(profile):
+            batch = run_aeo_prompt_batch(
+                selected,
+                profile,
+                save=True,
+                execution_run=run,
+                providers=providers,
+            )
         response_snapshot_ids = [
             int(one.get("snapshot_id"))
             for one in (batch.get("results") or [])

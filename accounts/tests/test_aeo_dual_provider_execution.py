@@ -1,10 +1,17 @@
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from django.contrib.auth import get_user_model
 
-from accounts.aeo.aeo_execution_utils import PLATFORM_GEMINI, PLATFORM_OPENAI, run_aeo_prompt_batch
+from accounts.aeo.aeo_execution_utils import (
+    PLATFORM_GEMINI,
+    PLATFORM_OPENAI,
+    _execution_max_workers,
+    run_aeo_prompt_batch,
+)
 from accounts.aeo.aeo_scoring_utils import calculate_aeo_scores_for_business, latest_extraction_per_response
 from accounts.aeo.gemini_execution_utils import run_single_aeo_prompt_gemini
 from accounts.models import (
@@ -84,7 +91,7 @@ def test_dual_provider_uses_thread_pool(settings, monkeypatch):
     original_init = ThreadPoolExecutor.__init__
 
     def tracked_init(self, *args, **kwargs):
-        assert kwargs.get("max_workers") == 2
+        assert kwargs.get("max_workers") == _execution_max_workers()
         return original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(ThreadPoolExecutor, "__init__", tracked_init)
@@ -113,6 +120,69 @@ def test_dual_provider_uses_thread_pool(settings, monkeypatch):
     )
 
     run_aeo_prompt_batch([{"prompt": "q"}], profile, save=False, execution_run=run)
+
+
+@pytest.mark.django_db
+def test_dual_batch_many_calls_overlap_in_flight(settings, monkeypatch):
+    """10 prompts × 2 providers should use one pool (default 20 workers), not cap at 2 concurrent."""
+    settings.AEO_EXECUTION_MAX_WORKERS = 20
+    settings.GEMINI_API_KEY = "test-key"
+    user = User.objects.create_user(username="d1c", email="d1c@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_PENDING)
+
+    lock = threading.Lock()
+    in_flight = [0]
+    max_in_flight = [0]
+
+    def track_enter():
+        with lock:
+            in_flight[0] += 1
+            max_in_flight[0] = max(max_in_flight[0], in_flight[0])
+
+    def track_exit():
+        with lock:
+            in_flight[0] -= 1
+
+    def openai_ok(prompt_obj, business_profile, **kwargs):
+        track_enter()
+        try:
+            time.sleep(0.2)
+            return {
+                "success": True,
+                "snapshot_id": 1,
+                "platform": PLATFORM_OPENAI,
+                "error": None,
+                "prompt": prompt_obj.get("prompt", ""),
+                "prompt_hash": "h",
+            }
+        finally:
+            track_exit()
+
+    def gemini_ok(prompt_obj, business_profile, **kwargs):
+        track_enter()
+        try:
+            time.sleep(0.2)
+            return {
+                "success": True,
+                "snapshot_id": 2,
+                "platform": PLATFORM_GEMINI,
+                "error": None,
+                "prompt": prompt_obj.get("prompt", ""),
+                "prompt_hash": "h",
+            }
+        finally:
+            track_exit()
+
+    monkeypatch.setattr("accounts.aeo.aeo_execution_utils.run_single_aeo_prompt", openai_ok)
+    monkeypatch.setattr("accounts.aeo.gemini_execution_utils.run_single_aeo_prompt_gemini", gemini_ok)
+
+    prompts = [{"prompt": f"q{i}"} for i in range(10)]
+    run_aeo_prompt_batch(prompts, profile, save=False, execution_run=run)
+
+    assert max_in_flight[0] == 20, (
+        f"expected 20 concurrent provider calls (10 prompts × 2), saw {max_in_flight[0]}"
+    )
 
 
 @pytest.mark.django_db

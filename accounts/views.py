@@ -1943,6 +1943,58 @@ def aeo_profile_data(request: HttpRequest) -> Response:
     return Response(serializer.data)
 
 
+def _improvement_recommendations_for_prompt(
+    prompt_key: str,
+    response_ids: set[int],
+    recs: list,
+) -> list:
+    """
+    Map Phase-5 ``AEORecommendationRun.recommendations_json`` items to a single prompt row.
+
+    Matches ``create_content`` by ``prompt`` text; ``acquire_citation`` by ``references.response_snapshot_id``
+    belonging to this prompt's response snapshots.
+    """
+    out: list = []
+    key = (prompt_key or "").strip()
+    seen_text: set[str] = set()
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        at = rec.get("action_type")
+        matched = False
+        if at == "create_content":
+            p = (rec.get("prompt") or "").strip()
+            if p == key:
+                matched = True
+        elif at == "acquire_citation":
+            refs = rec.get("references") if isinstance(rec.get("references"), dict) else {}
+            rid = refs.get("response_snapshot_id")
+            try:
+                rid_int = int(rid) if rid is not None else None
+            except (TypeError, ValueError):
+                rid_int = None
+            if rid_int is not None and rid_int in response_ids:
+                matched = True
+        if not matched:
+            continue
+        body = (rec.get("nl_explanation") or rec.get("reason") or "").strip()
+        if not body:
+            continue
+        if body in seen_text:
+            continue
+        seen_text.add(body)
+        item = {
+            "action_type": at,
+            "priority": (rec.get("priority") or "medium"),
+            "text": body,
+        }
+        src = rec.get("source")
+        if isinstance(src, str) and src.strip():
+            item["source"] = src.strip()
+        out.append(item)
+    return out
+
+
 def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     """
     One row per monitored / seen prompt; per-platform (OpenAI / Gemini) cells from latest snapshot each.
@@ -1954,7 +2006,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         merged_target_url_position,
         unique_business_count_excluding_target,
     )
-    from .models import AEOResponseSnapshot
+    from .models import AEOResponseSnapshot, AEORecommendationRun
 
     selected_prompt_count = len(
         [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
@@ -2030,6 +2082,13 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         "citations_ranking": [],
     }
 
+    latest_reco = (
+        AEORecommendationRun.objects.filter(profile=profile)
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    reco_items: list = list(latest_reco.recommendations_json or []) if latest_reco else []
+
     ordered_keys: list[str] = []
     seen: set[str] = set()
     for raw in profile.selected_aeo_prompts or []:
@@ -2045,6 +2104,10 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     prompts: list[dict] = []
     for key in ordered_keys:
         rows = by_prompt.get(key, [])
+        response_ids = {int(r.id) for r in rows if getattr(r, "id", None) is not None}
+        improvement_recommendations = _improvement_recommendations_for_prompt(
+            key, response_ids, reco_items
+        )
         plat_latest = latest_snapshot_per_platform(rows)
         platforms = {
             "openai": platform_cell(plat_latest["openai"]) if "openai" in plat_latest else dict(empty_cell),
@@ -2079,6 +2142,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
                 "platforms": platforms,
                 "target_url_position": combined_target,
                 "citations_ranking": combined_ranking,
+                "improvement_recommendations": improvement_recommendations,
             }
         )
 

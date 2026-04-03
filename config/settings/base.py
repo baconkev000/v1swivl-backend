@@ -373,3 +373,10 @@ AEO_GEMINI_EXECUTION_MODEL = env("AEO_GEMINI_EXECUTION_MODEL", default="gemini-2
 META_ADS_APP_ID = os.environ.get("META_ADS_APP_ID", "")
 META_ADS_APP_SECRET = os.environ.get("META_ADS_APP_SECRET", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+# Chat completions model for SEO/Reviews agents, onboarding, and AEO (unless overridden below).
+OPENAI_MODEL = env("OPENAI_MODEL", default="gpt-5-mini").strip() or "gpt-4o-mini"
+# Optional: different model for AEO Phase 2 execution / structured extraction (defaults to OPENAI_MODEL).
+AEO_EXECUTION_MODEL = env("AEO_EXECUTION_MODEL", default=OPENAI_MODEL).strip() or OPENAI_MODEL
+# Max concurrent threads for AEO batch execution (OpenAI/Gemini jobs); clamped in code to 1–64.
+AEO_EXECUTION_MAX_WORKERS = env.int("AEO_EXECUTION_MAX_WORKERS", default=20)
+AEO_EXTRACTION_PARSER_MODEL = env("AEO_EXTRACTION_PARSER_MODEL", default=OPENAI_MODEL).strip() or OPENAI_MODEL

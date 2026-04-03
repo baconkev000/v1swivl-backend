@@ -1,0 +1,569 @@
+"""
+Record and aggregate third-party API usage (DataForSEO, OpenAI, Gemini) for staff dashboards.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Generator
+
+from django.conf import settings
+from django.db.models import Count, IntegerField, Sum, Value
+from django.db.models.functions import Coalesce, TruncMonth
+from django.utils import timezone
+
+from accounts.aeo.aeo_scoring_utils import (
+    calculate_visibility_score,
+    latest_extraction_per_response_in_window,
+)
+from accounts.models import AEOResponseSnapshot, BusinessProfile, ThirdPartyApiRequestLog
+
+logger = logging.getLogger(__name__)
+
+_usage_business_profile: ContextVar[BusinessProfile | None] = ContextVar(
+    "usage_business_profile",
+    default=None,
+)
+
+
+@contextmanager
+def usage_profile_context(
+    business_profile: BusinessProfile | None,
+) -> Generator[None, None, None]:
+    """Set the active BusinessProfile for third-party usage attribution (thread/async safe)."""
+    token = _usage_business_profile.set(business_profile)
+    try:
+        yield
+    finally:
+        _usage_business_profile.reset(token)
+
+
+def get_usage_business_profile() -> BusinessProfile | None:
+    return _usage_business_profile.get()
+
+
+def effective_usage_profile(explicit: BusinessProfile | None) -> BusinessProfile | None:
+    if explicit is not None:
+        return explicit
+    return get_usage_business_profile()
+
+
+# Rough USD per 1M tokens when usage is not itemized (override via settings)
+_DEFAULT_OPENAI_INPUT_PER_M = Decimal("2.50")
+_DEFAULT_OPENAI_OUTPUT_PER_M = Decimal("10.00")
+
+
+def _openai_price_per_m(model: str | None) -> tuple[Decimal, Decimal]:
+    pricing = getattr(settings, "OPENAI_USAGE_PRICING_PER_MILLION_TOKENS", None) or {}
+    if model and isinstance(pricing, dict) and model in pricing:
+        p = pricing[model]
+        inp = Decimal(str(p.get("input", _DEFAULT_OPENAI_INPUT_PER_M)))
+        out = Decimal(str(p.get("output", _DEFAULT_OPENAI_OUTPUT_PER_M)))
+        return inp, out
+    return _DEFAULT_OPENAI_INPUT_PER_M, _DEFAULT_OPENAI_OUTPUT_PER_M
+
+
+def record_dataforseo_request(
+    *,
+    operation: str,
+    response_json: dict[str, Any] | None,
+    business_profile: BusinessProfile | None = None,
+) -> None:
+    try:
+        cost = None
+        if response_json is not None:
+            tasks = response_json.get("tasks") or []
+            if tasks and isinstance(tasks[0], dict):
+                c = tasks[0].get("cost")
+                if c is not None:
+                    cost = Decimal(str(c))
+        ThirdPartyApiRequestLog.objects.create(
+            provider=ThirdPartyApiRequestLog.Provider.DATAFORSEO,
+            business_profile=business_profile,
+            operation=(operation or "")[:512],
+            cost_usd=cost,
+        )
+    except Exception:
+        logger.exception("record_dataforseo_request failed op=%s", operation)
+
+
+def record_openai_chat_completion(
+    *,
+    operation: str,
+    response: Any,
+    business_profile: BusinessProfile | None = None,
+) -> None:
+    try:
+        cost = None
+        model = None
+        tokens_sent: int | None = None
+        tokens_received: int | None = None
+        if response is not None:
+            model = getattr(response, "model", None)
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                pt = getattr(usage, "prompt_tokens", None)
+                ct = getattr(usage, "completion_tokens", None)
+                if pt is not None:
+                    try:
+                        tokens_sent = max(0, int(pt))
+                    except (TypeError, ValueError):
+                        tokens_sent = None
+                if ct is not None:
+                    try:
+                        tokens_received = max(0, int(ct))
+                    except (TypeError, ValueError):
+                        tokens_received = None
+                pt_d = int(pt or 0)
+                ct_d = int(ct or 0)
+                inp_m, out_m = _openai_price_per_m(model)
+                cost = (Decimal(pt_d) / Decimal(1_000_000)) * inp_m + (
+                    Decimal(ct_d) / Decimal(1_000_000)
+                ) * out_m
+        ThirdPartyApiRequestLog.objects.create(
+            provider=ThirdPartyApiRequestLog.Provider.OPENAI,
+            business_profile=effective_usage_profile(business_profile),
+            operation=(operation or "")[:512],
+            cost_usd=cost,
+            tokens_sent=tokens_sent,
+            tokens_received=tokens_received,
+        )
+    except Exception:
+        logger.exception("record_openai_chat_completion failed op=%s", operation)
+
+
+def _gemini_price_per_m() -> tuple[Decimal, Decimal]:
+    return (
+        Decimal(str(getattr(settings, "GEMINI_INPUT_USD_PER_MILLION", "0.075"))),
+        Decimal(str(getattr(settings, "GEMINI_OUTPUT_USD_PER_MILLION", "0.30"))),
+    )
+
+
+def record_gemini_request(
+    *,
+    operation: str,
+    response: Any,
+    business_profile: BusinessProfile | None = None,
+) -> None:
+    try:
+        cost = None
+        tokens_sent: int | None = None
+        tokens_received: int | None = None
+        if response is not None:
+            um = getattr(response, "usage_metadata", None)
+            if um is not None:
+                pt = getattr(um, "prompt_token_count", None)
+                ct = getattr(um, "candidates_token_count", None)
+                if pt is not None:
+                    try:
+                        tokens_sent = max(0, int(pt))
+                    except (TypeError, ValueError):
+                        tokens_sent = None
+                if ct is not None:
+                    try:
+                        tokens_received = max(0, int(ct))
+                    except (TypeError, ValueError):
+                        tokens_received = None
+                pt_d = int(pt or 0)
+                ct_d = int(ct or 0)
+                inp_m, out_m = _gemini_price_per_m()
+                cost = (Decimal(pt_d) / Decimal(1_000_000)) * inp_m + (
+                    Decimal(ct_d) / Decimal(1_000_000)
+                ) * out_m
+        ThirdPartyApiRequestLog.objects.create(
+            provider=ThirdPartyApiRequestLog.Provider.GEMINI,
+            business_profile=effective_usage_profile(business_profile),
+            operation=(operation or "")[:512],
+            cost_usd=cost,
+            tokens_sent=tokens_sent,
+            tokens_received=tokens_received,
+        )
+    except Exception:
+        logger.exception("record_gemini_request failed op=%s", operation)
+
+
+def _last_n_calendar_month_starts(n: int) -> list[tuple[int, int]]:
+    ref = timezone.localdate()
+    y, m = ref.year, ref.month
+    seq: list[tuple[int, int]] = []
+    for _ in range(n):
+        seq.append((y, m))
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    seq.reverse()
+    return seq
+
+
+def _month_label(y: int, mo: int) -> str:
+    return datetime(y, mo, 1).strftime("%b %Y")
+
+
+def build_monthly_api_usage_chart_context(
+    business_profile_id: int | None,
+    *,
+    months: int = 12,
+) -> dict[str, Any]:
+    """
+    Context for staff home chart: Chart.js datasets + labels, plus totals.
+    business_profile_id None = all profiles.
+    """
+    month_keys = _last_n_calendar_month_starts(months)
+    labels = [_month_label(y, mo) for y, mo in month_keys]
+    first_y, first_m = month_keys[0]
+    start_naive = datetime(first_y, first_m, 1, 0, 0, 0)
+    if timezone.is_naive(start_naive):
+        start_dt = timezone.make_aware(start_naive, timezone.get_current_timezone())
+    else:
+        start_dt = start_naive
+
+    qs = ThirdPartyApiRequestLog.objects.filter(created_at__gte=start_dt)
+    if business_profile_id is not None:
+        qs = qs.filter(business_profile_id=business_profile_id)
+
+    rows = (
+        qs.annotate(m=TruncMonth("created_at", tzinfo=timezone.get_current_timezone()))
+        .values("m", "provider")
+        .annotate(cnt=Count("id"), cost=Sum("cost_usd"))
+    )
+
+    # (year, month) -> provider -> {count, cost}
+    by_month_provider: dict[tuple[int, int], dict[str, dict[str, Any]]] = defaultdict(
+        lambda: defaultdict(lambda: {"count": 0, "cost": Decimal("0")})
+    )
+    for row in rows:
+        dt = row["m"]
+        if dt is None:
+            continue
+        key = (dt.year, dt.month)
+        prov = row["provider"]
+        by_month_provider[key][prov]["count"] = row["cnt"]
+        by_month_provider[key][prov]["cost"] = row["cost"] or Decimal("0")
+
+    providers = [
+        ThirdPartyApiRequestLog.Provider.DATAFORSEO,
+        ThirdPartyApiRequestLog.Provider.OPENAI,
+        ThirdPartyApiRequestLog.Provider.GEMINI,
+    ]
+    provider_labels = {
+        ThirdPartyApiRequestLog.Provider.DATAFORSEO: "DataForSEO",
+        ThirdPartyApiRequestLog.Provider.OPENAI: "OpenAI",
+        ThirdPartyApiRequestLog.Provider.GEMINI: "Gemini",
+    }
+    colors = {
+        ThirdPartyApiRequestLog.Provider.DATAFORSEO: "rgba(54, 162, 235, 0.7)",
+        ThirdPartyApiRequestLog.Provider.OPENAI: "rgba(75, 192, 192, 0.7)",
+        ThirdPartyApiRequestLog.Provider.GEMINI: "rgba(255, 159, 64, 0.7)",
+    }
+
+    count_datasets = []
+    cost_datasets = []
+    for p in providers:
+        count_data = []
+        cost_data = []
+        for y, mo in month_keys:
+            cell = by_month_provider[(y, mo)].get(p, {"count": 0, "cost": Decimal("0")})
+            count_data.append(cell["count"])
+            cost_data.append(float(cell["cost"]))
+        count_datasets.append(
+            {
+                "label": provider_labels[p],
+                "data": count_data,
+                "backgroundColor": colors[p],
+            }
+        )
+        cost_datasets.append(
+            {
+                "label": provider_labels[p],
+                "data": cost_data,
+                "backgroundColor": colors[p],
+            }
+        )
+
+    total_requests = sum(
+        by_month_provider[k][p]["count"] for k in month_keys for p in providers
+    )
+    total_cost = sum(
+        (by_month_provider[k][p]["cost"] or Decimal("0"))
+        for k in month_keys
+        for p in providers
+    )
+
+    return {
+        "api_usage_chart_labels": labels,
+        "api_usage_count_datasets": count_datasets,
+        "api_usage_cost_datasets": cost_datasets,
+        "api_usage_total_requests": total_requests,
+        "api_usage_total_cost_usd": float(total_cost),
+        "api_usage_profile_filter": business_profile_id,
+    }
+
+
+def build_monthly_token_usage_chart_context(
+    business_profile_id: int | None,
+    tokens_platform: str,
+    *,
+    months: int = 12,
+) -> dict[str, Any]:
+    """
+    Monthly sums of tokens_sent / tokens_received for staff charts.
+    ``tokens_platform``: ``all`` | ``dataforseo`` | ``openai`` | ``gemini``.
+    """
+    month_keys = _last_n_calendar_month_starts(months)
+    labels = [_month_label(y, mo) for y, mo in month_keys]
+    first_y, first_m = month_keys[0]
+    start_naive = datetime(first_y, first_m, 1, 0, 0, 0)
+    if timezone.is_naive(start_naive):
+        start_dt = timezone.make_aware(start_naive, timezone.get_current_timezone())
+    else:
+        start_dt = start_naive
+
+    qs = ThirdPartyApiRequestLog.objects.filter(created_at__gte=start_dt)
+    if business_profile_id is not None:
+        qs = qs.filter(business_profile_id=business_profile_id)
+
+    providers = [
+        ThirdPartyApiRequestLog.Provider.DATAFORSEO,
+        ThirdPartyApiRequestLog.Provider.OPENAI,
+        ThirdPartyApiRequestLog.Provider.GEMINI,
+    ]
+    provider_labels = {
+        ThirdPartyApiRequestLog.Provider.DATAFORSEO: "DataForSEO",
+        ThirdPartyApiRequestLog.Provider.OPENAI: "OpenAI",
+        ThirdPartyApiRequestLog.Provider.GEMINI: "Gemini",
+    }
+    colors = {
+        ThirdPartyApiRequestLog.Provider.DATAFORSEO: "rgba(54, 162, 235, 0.75)",
+        ThirdPartyApiRequestLog.Provider.OPENAI: "rgba(75, 192, 192, 0.75)",
+        ThirdPartyApiRequestLog.Provider.GEMINI: "rgba(255, 159, 64, 0.75)",
+    }
+
+    tp = (tokens_platform or "all").strip().lower()
+    if tp not in ("all", "dataforseo", "openai", "gemini"):
+        tp = "all"
+
+    tz = timezone.get_current_timezone()
+    zero = Value(0, output_field=IntegerField())
+
+    if tp == "all":
+        rows = (
+            qs.annotate(m=TruncMonth("created_at", tzinfo=tz))
+            .values("m", "provider")
+            .annotate(
+                sent=Coalesce(Sum("tokens_sent"), zero),
+                recv=Coalesce(Sum("tokens_received"), zero),
+            )
+        )
+        by_month_provider: dict[tuple[int, int], dict[str, dict[str, int]]] = defaultdict(dict)
+        for row in rows:
+            dt = row["m"]
+            if dt is None:
+                continue
+            key = (dt.year, dt.month)
+            prov = row["provider"]
+            by_month_provider[key][prov] = {
+                "sent": int(row["sent"] or 0),
+                "recv": int(row["recv"] or 0),
+            }
+        sent_datasets: list[dict[str, Any]] = []
+        recv_datasets: list[dict[str, Any]] = []
+        for p in providers:
+            sent_data: list[int] = []
+            recv_data: list[int] = []
+            for y, mo in month_keys:
+                cell = by_month_provider[(y, mo)].get(p, {"sent": 0, "recv": 0})
+                sent_data.append(cell["sent"])
+                recv_data.append(cell["recv"])
+            sent_datasets.append(
+                {
+                    "label": provider_labels[p],
+                    "data": sent_data,
+                    "backgroundColor": colors[p],
+                }
+            )
+            recv_datasets.append(
+                {
+                    "label": provider_labels[p],
+                    "data": recv_data,
+                    "backgroundColor": colors[p],
+                }
+            )
+    else:
+        qs = qs.filter(provider=tp)
+        rows = (
+            qs.annotate(m=TruncMonth("created_at", tzinfo=tz))
+            .values("m")
+            .annotate(
+                sent=Coalesce(Sum("tokens_sent"), zero),
+                recv=Coalesce(Sum("tokens_received"), zero),
+            )
+        )
+        by_month: dict[tuple[int, int], dict[str, int]] = {}
+        for row in rows:
+            dt = row["m"]
+            if dt is None:
+                continue
+            by_month[(dt.year, dt.month)] = {
+                "sent": int(row["sent"] or 0),
+                "recv": int(row["recv"] or 0),
+            }
+        sent_data = []
+        recv_data = []
+        for y, mo in month_keys:
+            cell = by_month.get((y, mo), {"sent": 0, "recv": 0})
+            sent_data.append(cell["sent"])
+            recv_data.append(cell["recv"])
+        prov_member = ThirdPartyApiRequestLog.Provider(tp)
+        lbl = provider_labels[prov_member]
+        col = colors[prov_member]
+        sent_datasets = [{"label": lbl, "data": sent_data, "backgroundColor": col}]
+        recv_datasets = [{"label": lbl, "data": recv_data, "backgroundColor": col}]
+
+    total_sent = sum(sum(d["data"]) for d in sent_datasets)
+    total_recv = sum(sum(d["data"]) for d in recv_datasets)
+
+    return {
+        "token_chart_labels": labels,
+        "token_sent_datasets": sent_datasets,
+        "token_recv_datasets": recv_datasets,
+        "tokens_platform_filter": tp,
+        "token_total_sent": total_sent,
+        "token_total_received": total_recv,
+    }
+
+
+def _month_range_aware(year: int, month: int) -> tuple[datetime, datetime]:
+    tz = timezone.get_current_timezone()
+    start = timezone.make_aware(datetime(year, month, 1, 0, 0, 0), tz)
+    if month == 12:
+        end = timezone.make_aware(datetime(year + 1, 1, 1, 0, 0, 0), tz)
+    else:
+        end = timezone.make_aware(datetime(year, month + 1, 1, 0, 0, 0), tz)
+    return start, end
+
+
+def _platform_chart_label(slug: str) -> str:
+    s = (slug or "").strip().lower()
+    if s == "openai":
+        return "OpenAI"
+    if s == "gemini":
+        return "Gemini"
+    return (slug or "unknown").replace("_", " ").title()
+
+
+def _visibility_pct_for_profile_month(
+    profile: BusinessProfile,
+    year: int,
+    month: int,
+    *,
+    response_platform: str | None,
+) -> float | None:
+    start, end = _month_range_aware(year, month)
+    extractions = latest_extraction_per_response_in_window(
+        profile,
+        start=start,
+        end=end,
+        response_platform=response_platform,
+    )
+    if not extractions:
+        return None
+    site = (getattr(profile, "website_url", None) or "").strip()
+    return float(calculate_visibility_score(extractions, tracked_website_url=site))
+
+
+_PLATFORM_LINE_COLORS: dict[str, str] = {
+    "openai": "rgb(16, 163, 127)",
+    "gemini": "rgb(66, 133, 244)",
+}
+
+
+def build_monthly_aeo_visibility_chart_context(
+    business_profile_id: int | None,
+    *,
+    months: int = 12,
+) -> dict[str, Any]:
+    """
+    Monthly AEO brand-visibility % from extractions tied to responses created in each month.
+
+    - **Total**: all platforms (one extraction per response row; prompts with both OpenAI and Gemini
+      count twice toward the denominator, matching ``response_platform=None`` semantics).
+    - **By platform**: separate series per ``AEOResponseSnapshot.platform`` value seen in the window.
+
+    For **all profiles**, averages visibility across up to 200 profiles that have any AEO response
+    in the chart window (keeps the staff home page responsive).
+    """
+    month_keys = _last_n_calendar_month_starts(months)
+    labels = [_month_label(y, mo) for y, mo in month_keys]
+    first_y, first_m = month_keys[0]
+    chart_start, _ = _month_range_aware(first_y, first_m)
+
+    if business_profile_id is not None:
+        profiles = list(
+            BusinessProfile.objects.filter(pk=business_profile_id).only("id", "website_url"),
+        )
+    else:
+        ids = list(
+            AEOResponseSnapshot.objects.filter(created_at__gte=chart_start)
+            .order_by("profile_id")
+            .values_list("profile_id", flat=True)
+            .distinct()[:200]
+        )
+        profiles = list(
+            BusinessProfile.objects.filter(pk__in=ids).only("id", "website_url").order_by("pk"),
+        )
+
+    platform_slugs = sorted(
+        {
+            str(p).strip().lower()
+            for p in AEOResponseSnapshot.objects.filter(created_at__gte=chart_start).values_list(
+                "platform",
+                flat=True,
+            )
+            if str(p).strip()
+        }
+    )
+    if not platform_slugs:
+        platform_slugs = ["openai", "gemini"]
+
+    total_data: list[float] = []
+    for y, mo in month_keys:
+        vals: list[float] = []
+        for p in profiles:
+            v = _visibility_pct_for_profile_month(p, y, mo, response_platform=None)
+            if v is not None:
+                vals.append(v)
+        total_data.append(round(sum(vals) / len(vals), 2) if vals else 0.0)
+
+    by_platform: list[dict[str, Any]] = []
+    for slug in platform_slugs:
+        series: list[float] = []
+        for y, mo in month_keys:
+            vals_p: list[float] = []
+            for p in profiles:
+                v = _visibility_pct_for_profile_month(p, y, mo, response_platform=slug)
+                if v is not None:
+                    vals_p.append(v)
+            series.append(round(sum(vals_p) / len(vals_p), 2) if vals_p else 0.0)
+        by_platform.append(
+            {
+                "platform": slug,
+                "label": _platform_chart_label(slug),
+                "data": series,
+                "borderColor": _PLATFORM_LINE_COLORS.get(
+                    slug,
+                    "rgb(108, 117, 125)",
+                ),
+            }
+        )
+
+    return {
+        "aeo_visibility_labels": labels,
+        "aeo_visibility_total": total_data,
+        "aeo_visibility_by_platform": by_platform,
+    }

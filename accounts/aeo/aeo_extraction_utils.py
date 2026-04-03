@@ -4,7 +4,7 @@ Phase 3: structured extraction from raw AEO answers (second-pass OpenAI JSON).
 Keeps execution (Phase 2) separate; prompt strings for extraction live in aeo_prompts.py.
 
 Optional settings:
-    AEO_EXTRACTION_PARSER_MODEL — default: same as OPENAI_MODEL / _get_model()
+    AEO_EXTRACTION_PARSER_MODEL — env; defaults to OPENAI_MODEL (see settings.base)
     AEO_EXTRACTION_TEMPERATURE — default 0.1
     AEO_EXTRACTION_MAX_TOKENS — default 800
     AEO_EXTRACTION_TIMEOUT — HTTP timeout seconds, default 60
@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 from django.conf import settings
 
 from ..models import AEOExtractionSnapshot, AEOResponseSnapshot, BusinessProfile
-from ..openai_utils import _get_client, _get_model
+from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
 from .aeo_prompts import (
     AEO_STRUCTURED_EXTRACTION_RETRY_SUFFIX,
     AEO_STRUCTURED_EXTRACTION_SYSTEM_PROMPT,
@@ -82,7 +82,9 @@ def _domain_grounds_brand(raw_text: str, website_domain: str) -> bool:
 
 
 def _extraction_model() -> str:
-    return getattr(settings, "AEO_EXTRACTION_PARSER_MODEL", None) or _get_model()
+    raw = getattr(settings, "AEO_EXTRACTION_PARSER_MODEL", "") or ""
+    s = str(raw).strip()
+    return s or _get_model()
 
 
 def _extraction_temperature() -> float:
@@ -768,10 +770,17 @@ def _parse_extraction_json(raw_text: str) -> dict[str, Any] | None:
     return obj
 
 
-def _call_extraction_openai(user_content: str) -> str:
+def _call_extraction_openai(
+    user_content: str,
+    *,
+    business_profile: BusinessProfile | None = None,
+) -> str:
     client = _extraction_openai_client()
     try:
-        completion = client.chat.completions.create(
+        completion = chat_completion_create_logged(
+            client,
+            operation="openai.chat.aeo_structured_extraction",
+            business_profile=business_profile,
             model=_extraction_model(),
             messages=[
                 {"role": "system", "content": AEO_STRUCTURED_EXTRACTION_SYSTEM_PROMPT},
@@ -835,11 +844,17 @@ def extract_aeo_response(
     parsed: dict[str, Any] | None = None
 
     try:
-        raw_llm = _call_extraction_openai(user_content)
+        raw_llm = _call_extraction_openai(
+            user_content,
+            business_profile=business_profile,
+        )
         parsed = _parse_extraction_json(raw_llm)
         if parsed is None:
             logger.warning("AEO extraction JSON parse failed; retrying once")
-            raw_llm = _call_extraction_openai(user_content + AEO_STRUCTURED_EXTRACTION_RETRY_SUFFIX)
+            raw_llm = _call_extraction_openai(
+                user_content + AEO_STRUCTURED_EXTRACTION_RETRY_SUFFIX,
+                business_profile=business_profile,
+            )
             parsed = _parse_extraction_json(raw_llm)
     except Exception as exc:
         logger.exception("AEO extraction OpenAI call failed: %s", exc)

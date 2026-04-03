@@ -80,6 +80,7 @@ def run_single_aeo_prompt_gemini(
         user_text=prompt_text,
         temperature=_execution_temperature(),
         max_output_tokens=_execution_max_tokens(),
+        business_profile=business_profile,
     )
 
     executed_at = datetime.now(timezone.utc)

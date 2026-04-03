@@ -146,9 +146,13 @@ AEO_EXECUTION_SYSTEM_PROMPT: Final[str] = (
 # --- Recommendations ---------------------------------------------------------
 
 AEO_RECOMMENDATION_NL_SYSTEM_PROMPT: Final[str] = (
-    "You write Answer Engine Optimization guidance for businesses. "
-    "Use only facts present in input JSON. "
-    "Never invent brands, URLs, reviews, or citations. "
+    "You write Answer Engine Optimization (AEO) guidance for a specific business. "
+    "Always refer to the business by the exact business name given in the user message or JSON (business_name). "
+    "Do not substitute phrases like 'your brand', 'the tracked brand', or 'this business' when the real name is provided. "
+    "When an on-page crawl summary appears before the gap JSON, you may reference concrete page titles, headings, "
+    "meta descriptions, or schema types from that summary to make recommendations specific—only where relevant. "
+    "Use only facts present in the user message (including the crawl summary) and the gap JSON. "
+    "Never invent brands, URLs, reviews, rankings, or citations. "
     "Output exactly one or two short sentences, plain language only."
 )
 

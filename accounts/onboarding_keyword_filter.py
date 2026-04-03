@@ -390,13 +390,16 @@ def _openai_chat_user_only(user_content: str, *, temperature: float, timeout: fl
     except ImportError:
         return None, "openai package not available"
     try:
-        from .openai_utils import _get_client, _get_model
+        from .openai_utils import _get_client, _get_model, chat_completion_create_logged
     except Exception as exc:
         return None, str(exc)
     client = _get_client()
     model = _get_model()
     try:
-        completion = client.chat.completions.create(
+        completion = chat_completion_create_logged(
+            client,
+            operation="openai.chat.onboarding_aeo_keyword_filter",
+            business_profile=None,
             model=model,
             messages=[{"role": "user", "content": user_content}],
             temperature=temperature,

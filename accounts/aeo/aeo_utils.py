@@ -20,7 +20,7 @@ from ..models import BusinessProfile
 
 # Onboarding / tracking: exactly this many prompts in combined output and saved profile lists.
 AEO_ONBOARDING_PROMPT_COUNT: Final[int] = 50
-from ..openai_utils import _get_client, _get_model
+from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
 from .aeo_prompts import (
     AEOPromptType,
     AEOPromptTemplateSpec,
@@ -499,6 +499,7 @@ def run_prompt_batch_via_openai(
     api_key_env: str = "OPEN_AI_SEO_API_KEY",
     model: str | None = None,
     onboarding_topic_details: Sequence[Mapping[str, Any]] | None = None,
+    business_profile: BusinessProfile | None = None,
 ) -> list[dict[str, Any]]:
     """
     Ask OpenAI for additional prompts; returns normalized JSON-ready dicts.
@@ -516,7 +517,10 @@ def run_prompt_batch_via_openai(
 
     try:
         client = _get_client(api_key_env)
-        completion = client.chat.completions.create(
+        completion = chat_completion_create_logged(
+            client,
+            operation="openai.chat.aeo_prompt_batch",
+            business_profile=business_profile,
             model=use_model,
             messages=[
                 {"role": "system", "content": sys_p},
@@ -524,7 +528,7 @@ def run_prompt_batch_via_openai(
             ],
             temperature=0.2,
             top_p=0.9,
-            max_tokens=500
+            max_tokens=500,
         )
         raw = (completion.choices[0].message.content or "").strip()
     except Exception:
@@ -565,7 +569,7 @@ def prepare_structured_extraction_input(
         "raw_completion": raw_completion,
         "parsed_prompts": parsed,
         "business": business.as_dict() if business else None,
-        "openai_model": getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
+        "openai_model": _get_model(),
     }
 
 
@@ -679,6 +683,7 @@ def build_full_aeo_prompt_plan(
                 max_additional=req,
                 system_prompt=type_prompts[prompt_type],
                 onboarding_topic_details=onboarding_topic_details,
+                business_profile=profile,
             )
             rounds += 1
             typed = _typed_batch(batch, prompt_type)
@@ -707,6 +712,7 @@ def build_full_aeo_prompt_plan(
                 max_additional=req,
                 system_prompt=type_prompts[prompt_type],
                 onboarding_topic_details=onboarding_topic_details,
+                business_profile=profile,
             )
             typed = _typed_batch(batch, prompt_type)
             if not typed:

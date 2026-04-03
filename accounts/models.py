@@ -932,3 +932,59 @@ class AgentActivityLog(models.Model):
         return f"AgentActivityLog(user={self.user!s}, agent={self.agent}, at={self.created_at})"
 
 
+class ThirdPartyApiRequestLog(models.Model):
+    """
+    One row per outbound call to DataForSEO, OpenAI, or Gemini (for usage graphs and cost tracking).
+    """
+
+    class Provider(models.TextChoices):
+        DATAFORSEO = "dataforseo", "DataForSEO"
+        OPENAI = "openai", "OpenAI"
+        GEMINI = "gemini", "Google Gemini"
+
+    provider = models.CharField(max_length=32, choices=Provider.choices, db_index=True)
+    business_profile = models.ForeignKey(
+        BusinessProfile,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="third_party_api_logs",
+    )
+    operation = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="Endpoint or logical operation name (e.g. DataForSEO path, openai.chat operation).",
+    )
+    cost_usd = models.DecimalField(
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+        help_text="Provider-reported or estimated cost in USD.",
+    )
+    tokens_sent = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Input/prompt tokens (OpenAI/Gemini); null for providers without token usage.",
+    )
+    tokens_received = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Output/completion tokens (OpenAI/Gemini); null for providers without token usage.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Third-party API request"
+        verbose_name_plural = "Third-party API requests"
+        indexes = [
+            models.Index(fields=["provider", "created_at"]),
+            models.Index(fields=["business_profile", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.provider} {self.operation[:40]!r} @ {self.created_at}"
+
+

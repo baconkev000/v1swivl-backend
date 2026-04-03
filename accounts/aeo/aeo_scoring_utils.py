@@ -13,6 +13,7 @@ every platform (e.g. custom reporting).
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 from typing import Any, Protocol, Sequence
 
 from django.db.models import Prefetch
@@ -533,6 +534,37 @@ def latest_extraction_per_response(
             ),
         ),
     ).all()
+    for resp in responses:
+        chosen = _pick_extraction_for_response(resp)
+        if chosen is not None:
+            out.append(chosen)
+    return out
+
+
+def latest_extraction_per_response_in_window(
+    business_profile: BusinessProfile,
+    *,
+    start: datetime,
+    end: datetime,
+    response_platform: str | None,
+) -> list[AEOExtractionSnapshot]:
+    """
+    Like ``latest_extraction_per_response``, but only ``AEOResponseSnapshot`` rows with
+    ``created_at`` in ``[start, end)`` (half-open). Used for monthly AEO visibility trends.
+    """
+    rsp_qs = business_profile.aeo_response_snapshots.filter(
+        created_at__gte=start,
+        created_at__lt=end,
+    )
+    if response_platform is not None:
+        rsp_qs = rsp_qs.filter(platform=response_platform)
+    responses = rsp_qs.prefetch_related(
+        Prefetch(
+            "extraction_snapshots",
+            queryset=AEOExtractionSnapshot.objects.order_by("-created_at"),
+        ),
+    ).order_by("id")
+    out: list[AEOExtractionSnapshot] = []
     for resp in responses:
         chosen = _pick_extraction_for_response(resp)
         if chosen is not None:

@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 import requests
 from django.conf import settings
 
-from .models import OnPageAuditSnapshot
+from .models import BusinessProfile, OnPageAuditSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,12 @@ def _get_auth() -> Optional[tuple[str, str]]:
     return str(login), str(password)
 
 
-def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _post(
+    path: str,
+    payload: List[Dict[str, Any]],
+    *,
+    business_profile: BusinessProfile | None = None,
+) -> Optional[Dict[str, Any]]:
     auth = _get_auth()
     if auth is None:
         return None
@@ -59,6 +64,13 @@ def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         logger.warning("[OnPageAudit] POST %s returned non-JSON body.", path)
         return None
 
+    from accounts.third_party_usage import record_dataforseo_request
+
+    record_dataforseo_request(
+        operation=path,
+        response_json=data,
+        business_profile=business_profile,
+    )
     return data
 
 

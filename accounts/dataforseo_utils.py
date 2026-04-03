@@ -682,7 +682,12 @@ def _get_search_volumes_for_keywords(
         return {}
 
 
-def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _post(
+    path: str,
+    payload: List[Dict[str, Any]],
+    *,
+    business_profile: Optional[BusinessProfile] = None,
+) -> Optional[Dict[str, Any]]:
     """Low-level POST helper with basic error handling."""
     auth = _get_auth()
     if auth is None:
@@ -715,6 +720,22 @@ def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         # #endregion
         return None
 
+    parsed_json: Optional[Dict[str, Any]] = None
+    if resp.content:
+        try:
+            parsed_json = resp.json()
+        except ValueError:
+            parsed_json = None
+
+    operation_label = path if resp.status_code == 200 else f"{path} HTTP {resp.status_code}"
+    from accounts.third_party_usage import effective_usage_profile, record_dataforseo_request
+
+    record_dataforseo_request(
+        operation=operation_label,
+        response_json=parsed_json,
+        business_profile=effective_usage_profile(business_profile),
+    )
+
     if resp.status_code != 200:
         # DataForSEO returns 200 with status_code inside body for logical errors;
         # non-200 here is a transport-level issue.
@@ -745,9 +766,7 @@ def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         # #endregion
         return None
 
-    try:
-        data = resp.json()
-    except ValueError:  # pragma: no cover - unexpected non-JSON
+    if parsed_json is None:
         logger.warning("[DataForSEO] POST %s returned non-JSON body.", path)
         # #region agent log
         try:
@@ -766,6 +785,7 @@ def _post(path: str, payload: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         # #endregion
         return None
 
+    data = parsed_json
     # DataForSEO wraps results in tasks / result; callers will unpack further.
     # #region agent log
     try:
@@ -1376,6 +1396,7 @@ def _crawl_pages_for_aeo(
     max_pages: int = 20,
     crawl_scope: Optional[str] = None,
     timeout_seconds: int = 120,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, Any]:
     """
     Crawl site pages via DataForSEO On-Page API with bounded polling.
@@ -1433,6 +1454,7 @@ def _crawl_pages_for_aeo(
                     "enable_javascript": True,
                 },
             ],
+            business_profile=business_profile,
         )
         if not task_data:
             cache.delete(lock_key)
@@ -1473,6 +1495,7 @@ def _crawl_pages_for_aeo(
                     "offset": 0,
                 },
             ],
+            business_profile=business_profile,
         )
         if not pages_data:
             return {"pages": [], "aeo_status": "error", "exit_reason": "api_error", "task_id": task_id}
@@ -2125,6 +2148,9 @@ def get_aeo_content_readiness_for_site(
         "aeo_score": 0,
     }
     try:
+        usage_profile: Optional[BusinessProfile] = None
+        if profile_id:
+            usage_profile = BusinessProfile.objects.filter(pk=profile_id).first()
         normalized_domain = normalize_domain(target_domain) if target_domain else ""
         normalized_niche = (niche or "").strip().lower()
         cache_seed = (cache_key_seed or "").strip().lower()
@@ -2170,6 +2196,7 @@ def get_aeo_content_readiness_for_site(
             max_pages=20,
             crawl_scope=cache_seed or f"profile:{profile_id or 'unknown'}",
             timeout_seconds=120,
+            business_profile=usage_profile,
         )
         if isinstance(crawl_result, list):
             pages = list(crawl_result)
@@ -4254,112 +4281,119 @@ def get_or_refresh_seo_score_for_user(
         data={"domain": domain},
         runId="pre-fix",
     )
-    items = fetch_ranked_keyword_items(domain, ranking_location_code, language_code, user)
-    if not items:
-        # #region agent log
-        _debug.log(
-            "dataforseo_utils.py:get_or_refresh_seo_score_for_user:empty_items_zero_fallback",
-            "No ranked keyword items; returning zero SEO response",
-            {"user_id": getattr(user, "id", None), "domain": domain},
-            "S5",
-        )
-        # #endregion
-        return _build_empty_seo_response(
-            user,
-            site_url,
-            seo_metrics_location_mode=location_mode,
-            seo_location_label=location_label,
-        )
 
-    metrics = compute_ranked_metrics(items)
-    # Ranked-only keywords for sync path: no gap/LLM enrichment here (done in background).
-    top_keywords_ranked = sorted(
-        metrics["top_keywords"],
-        key=lambda x: x.get("search_volume", 0),
-        reverse=True,
-    )[:20]
+    from accounts.third_party_usage import usage_profile_context
 
-    agg = normalize_seo_snapshot_metrics(
-        recompute_snapshot_metrics_from_keywords(
-            top_keywords=top_keywords_ranked,
-            domain=domain,
-            location_code=int(ranking_location_code),
-            language_code=language_code,
-            seo_location_mode=location_mode,
-        )
-    )
-    affects_miss = False
-    if location_mode == "local":
-        baseline_agg = normalize_seo_snapshot_metrics(
+    def _live_seo_refresh_branch() -> Dict[str, Any] | None:
+        items = fetch_ranked_keyword_items(domain, ranking_location_code, language_code, user)
+        if not items:
+            # #region agent log
+            _debug.log(
+                "dataforseo_utils.py:get_or_refresh_seo_score_for_user:empty_items_zero_fallback",
+                "No ranked keyword items; returning zero SEO response",
+                {"user_id": getattr(user, "id", None), "domain": domain},
+                "S5",
+            )
+            # #endregion
+            return _build_empty_seo_response(
+                user,
+                site_url,
+                seo_metrics_location_mode=location_mode,
+                seo_location_label=location_label,
+            )
+
+        metrics = compute_ranked_metrics(items)
+        # Ranked-only keywords for sync path: no gap/LLM enrichment here (done in background).
+        top_keywords_ranked = sorted(
+            metrics["top_keywords"],
+            key=lambda x: x.get("search_volume", 0),
+            reverse=True,
+        )[:20]
+
+        agg = normalize_seo_snapshot_metrics(
             recompute_snapshot_metrics_from_keywords(
                 top_keywords=top_keywords_ranked,
                 domain=domain,
                 location_code=int(ranking_location_code),
                 language_code=language_code,
-                seo_location_mode="organic",
+                seo_location_mode=location_mode,
             )
         )
-        affects_miss = local_verification_affects_visibility(
-            seo_location_mode=location_mode,
-            baseline_metrics=baseline_agg,
-            local_mode_metrics=agg,
+        affects_miss = False
+        if location_mode == "local":
+            baseline_agg = normalize_seo_snapshot_metrics(
+                recompute_snapshot_metrics_from_keywords(
+                    top_keywords=top_keywords_ranked,
+                    domain=domain,
+                    location_code=int(ranking_location_code),
+                    language_code=language_code,
+                    seo_location_mode="organic",
+                )
+            )
+            affects_miss = local_verification_affects_visibility(
+                seo_location_mode=location_mode,
+                baseline_metrics=baseline_agg,
+                local_mode_metrics=agg,
+            )
+
+        snapshot = save_seo_snapshot(
+            user, start_current, domain, now_utc,
+            organic_visitors=int(agg["estimated_traffic"] or 0),
+            keywords_ranking=int(agg["keywords_ranking"] or 0),
+            top3_positions=int(agg["top3_positions"] or 0),
+            top_keywords_sorted=top_keywords_ranked,
+            total_search_volume=int(agg["total_search_volume"] or 0),
+            estimated_search_appearances_monthly=int(agg["estimated_search_appearances_monthly"] or 0),
+            missed_searches_monthly=int(agg["missed_searches_monthly"] or 0),
+            search_visibility_percent=int(agg["search_visibility_percent"] or 0),
+            search_performance_score=int(agg["search_performance_score"] or 0),
+            cached_location_mode=location_mode,
+            cached_location_code=snapshot_location_code,
+            cached_location_label=location_label,
+            local_verification_applied=any(
+                str((row or {}).get("rank_source") or "baseline") == "local_verified"
+                for row in (top_keywords_ranked or [])
+            ),
+            local_verified_keyword_count=sum(
+                1
+                for row in (top_keywords_ranked or [])
+                if (row or {}).get("local_verified_rank") is not None
+            ),
         )
 
-    snapshot = save_seo_snapshot(
-        user, start_current, domain, now_utc,
-        organic_visitors=int(agg["estimated_traffic"] or 0),
-        keywords_ranking=int(agg["keywords_ranking"] or 0),
-        top3_positions=int(agg["top3_positions"] or 0),
-        top_keywords_sorted=top_keywords_ranked,
-        total_search_volume=int(agg["total_search_volume"] or 0),
-        estimated_search_appearances_monthly=int(agg["estimated_search_appearances_monthly"] or 0),
-        missed_searches_monthly=int(agg["missed_searches_monthly"] or 0),
-        search_visibility_percent=int(agg["search_visibility_percent"] or 0),
-        search_performance_score=int(agg["search_performance_score"] or 0),
-        cached_location_mode=location_mode,
-        cached_location_code=snapshot_location_code,
-        cached_location_label=location_label,
-        local_verification_applied=any(
-            str((row or {}).get("rank_source") or "baseline") == "local_verified"
-            for row in (top_keywords_ranked or [])
-        ),
-        local_verified_keyword_count=sum(
-            1
-            for row in (top_keywords_ranked or [])
-            if (row or {}).get("local_verified_rank") is not None
-        ),
-    )
+        if snapshot:
+            try:
+                from .tasks import (
+                    enrich_snapshot_keywords_task,
+                    generate_snapshot_next_steps_task,
+                    generate_keyword_action_suggestions_task,
+                )
+                enrich_snapshot_keywords_task.delay(snapshot.id)
+                generate_snapshot_next_steps_task.delay(snapshot.id)
+                generate_keyword_action_suggestions_task.delay(snapshot.id)
+            except Exception as e:
+                logger.warning("[SEO score] Could not enqueue enrichment tasks: %s", e)
 
-    if snapshot:
-        try:
-            from .tasks import (
-                enrich_snapshot_keywords_task,
-                generate_snapshot_next_steps_task,
-                generate_keyword_action_suggestions_task,
-            )
-            enrich_snapshot_keywords_task.delay(snapshot.id)
-            generate_snapshot_next_steps_task.delay(snapshot.id)
-            generate_keyword_action_suggestions_task.delay(snapshot.id)
-        except Exception as e:
-            logger.warning("[SEO score] Could not enqueue enrichment tasks: %s", e)
+        return build_seo_response(
+            search_performance_score=int(agg["search_performance_score"] or 0),
+            organic_visitors=int(agg["estimated_traffic"] or 0),
+            total_search_volume=int(agg["total_search_volume"] or 0),
+            estimated_search_appearances_monthly=int(agg.get("estimated_search_appearances_monthly") or 0),
+            keywords_ranking=int(agg["keywords_ranking"] or 0),
+            top3_positions=int(agg["top3_positions"] or 0),
+            search_visibility_percent=int(agg["search_visibility_percent"] or 0),
+            missed_searches_monthly=int(agg["missed_searches_monthly"] or 0),
+            top_keywords=top_keywords_ranked,
+            seo_next_steps=[],
+            enrichment_status="pending",
+            seo_metrics_location_mode=str(location_mode or "organic"),
+            seo_location_label=str(location_label or ""),
+            local_verified_keyword_count=sum(
+                1 for row in (top_keywords_ranked or []) if (row or {}).get("local_verified_rank") is not None
+            ),
+            local_verification_affects_visibility=affects_miss,
+        )
 
-    return build_seo_response(
-        search_performance_score=int(agg["search_performance_score"] or 0),
-        organic_visitors=int(agg["estimated_traffic"] or 0),
-        total_search_volume=int(agg["total_search_volume"] or 0),
-        estimated_search_appearances_monthly=int(agg.get("estimated_search_appearances_monthly") or 0),
-        keywords_ranking=int(agg["keywords_ranking"] or 0),
-        top3_positions=int(agg["top3_positions"] or 0),
-        search_visibility_percent=int(agg["search_visibility_percent"] or 0),
-        missed_searches_monthly=int(agg["missed_searches_monthly"] or 0),
-        top_keywords=top_keywords_ranked,
-        seo_next_steps=[],
-        enrichment_status="pending",
-        seo_metrics_location_mode=str(location_mode or "organic"),
-        seo_location_label=str(location_label or ""),
-        local_verified_keyword_count=sum(
-            1 for row in (top_keywords_ranked or []) if (row or {}).get("local_verified_rank") is not None
-        ),
-        local_verification_affects_visibility=affects_miss,
-    )
+    with usage_profile_context(profile):
+        return _live_seo_refresh_branch()
 

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import Counter
 from typing import Any
+from urllib.parse import urlparse
 
 from django.conf import settings
 
@@ -20,8 +22,9 @@ from ..models import (
     AEORecommendationRun,
     AEOScoreSnapshot,
     BusinessProfile,
+    OnboardingOnPageCrawl,
 )
-from ..openai_utils import _get_client, _get_model
+from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
 from .aeo_extraction_utils import brand_effectively_cited
 from .aeo_prompts import AEO_RECOMMENDATION_NL_SYSTEM_PROMPT
 from .aeo_scoring_utils import (
@@ -35,6 +38,160 @@ from .aeo_utils import infer_city_from_address
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
+
+# Country / macro-region strings that are too vague alone for AEO locality copy
+_VAGUE_LOCALITY_ONLY: frozenset[str] = frozenset(
+    {
+        "united states",
+        "usa",
+        "us",
+        "u.s.",
+        "u.s.a.",
+        "united kingdom",
+        "uk",
+        "great britain",
+        "canada",
+        "australia",
+        "new zealand",
+        "europe",
+        "worldwide",
+        "global",
+    }
+)
+
+
+def _short_website_domain(profile: BusinessProfile) -> str:
+    raw = (getattr(profile, "website_url", None) or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        host = (urlparse(raw).netloc or "").strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
+def _competitor_display_names(competitors: list[Any] | None, *, limit: int = 16) -> list[str]:
+    """
+    Turn extraction competitor entries into short display strings (name or url), never ``str(dict)``.
+    """
+    out: list[str] = []
+    if not competitors or not isinstance(competitors, list):
+        return out
+    seen: set[str] = set()
+    for c in competitors:
+        if len(out) >= limit:
+            break
+        label = ""
+        if isinstance(c, dict):
+            name = str(c.get("name") or c.get("competitor") or "").strip()
+            url = str(c.get("url") or c.get("domain") or "").strip()
+            label = name or url
+        elif c is not None:
+            s = str(c).strip()
+            if s.startswith("{") and "}" in s:
+                continue
+            label = s
+        if not label:
+            continue
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(label[:120])
+    return out
+
+
+def _region_label_for_profile(profile: BusinessProfile, city: str) -> str:
+    """
+    Human-readable locality for copy. Avoid using bare country names (e.g. only ``United States``)
+    when we have no city—prefer industry or domain-scoped phrasing.
+    """
+    c = (city or "").strip()
+    if c and c.lower() in _VAGUE_LOCALITY_ONLY:
+        c = ""
+    if c:
+        return c
+    addr = (profile.business_address or "").strip()
+    if addr:
+        parts = [p.strip() for p in addr.split(",") if p.strip()]
+        if len(parts) == 1 and parts[0].lower() in _VAGUE_LOCALITY_ONLY:
+            pass
+        else:
+            alt = infer_city_from_address(addr)
+            if alt and alt.lower() not in _VAGUE_LOCALITY_ONLY:
+                return alt
+    industry = (profile.industry or "").strip()
+    if industry:
+        return f"the {industry} market"
+    dom = _short_website_domain(profile)
+    if dom:
+        return f"searchers evaluating offerings like yours ({dom})"
+    return "your market"
+
+
+def _latest_completed_onboarding_crawl(profile: BusinessProfile) -> OnboardingOnPageCrawl | None:
+    return (
+        OnboardingOnPageCrawl.objects.filter(
+            business_profile=profile,
+            status=OnboardingOnPageCrawl.STATUS_COMPLETED,
+        )
+        .order_by("-created_at", "-id")
+        .first()
+    )
+
+
+def _build_onpage_crawl_summary(crawl: OnboardingOnPageCrawl | None) -> str:
+    """
+    Compact text for NL enrichment: topic seeds plus first few crawled pages (title, h1, meta, schema).
+    """
+    if crawl is None:
+        return ""
+    parts: list[str] = []
+    seeds = crawl.crawl_topic_seeds or []
+    if isinstance(seeds, list) and seeds:
+        labels: list[str] = []
+        for s in seeds[:10]:
+            if isinstance(s, dict):
+                lab = str(s.get("label") or "").strip()
+                if lab:
+                    labels.append(lab[:100])
+            elif isinstance(s, str) and s.strip():
+                labels.append(s.strip()[:100])
+        if labels:
+            dedup = list(dict.fromkeys(labels))[:8]
+            parts.append("Topic seeds: " + "; ".join(dedup))
+    pages = crawl.pages if isinstance(crawl.pages, list) else []
+    for p in pages[:4]:
+        if not isinstance(p, dict):
+            continue
+        title = str(p.get("page_title") or "").strip()[:80]
+        h1 = str(p.get("h1") or "").strip()[:80]
+        md = str(p.get("meta_description") or "").strip()
+        md = re.sub(r"\s+", " ", md)[:140].rstrip()
+        st = p.get("schema_types") or []
+        st_str = ""
+        if isinstance(st, list):
+            st_str = ", ".join(str(x) for x in st[:10] if str(x).strip())
+        bits: list[str] = []
+        if title:
+            bits.append(f"title «{title}»")
+        if h1 and h1.lower() != title.lower():
+            bits.append(f"h1 «{h1}»")
+        if md:
+            bits.append(f"meta «{md}»")
+        if st_str:
+            bits.append(f"schema [{st_str}]")
+        if not bits:
+            continue
+        url = str(p.get("url") or "")[:72]
+        prefix = f"{url}: " if url else ""
+        parts.append(prefix + " | ".join(bits))
+    return "\n".join(parts)[:8000]
 
 
 def _priority_from_scores(visibility: float, citation_share: float) -> str:
@@ -184,11 +341,16 @@ def _recommendation_nl_enrichment(
     Context merged into gap dicts for NL templates and OpenAI; keeps guidance reusable and local-aware.
     """
     city = infer_city_from_address(profile.business_address or "")
+    region_label = _region_label_for_profile(profile, city)
+    crawl = _latest_completed_onboarding_crawl(profile)
+    onpage_summary = _build_onpage_crawl_summary(crawl)
     out: dict[str, Any] = {
         "business_name": (profile.business_name or "").strip(),
         "city": city,
+        "region_label": region_label,
         "industry": (profile.industry or "").strip(),
         "services": "",  # placeholder when profile gains structured services
+        "onpage_crawl_summary": onpage_summary,
     }
     if score is not None:
         comps = _top_competitors_from_score(score, limit=5)
@@ -197,7 +359,11 @@ def _recommendation_nl_enrichment(
     return out
 
 
-def generate_natural_language_recommendation(gap_object: dict[str, Any]) -> str:
+def generate_natural_language_recommendation(
+    gap_object: dict[str, Any],
+    *,
+    business_profile: BusinessProfile | None = None,
+) -> str:
     """
     Short human-readable line for a gap. Uses OpenAI only when
     settings.AEO_RECOMMENDATION_USE_OPENAI is true; otherwise template-based.
@@ -205,7 +371,7 @@ def generate_natural_language_recommendation(gap_object: dict[str, Any]) -> str:
     use_llm = bool(getattr(settings, "AEO_RECOMMENDATION_USE_OPENAI", False))
     if use_llm:
         try:
-            return _nl_via_openai(gap_object)
+            return _nl_via_openai(gap_object, business_profile=business_profile)
         except Exception as exc:
             logger.warning("AEO recommendation NL OpenAI failed: %s", exc)
     return _nl_template_with_kinds(gap_object)
@@ -224,7 +390,7 @@ def _nl_template_no_gap(gap: dict[str, Any]) -> str:
         cite = float(gap.get("citation_share") or 0)
     except (TypeError, ValueError):
         vis, cite = 0.0, 0.0
-    location = (gap.get("city") or "").strip() or "your area"
+    location = (gap.get("region_label") or gap.get("city") or "").strip() or "your area"
     bn = (gap.get("business_name") or "").strip() or "your business"
     return (
         f"No single prompt gap fired on the latest run; visibility is about {vis:.0f}% and citation-style "
@@ -234,10 +400,9 @@ def _nl_template_no_gap(gap: dict[str, Any]) -> str:
 
 
 def _nl_context_labels(gap: dict[str, Any]) -> tuple[str, str, str, str]:
-    """(business_name, city, industry, services) with safe defaults for templates."""
+    """(business_name, region, industry, services) with safe defaults for templates."""
     bn = (gap.get("business_name") or "").strip() or "your business"
-    city = (gap.get("city") or "").strip() or ""
-    region = city if city else "your market"
+    region = (gap.get("region_label") or "").strip() or (gap.get("city") or "").strip() or "your market"
     industry = (gap.get("industry") or "").strip()
     services = (gap.get("services") or "").strip()
     return bn, region, industry, services
@@ -254,7 +419,7 @@ def _nl_template(gap: dict[str, Any]) -> str:
         if len(prompt) > 140:
             prompt = prompt[:137].rstrip() + "…"
         comps = gap.get("competitors_in_answer") or []
-        comp_str = ", ".join(str(c).strip() for c in comps[:3] if c and str(c).strip())
+        comp_str = ", ".join(_competitor_display_names(comps if isinstance(comps, list) else [], limit=8)[:3])
         if comp_str:
             return (
                 f"For “{prompt}”{ind_suffix}, modeled answers in {region} already name {comp_str}; tighten FAQs, "
@@ -307,17 +472,49 @@ def _nl_template(gap: dict[str, Any]) -> str:
     )
 
 
-def _nl_via_openai(gap_object: dict[str, Any]) -> str:
+def _nl_via_openai(
+    gap_object: dict[str, Any],
+    *,
+    business_profile: BusinessProfile | None = None,
+) -> str:
     api_env = getattr(settings, "AEO_RECOMMENDATION_API_KEY_ENV", DEFAULT_API_KEY_ENV)
     client = _get_client(api_env)
-    payload = json.dumps(gap_object, ensure_ascii=False, default=str)[:6000]
+    bn = (gap_object.get("business_name") or "").strip()
+    if not bn and business_profile is not None:
+        bn = (business_profile.business_name or "").strip()
+    region = (gap_object.get("region_label") or gap_object.get("city") or "").strip()
+    crawl_text = (gap_object.get("onpage_crawl_summary") or "").strip()
+    pre_parts: list[str] = []
+    if bn:
+        pre_parts.append(
+            f"Business name (refer to this business using this exact name): {bn}.",
+        )
+    if region:
+        pre_parts.append(f"Locality / market label for messaging: {region}.")
+    if crawl_text:
+        pre_parts.append(
+            "On-page crawl summary (latest completed onboarding crawl; use only facts below when relevant):",
+        )
+        pre_parts.append(crawl_text[:3500])
+    prefix = "\n".join(pre_parts)
+    if prefix:
+        prefix = prefix + "\n\n---\n\n"
+    gap_for_json = dict(gap_object)
+    if crawl_text:
+        gap_for_json.pop("onpage_crawl_summary", None)
+    payload = json.dumps(gap_for_json, ensure_ascii=False, default=str)[:6000]
     user_msg = (
-        "Gap object (JSON). Write one or two sentences of actionable AEO guidance for the business. "
-        "Respect gap_kind; use city/region and industry when present; use business_name and any competitor "
-        "names only as given. Do not invent sites or brands. Prioritize visibility misses and low citation share.\n\n"
+        prefix
+        + "Gap object (JSON). Write one or two sentences of actionable AEO guidance. "
+        "Respect gap_kind; use region and industry when present; use business_name and competitor "
+        "names only as given in the JSON. Do not invent sites or brands. Prioritize visibility misses "
+        "and low citation share.\n\n"
         + payload
     )
-    completion = client.chat.completions.create(
+    completion = chat_completion_create_logged(
+        client,
+        operation="openai.chat.aeo_recommendation_nl",
+        business_profile=business_profile,
         model=_get_model(),
         messages=[
             {"role": "system", "content": AEO_RECOMMENDATION_NL_SYSTEM_PROMPT},
@@ -339,19 +536,20 @@ def _build_create_content_recommendation(
     business_profile: BusinessProfile,
 ) -> dict[str, Any]:
     city = infer_city_from_address(business_profile.business_address or "")
-    region = city or "your market"
+    region = _region_label_for_profile(business_profile, city)
+    bn = (business_profile.business_name or "").strip() or "This business"
     industry = (business_profile.industry or "").strip()
     ind_bit = f" ({industry})" if industry else ""
     prompt_display = gap.get("prompt_text") or ""
     reason = (
-        f"Visibility gap: the tracked brand was not mentioned in the captured answer for this query{ind_bit}. "
+        f"Visibility gap: {bn} was not mentioned in the captured answer for this query{ind_bit}. "
         f"Improve content, entity consistency, and local relevance for {region} so transactional and trust queries "
-        f"can surface the business alongside named alternatives."
+        f"can surface {bn} alongside named alternatives."
     )
     if score is not None and score.visibility_score < 20:
-        reason += f" Overall visibility score is {score.visibility_score:.1f}% (high priority)."
+        reason += f" Overall visibility score for {bn} is {score.visibility_score:.1f}% (high priority)."
     elif score is not None:
-        reason += f" Snapshot visibility score: {score.visibility_score:.1f}%."
+        reason += f" Snapshot visibility score for {bn}: {score.visibility_score:.1f}%."
     comps = gap.get("competitors_in_answer") or []
     return {
         "action_type": "create_content",
@@ -373,6 +571,7 @@ def _build_acquire_citation_recommendation(
     *,
     score: AEOScoreSnapshot | None,
     priority: str,
+    business_profile: BusinessProfile,
 ) -> dict[str, Any]:
     dom = gap.get("source_domain")
     try:
@@ -380,18 +579,19 @@ def _build_acquire_citation_recommendation(
     except (TypeError, ValueError):
         cite = 0.0
     comp = gap.get("top_competitor_hint")
+    bn = (business_profile.business_name or "").strip() or "This business"
     if dom:
         reason = (
             f"Citation gap: modeled citation-style share is {cite:.1f}%; earn verifiable mentions on {dom} "
-            f"and comparable authoritative domains so answer engines can cite your brand."
+            f"and comparable authoritative domains so answer engines can cite {bn}."
         )
     else:
         reason = (
             f"Citation gap: modeled citation-style share is {cite:.1f}%; pursue trusted third-party listings, "
-            f"profiles, and editorial references your category relies on for AI answers."
+            f"profiles, and editorial references your category relies on so models can cite {bn} in AI answers."
         )
     if comp:
-        reason += f" Recent answers often name {comp}—mirror the citation patterns those sources reward."
+        reason += f" Recent answers often name {comp}—mirror the citation patterns those sources reward so {bn} is included."
     rec: dict[str, Any] = {
         "action_type": "acquire_citation",
         "reason": reason,
@@ -469,20 +669,32 @@ def generate_aeo_recommendations(
             business_profile=business_profile,
         )
         if enrich_with_nl:
-            rec["nl_explanation"] = generate_natural_language_recommendation({**gap, **nl_ctx})
+            rec["nl_explanation"] = generate_natural_language_recommendation(
+                {**gap, **nl_ctx},
+                business_profile=business_profile,
+            )
         recommendations.append(rec)
 
     for gap in cite_gaps:
-        rec = _build_acquire_citation_recommendation(gap, score=score, priority=priority)
+        rec = _build_acquire_citation_recommendation(
+            gap,
+            score=score,
+            priority=priority,
+            business_profile=business_profile,
+        )
         if enrich_with_nl:
-            rec["nl_explanation"] = generate_natural_language_recommendation({**gap, **nl_ctx})
+            rec["nl_explanation"] = generate_natural_language_recommendation(
+                {**gap, **nl_ctx},
+                business_profile=business_profile,
+            )
         recommendations.append(rec)
 
     if not recommendations:
+        bn = (business_profile.business_name or "").strip() or "This business"
         low_rec = {
             "action_type": "review_visibility",
             "reason": (
-                f"No prompt-level visibility or citation gaps were flagged on this pass; headline scores are "
+                f"No prompt-level visibility or citation gaps were flagged on this pass for {bn}; headline scores are "
                 f"visibility {visibility:.1f}% and citation-style share {citation:.1f}%. Re-run after content or "
                 f"off-site citation updates so regressions surface early."
             ),
@@ -501,7 +713,8 @@ def generate_aeo_recommendations(
                     "visibility": visibility,
                     "citation_share": citation,
                     **nl_ctx,
-                }
+                },
+                business_profile=business_profile,
             )
         recommendations.append(low_rec)
 
