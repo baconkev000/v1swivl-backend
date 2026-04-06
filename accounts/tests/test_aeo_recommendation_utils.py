@@ -4,6 +4,7 @@ import pytest
 
 from accounts.aeo.aeo_recommendation_utils import (
     _build_onpage_crawl_summary,
+    _build_sanitized_nl_signals,
     _competitor_display_names,
     _region_label_for_profile,
 )
@@ -33,6 +34,36 @@ def test_region_label_avoids_bare_united_states():
 def test_region_label_uses_city_when_specific():
     p = SimpleNamespace(business_address="", industry="", website_url="")
     assert _region_label_for_profile(p, "Austin, TX") == "Austin, TX"
+
+
+def test_sanitized_nl_signals_omits_reason_and_nl_explanation():
+    raw = {
+        "gap_kind": "visibility_miss",
+        "prompt_text": "Best dentist?",
+        "business_name": "Smile Co",
+        "region_label": "Austin, TX",
+        "onpage_crawl_summary": "Topic seeds: cleaning",
+        "competitors_in_answer": [{"name": "Acme", "url": "x.com"}],
+        "reason": "Visibility gap: long generic text",
+        "nl_explanation": "Old NL",
+        "score": {"visibility_pct": 12.0, "citation_share_pct": 8.0},
+        "action_type": "create_content",
+    }
+    s = _build_sanitized_nl_signals(raw)
+    assert set(s.keys()) == {
+        "prompt",
+        "action_type",
+        "competitors",
+        "business_name",
+        "region",
+        "gap_kind",
+        "score",
+        "crawl_summary",
+    }
+    assert "reason" not in s and "nl_explanation" not in s
+    assert s["prompt"] == "Best dentist?"
+    assert s["competitors"] == ["Acme"]
+    assert s["score"]["visibility_pct"] == 12.0
 
 
 def test_build_onpage_crawl_summary_from_namespace():

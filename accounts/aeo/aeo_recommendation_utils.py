@@ -26,7 +26,10 @@ from ..models import (
 )
 from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
 from .aeo_extraction_utils import brand_effectively_cited
-from .aeo_prompts import AEO_RECOMMENDATION_NL_SYSTEM_PROMPT
+from .aeo_prompts import (
+    AEO_RECOMMENDATION_NL_SYSTEM_PROMPT,
+    AEO_RECOMMENDATION_TYPE_SYSTEM_PROMPT,
+)
 from .aeo_scoring_utils import (
     calculate_citation_share,
     calculate_visibility_score,
@@ -38,6 +41,16 @@ from .aeo_utils import infer_city_from_address
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
+
+RECOMMENDATION_TYPE_CHOICES: frozenset[str] = frozenset(
+    {
+        "new_page",
+        "faq_expansion",
+        "schema_fix",
+        "citation_target",
+        "entity_alignment",
+    }
+)
 
 # Country / macro-region strings that are too vague alone for AEO locality copy
 _VAGUE_LOCALITY_ONLY: frozenset[str] = frozenset(
@@ -472,6 +485,148 @@ def _nl_template(gap: dict[str, Any]) -> str:
     )
 
 
+def _infer_action_type_for_nl(g: dict[str, Any]) -> str:
+    at = str(g.get("action_type") or "").strip()
+    if at:
+        return at
+    k = g.get("gap_kind")
+    if k == "visibility_miss":
+        return "create_content"
+    if k in ("citation_share", "citation_share_generic"):
+        return "acquire_citation"
+    return "review_visibility"
+
+
+def _normalize_score_for_nl(gap_object: dict[str, Any]) -> dict[str, Any]:
+    raw = gap_object.get("score")
+    if isinstance(raw, dict) and raw:
+        return {k: v for k, v in raw.items() if v is not None}
+    out: dict[str, Any] = {}
+    try:
+        if gap_object.get("visibility_pct") is not None:
+            out["visibility_pct"] = float(gap_object["visibility_pct"])
+        elif gap_object.get("visibility") is not None:
+            out["visibility_pct"] = float(gap_object["visibility"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if gap_object.get("citation_share_pct") is not None:
+            out["citation_share_pct"] = float(gap_object["citation_share_pct"])
+        elif gap_object.get("citation_share") is not None:
+            out["citation_share_pct"] = float(gap_object["citation_share"])
+        elif gap_object.get("citation_share_at_check") is not None:
+            out["citation_share_pct"] = float(gap_object["citation_share_at_check"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if gap_object.get("weighted_position_pct") is not None:
+            out["weighted_position_pct"] = float(gap_object["weighted_position_pct"])
+    except (TypeError, ValueError):
+        pass
+    dom = gap_object.get("source_domain")
+    if isinstance(dom, str) and dom.strip():
+        out["citation_target_domain"] = dom.strip().lower()
+    return out
+
+
+def _competitor_strings_for_nl(gap_object: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add_one(s: str) -> None:
+        t = (s or "").strip()[:160]
+        if not t:
+            return
+        k = t.lower()
+        if k in seen:
+            return
+        seen.add(k)
+        out.append(t)
+
+    raw_list = gap_object.get("competitors_in_answer")
+    if isinstance(raw_list, list):
+        for x in _competitor_display_names(raw_list, limit=14):
+            add_one(x)
+    cs = gap_object.get("competitors")
+    if isinstance(cs, str) and cs.strip():
+        for part in cs.split(","):
+            add_one(part)
+    elif isinstance(cs, list):
+        for x in _competitor_display_names(cs, limit=10):
+            add_one(x)
+    th = gap_object.get("top_competitor_hint")
+    if isinstance(th, str) and th.strip():
+        add_one(th.strip())
+    return out
+
+
+def _build_sanitized_nl_signals(gap_object: dict[str, Any]) -> dict[str, Any]:
+    """
+    Strip high-level ``reason`` / ``nl_explanation`` and ids; only raw signals for the model.
+    Keys: prompt, action_type, competitors, business_name, region, gap_kind, score, crawl_summary.
+    """
+    prompt = (gap_object.get("prompt_text") or gap_object.get("prompt") or "").strip()
+    bn = (gap_object.get("business_name") or "").strip()
+    region = (gap_object.get("region_label") or gap_object.get("region") or gap_object.get("city") or "").strip()
+    crawl_summary = (gap_object.get("onpage_crawl_summary") or gap_object.get("crawl_summary") or "").strip()
+    gk = gap_object.get("gap_kind")
+    gap_kind = str(gk).strip() if gk is not None else ""
+    return {
+        "prompt": prompt,
+        "action_type": _infer_action_type_for_nl(gap_object),
+        "competitors": _competitor_strings_for_nl(gap_object),
+        "business_name": bn,
+        "region": region,
+        "gap_kind": gap_kind,
+        "score": _normalize_score_for_nl(gap_object),
+        "crawl_summary": crawl_summary[:8000],
+    }
+
+
+def _parse_recommendation_type_response(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return "entity_alignment"
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s*```\s*$", "", t).strip()
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, dict):
+            rt = str(obj.get("recommendation_type") or "").strip().lower()
+            if rt in RECOMMENDATION_TYPE_CHOICES:
+                return rt
+    except json.JSONDecodeError:
+        pass
+    return "entity_alignment"
+
+
+def _classify_recommendation_type(
+    client: Any,
+    sanitized: dict[str, Any],
+    *,
+    business_profile: BusinessProfile | None,
+) -> str:
+    payload = json.dumps(sanitized, ensure_ascii=False)[:4500]
+    user_msg = (
+        "Classify this gap for the next recommendation step. Output only valid JSON, one object.\n\n" + payload
+    )
+    completion = chat_completion_create_logged(
+        client,
+        operation="openai.chat.aeo_recommendation_type",
+        business_profile=business_profile,
+        model=_get_model(),
+        messages=[
+            {"role": "system", "content": AEO_RECOMMENDATION_TYPE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0,
+        max_tokens=100,
+    )
+    raw = (completion.choices[0].message.content or "").strip()
+    return _parse_recommendation_type_response(raw)
+
+
 def _nl_via_openai(
     gap_object: dict[str, Any],
     *,
@@ -479,37 +634,21 @@ def _nl_via_openai(
 ) -> str:
     api_env = getattr(settings, "AEO_RECOMMENDATION_API_KEY_ENV", DEFAULT_API_KEY_ENV)
     client = _get_client(api_env)
-    bn = (gap_object.get("business_name") or "").strip()
-    if not bn and business_profile is not None:
-        bn = (business_profile.business_name or "").strip()
-    region = (gap_object.get("region_label") or gap_object.get("city") or "").strip()
-    crawl_text = (gap_object.get("onpage_crawl_summary") or "").strip()
-    pre_parts: list[str] = []
-    if bn:
-        pre_parts.append(
-            f"Business name (refer to this business using this exact name): {bn}.",
-        )
-    if region:
-        pre_parts.append(f"Locality / market label for messaging: {region}.")
-    if crawl_text:
-        pre_parts.append(
-            "On-page crawl summary (latest completed onboarding crawl; use only facts below when relevant):",
-        )
-        pre_parts.append(crawl_text[:3500])
-    prefix = "\n".join(pre_parts)
-    if prefix:
-        prefix = prefix + "\n\n---\n\n"
-    gap_for_json = dict(gap_object)
-    if crawl_text:
-        gap_for_json.pop("onpage_crawl_summary", None)
-    payload = json.dumps(gap_for_json, ensure_ascii=False, default=str)[:6000]
+    sanitized = _build_sanitized_nl_signals(gap_object)
+    if not sanitized.get("business_name") and business_profile is not None:
+        sanitized["business_name"] = (business_profile.business_name or "").strip()
+    rec_type = _classify_recommendation_type(
+        client, sanitized, business_profile=business_profile
+    )
+    payload = json.dumps(sanitized, ensure_ascii=False)[:6000]
     user_msg = (
-        prefix
-        + "Gap object (JSON). Write one or two sentences of actionable AEO guidance. "
-        "Respect gap_kind; use region and industry when present; use business_name and competitor "
-        "names only as given in the JSON. Do not invent sites or brands. Prioritize visibility misses "
-        "and low citation share.\n\n"
-        + payload
+        f'recommendation_type: "{rec_type}"\n\n'
+        "Gap signals (JSON only):\n"
+        f"{payload}\n\n"
+        "Write exactly 2 sentences:\n"
+        "1) specific website/content action\n"
+        "2) why this closes the AEO gap for this query\n"
+        "Avoid repeating the JSON wording."
     )
     completion = chat_completion_create_logged(
         client,
@@ -520,8 +659,8 @@ def _nl_via_openai(
             {"role": "system", "content": AEO_RECOMMENDATION_NL_SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ],
-        temperature=0.3,
-        max_tokens=200,
+        temperature=0.2,
+        max_tokens=350,
     )
     return (
         (completion.choices[0].message.content or "").strip() or _nl_template_with_kinds(gap_object)
@@ -661,6 +800,19 @@ def generate_aeo_recommendations(
     recommendations: list[dict[str, Any]] = []
     nl_ctx = _recommendation_nl_enrichment(business_profile, score=score)
 
+    def _headline_score_dict(*, cite_gap: dict[str, Any] | None = None) -> dict[str, Any]:
+        sc: dict[str, Any] = {
+            "visibility_pct": visibility,
+            "citation_share_pct": citation,
+        }
+        if score is not None:
+            sc["weighted_position_pct"] = float(score.weighted_position_score)
+        if cite_gap:
+            dom = cite_gap.get("source_domain")
+            if isinstance(dom, str) and dom.strip():
+                sc["citation_target_domain"] = dom.strip().lower()
+        return sc
+
     for gap in vis_gaps:
         rec = _build_create_content_recommendation(
             gap,
@@ -670,7 +822,12 @@ def generate_aeo_recommendations(
         )
         if enrich_with_nl:
             rec["nl_explanation"] = generate_natural_language_recommendation(
-                {**gap, **nl_ctx},
+                {
+                    **gap,
+                    **nl_ctx,
+                    "action_type": "create_content",
+                    "score": _headline_score_dict(),
+                },
                 business_profile=business_profile,
             )
         recommendations.append(rec)
@@ -684,7 +841,12 @@ def generate_aeo_recommendations(
         )
         if enrich_with_nl:
             rec["nl_explanation"] = generate_natural_language_recommendation(
-                {**gap, **nl_ctx},
+                {
+                    **gap,
+                    **nl_ctx,
+                    "action_type": "acquire_citation",
+                    "score": _headline_score_dict(cite_gap=gap),
+                },
                 business_profile=business_profile,
             )
         recommendations.append(rec)
@@ -713,6 +875,8 @@ def generate_aeo_recommendations(
                     "visibility": visibility,
                     "citation_share": citation,
                     **nl_ctx,
+                    "action_type": "review_visibility",
+                    "score": _headline_score_dict(),
                 },
                 business_profile=business_profile,
             )
