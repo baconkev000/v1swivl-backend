@@ -6,6 +6,7 @@ missed_searches_monthly).
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from typing import Any, Dict, List
 
@@ -41,6 +42,34 @@ def _aeo_target_prompt_count() -> int:
 
 def _aeo_recommendation_stage_enabled() -> bool:
     return bool(getattr(settings, "AEO_ENABLE_RECOMMENDATION_STAGE", False))
+
+
+def _aeo_phase3_extract_one_snapshot(snapshot_id: int, run_started_at: Any) -> tuple[int, int]:
+    """
+    Run extraction for one response snapshot in a thread worker.
+    Returns (created_increment, failed_increment) for aggregation.
+    """
+    from django.db import close_old_connections
+
+    from .aeo.aeo_extraction_utils import run_single_extraction
+    from .models import AEOResponseSnapshot
+
+    close_old_connections()
+    try:
+        snap = AEOResponseSnapshot.objects.select_related("profile").filter(pk=snapshot_id).first()
+        if snap is None:
+            return 0, 1
+        if run_started_at is not None:
+            if snap.extraction_snapshots.filter(created_at__gte=run_started_at).exists():
+                return 0, 0
+        result = run_single_extraction(snap, save=True)
+        if result.get("save_error"):
+            return 0, 1
+        if result.get("extraction_snapshot_id"):
+            return 1, 0
+        return 0, 0
+    finally:
+        close_old_connections()
 
 
 def _enqueue_seo_after_aeo(run_id: int) -> None:
@@ -715,8 +744,8 @@ def run_aeo_phase3_extraction_task(
     response_snapshot_ids: list[int] | None = None,
     response_platform: str | None = None,
 ) -> None:
+    from .aeo.worker_limits import aeo_execution_max_workers
     from .models import AEOExecutionRun, AEOResponseSnapshot
-    from .aeo.aeo_extraction_utils import run_single_extraction
 
     run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
     if not run:
@@ -748,16 +777,27 @@ def run_aeo_phase3_extraction_task(
     created_count = 0
     failed_count = 0
     try:
+        to_process: list[int] = []
         for response in responses:
-            # Idempotency: don't write duplicate extraction rows during reruns of the same stage.
-            if run.started_at and response.extraction_snapshots.filter(created_at__gte=run.started_at).exists():
+            if run.started_at and response.extraction_snapshots.filter(
+                created_at__gte=run.started_at
+            ).exists():
                 continue
-            result = run_single_extraction(response, save=True)
-            if result.get("save_error"):
-                failed_count += 1
-                continue
-            if result.get("extraction_snapshot_id"):
-                created_count += 1
+            to_process.append(response.id)
+
+        max_workers = aeo_execution_max_workers()
+        started_at = run.started_at
+        if to_process:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(_aeo_phase3_extract_one_snapshot, rid, started_at)
+                    for rid in to_process
+                ]
+                for fut in as_completed(futures):
+                    c_inc, f_inc = fut.result()
+                    created_count += c_inc
+                    failed_count += f_inc
+
         run.extraction_count = created_count
         run.extraction_status = AEOExecutionRun.STAGE_COMPLETED
         run.save(update_fields=["extraction_count", "extraction_status", "updated_at"])

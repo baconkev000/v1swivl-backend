@@ -92,6 +92,8 @@ class AEOExtractionSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "id",
         "response_snapshot",
         "brand_mentioned",
+        "brand_mentioned_url_status",
+        "cited_domain_or_url",
         "mention_position",
         "mention_count",
         "sentiment",
@@ -99,7 +101,13 @@ class AEOExtractionSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "extraction_model",
         "created_at",
     )
-    list_filter = ("brand_mentioned", "mention_position", "sentiment", "extraction_parse_failed")
+    list_filter = (
+        "brand_mentioned",
+        "brand_mentioned_url_status",
+        "mention_position",
+        "sentiment",
+        "extraction_parse_failed",
+    )
     search_fields = ("response_snapshot__prompt_hash", "response_snapshot__prompt_text")
     raw_id_fields = ("response_snapshot",)
 

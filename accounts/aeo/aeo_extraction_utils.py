@@ -9,6 +9,7 @@ Optional settings:
     AEO_EXTRACTION_MAX_TOKENS — default 800
     AEO_EXTRACTION_TIMEOUT — HTTP timeout seconds, default 60
     AEO_EXTRACTION_API_KEY_ENV — default OPEN_AI_SEO_API_KEY
+    AEO_DOMAIN_VERIFY_* — see accounts.aeo.domain_verification (wrong-URL live/broken on save)
 """
 
 from __future__ import annotations
@@ -51,8 +52,7 @@ def programmatic_tracked_brand_from_urls(
     or from any sanitized competitor ``url`` (``registered_root_domains_match``; not LLM judgment).
     ``mention_count`` is the number of distinct matched host roots (minimum 1 when cited).
     """
-    tracked_root = root_domain_from_fragment(tracked_website_domain) or ""
-    tracked_root = tracked_root.strip().lower().rstrip(".")
+    tracked_root = canonical_registrable_domain(tracked_website_domain)
     if not tracked_root:
         return False, 0
     matched_hosts: set[str] = set()
@@ -143,6 +143,17 @@ def _format_competitor_hints(hints: str | Sequence[str] | None) -> str:
         return t if t else "(none)"
     parts = [str(x).strip() for x in hints if str(x).strip()]
     return "\n".join(parts) if parts else "(none)"
+
+
+def canonical_registrable_domain(url_or_domain: str | None) -> str:
+    """
+    Single entry point: ``BusinessProfile.website_url`` (or any URL fragment) → lowercase registrable-style host.
+
+    Same normalization rules as ``root_domain_from_fragment``; use wherever canonical site identity is compared
+    to extracted citation or competitor URLs.
+    """
+    r = root_domain_from_fragment((url_or_domain or "").strip()) or ""
+    return r.strip().lower().rstrip(".")
 
 
 def root_domain_from_fragment(text: str) -> str | None:
@@ -300,7 +311,7 @@ def tracked_domain_listed_in_competitors(tracked_website_domain: str, competitor
     Extraction models often put the target business only inside ``competitors`` (with URL)
     while setting ``brand_mentioned`` false; coverage and scoring should still count that as a cite.
     """
-    t = (tracked_website_domain or "").strip().lower().rstrip(".")
+    t = canonical_registrable_domain(tracked_website_domain)
     if not t or not competitors:
         return False
     if not isinstance(competitors, (list, tuple)):
@@ -314,6 +325,54 @@ def tracked_domain_listed_in_competitors(tracked_website_domain: str, competitor
         if comp_dom and registered_root_domains_match(t, comp_dom):
             return True
     return False
+
+
+def _competitor_name_matches_tracked_business(tracked_name: str, competitor_name: str) -> bool:
+    """True when a structured competitor row likely refers to the tracked business by name (not LLM brand flags)."""
+    a = _normalize_for_brand_match(tracked_name)
+    b = _normalize_for_brand_match(competitor_name)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) < 4:
+        return False
+    return shorter in longer
+
+
+def competitor_attributed_noncanonical_url(
+    tracked_business_name: str,
+    tracked_root: str,
+    competitors: Any,
+) -> str | None:
+    """
+    If a competitor row names the tracked business but links a different registrable host, return that URL string.
+
+    Used to classify ``mentioned_url_wrong_*`` when canonical domain matching did not fire.
+    """
+    tr = (tracked_root or "").strip().lower().rstrip(".")
+    if not tr:
+        return None
+    tn = (tracked_business_name or "").strip()
+    if not tn:
+        return None
+    if not isinstance(competitors, list):
+        return None
+    for c in competitors:
+        if not isinstance(c, dict):
+            continue
+        name = (c.get("name") or "").strip()
+        url = (c.get("url") or "").strip()
+        if not url or not _competitor_name_matches_tracked_business(tn, name):
+            continue
+        host_root = root_domain_from_fragment(url)
+        if not host_root:
+            continue
+        if registered_root_domains_match(tr, host_root):
+            continue
+        return url.split("?")[0].strip()
+    return None
 
 
 def _domain_fallback_display(domain: str) -> str:
@@ -563,8 +622,8 @@ def brand_effectively_cited(
     """
     if brand_mentioned:
         return True
-    rooted = root_domain_from_fragment(tracked_website_url_or_domain) or ""
-    rooted = (rooted or (tracked_website_url_or_domain or "").strip().lower()).rstrip(".")
+    rooted = canonical_registrable_domain(tracked_website_url_or_domain)
+    rooted = rooted or (tracked_website_url_or_domain or "").strip().lower().rstrip(".")
     return tracked_domain_listed_in_competitors(rooted, competitors_json)
 
 
@@ -697,7 +756,7 @@ def normalize_extraction_payload(
     API compatibility only.
     """
     raw = (raw_response or "").strip()
-    domain = (tracked_website_domain or "").strip()
+    domain = canonical_registrable_domain(tracked_website_domain)
 
     competitors = _sanitize_competitors(data.get("competitors"))
     brand, count = programmatic_tracked_brand_from_urls(domain, raw, competitors)
@@ -811,7 +870,7 @@ def _build_user_content(
 ) -> str:
     name = (getattr(business_profile, "business_name", None) or "").strip() or "(unknown)"
     site = (getattr(business_profile, "website_url", None) or "").strip()
-    domain = (root_domain_from_fragment(site) or "").strip() or "(unknown)"
+    domain = canonical_registrable_domain(site) or "(unknown)"
     return AEO_STRUCTURED_EXTRACTION_USER_TEMPLATE.format(
         business_name=name,
         business_domain=domain,
@@ -873,8 +932,7 @@ def extract_aeo_response(
         parsed,
         raw_response=raw_response,
         tracked_business_name=(getattr(business_profile, "business_name", None) or "").strip(),
-        tracked_website_domain=root_domain_from_fragment(getattr(business_profile, "website_url", None) or "")
-        or "",
+        tracked_website_domain=canonical_registrable_domain(getattr(business_profile, "website_url", None) or ""),
     )
     return {
         **normalized,
@@ -894,9 +952,11 @@ def save_extraction_result(
     """
     Persist extraction output linked to the Phase 2 response row.
     """
+    from .domain_verification import resolve_brand_url_status_fields, verification_notes_json_safe
+
     profile = response_snapshot.profile
     tracked_name = (getattr(profile, "business_name", None) or "").strip()
-    tracked_domain = root_domain_from_fragment(getattr(profile, "website_url", None) or "") or ""
+    tracked_domain = canonical_registrable_domain(getattr(profile, "website_url", None) or "")
     raw = response_snapshot.raw_response or ""
     norm = (
         normalize_extraction_payload(
@@ -908,6 +968,25 @@ def save_extraction_result(
         if not parse_failed
         else _default_failed_payload()
     )
+    if parse_failed:
+        url_kw: dict[str, Any] = {
+            "brand_mentioned_url_status": None,
+            "cited_domain_or_url": "",
+            "url_verification_notes": {},
+            "verified_at": None,
+        }
+    else:
+        attributed = competitor_attributed_noncanonical_url(
+            tracked_name,
+            tracked_domain,
+            norm["competitors"],
+        )
+        url_kw = resolve_brand_url_status_fields(
+            brand_mentioned=bool(norm["brand_mentioned"]),
+            tracked_root=tracked_domain,
+            attributed_wrong_url=attributed,
+        )
+        url_kw["url_verification_notes"] = verification_notes_json_safe(url_kw["url_verification_notes"])
     return AEOExtractionSnapshot.objects.create(
         response_snapshot=response_snapshot,
         brand_mentioned=norm["brand_mentioned"],
@@ -919,6 +998,7 @@ def save_extraction_result(
         confidence_score=norm["confidence_score"],
         extraction_model=(extraction_model or "")[:128],
         extraction_parse_failed=parse_failed,
+        **url_kw,
     )
 
 

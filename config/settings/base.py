@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve(strict=True).parent.parent.parent
 APPS_DIR = BASE_DIR / "swivl"
 env = environ.Env()
 
-READ_DOT_ENV_FILE = env.bool("DJANGO_READ_DOT_ENV_FILE", default=False)
+READ_DOT_ENV_FILE = env.bool("DJANGO_READ_DOT_ENV_FILE", default=True)
 if READ_DOT_ENV_FILE:
     # OS environment variables take precedence over variables from .env
     env.read_env(str(BASE_DIR / ".env"))
@@ -365,6 +365,8 @@ AEO_TESTING_MODE = env.bool("AEO_TESTING_MODE", default=False)
 AEO_TEST_PROMPT_COUNT = env.int("AEO_TEST_PROMPT_COUNT", default=10)
 AEO_PROD_PROMPT_COUNT = env.int("AEO_PROD_PROMPT_COUNT", default=50)
 AEO_ENABLE_RECOMMENDATION_STAGE = env.bool("AEO_ENABLE_RECOMMENDATION_STAGE", default=False)
+# Phase 5 recommendation nl_explanation: False = template-only (no OpenAI); True = LLM (extra API calls).
+AEO_RECOMMENDATION_USE_OPENAI = env.bool("AEO_RECOMMENDATION_USE_OPENAI", default=False)
 # Google Gemini — optional Phase 2 AEO execution alongside OpenAI (see accounts.gemini_utils).
 # Also accepted: GOOGLE_GEMINI_API_KEY if this is empty (read in gemini_utils).
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="").strip()
@@ -380,3 +382,10 @@ AEO_EXECUTION_MODEL = env("AEO_EXECUTION_MODEL", default=OPENAI_MODEL).strip() o
 # Max concurrent threads for AEO batch execution (OpenAI/Gemini jobs); clamped in code to 1–64.
 AEO_EXECUTION_MAX_WORKERS = env.int("AEO_EXECUTION_MAX_WORKERS", default=20)
 AEO_EXTRACTION_PARSER_MODEL = env("AEO_EXTRACTION_PARSER_MODEL", default=OPENAI_MODEL).strip() or OPENAI_MODEL
+# Phase 3 wrong-URL verification (DNS/HTTP probe of model-attributed non-canonical links).
+AEO_DOMAIN_VERIFY_ENABLED = env.bool("AEO_DOMAIN_VERIFY_ENABLED", default=True)
+AEO_DOMAIN_VERIFY_TIMEOUT_S = env.float("AEO_DOMAIN_VERIFY_TIMEOUT_S", default=3.0)
+AEO_DOMAIN_VERIFY_MAX_REDIRECTS = env.int("AEO_DOMAIN_VERIFY_MAX_REDIRECTS", default=5)
+AEO_DOMAIN_VERIFY_USER_AGENT = env("AEO_DOMAIN_VERIFY_USER_AGENT", default="").strip()
+# Lowercase hostnames that bypass private-IP blocking (unit tests only; do not use in production).
+AEO_DOMAIN_VERIFY_ALLOWLIST = env.list("AEO_DOMAIN_VERIFY_ALLOWLIST", default=[])

@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -10,6 +11,7 @@ from accounts.models import (
     AEOScoreSnapshot,
     BusinessProfile,
 )
+from accounts.aeo.worker_limits import aeo_execution_max_workers
 from accounts.tasks import (
     run_aeo_phase1_execution_task,
     run_aeo_phase3_extraction_task,
@@ -99,6 +101,99 @@ def test_phase3_creates_extraction_rows_and_enqueues_scoring(monkeypatch):
     assert run.extraction_count == 2
     assert AEOExtractionSnapshot.objects.filter(response_snapshot__profile=profile).count() == 2
     assert queued == [run.id]
+
+
+@pytest.mark.django_db
+def test_phase3_thread_pool_uses_aeo_execution_max_workers(monkeypatch, settings):
+    settings.AEO_EXECUTION_MAX_WORKERS = 11
+    user = User.objects.create_user(username="p3w", email="p3w@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_COMPLETED,
+        started_at=timezone.now(),
+    )
+    r1 = AEOResponseSnapshot.objects.create(profile=profile, prompt_text="a", prompt_hash="ha", raw_response="ra")
+
+    original_init = ThreadPoolExecutor.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        assert kwargs.get("max_workers") == aeo_execution_max_workers()
+        return original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(ThreadPoolExecutor, "__init__", tracked_init)
+
+    def fake_single_extraction(snapshot, save=True, competitor_hints=None):
+        row = AEOExtractionSnapshot.objects.create(
+            response_snapshot=snapshot,
+            brand_mentioned=True,
+            mention_position="top",
+            mention_count=1,
+            competitors_json=[],
+            citations_json=[],
+            sentiment="neutral",
+            confidence_score=0.5,
+            extraction_model="fake",
+            extraction_parse_failed=False,
+        )
+        return {"extraction_snapshot_id": row.id, "save_error": None}
+
+    monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda _rid: None)
+
+    run_aeo_phase3_extraction_task(run.id, [r1.id])
+
+
+@pytest.mark.django_db
+def test_phase3_skips_idempotent_snapshots_but_extracts_others(monkeypatch):
+    user = User.objects.create_user(username="p3i", email="p3i@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    t0 = timezone.now()
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_COMPLETED,
+        started_at=t0,
+    )
+    r1 = AEOResponseSnapshot.objects.create(profile=profile, prompt_text="a", prompt_hash="ha", raw_response="ra")
+    r2 = AEOResponseSnapshot.objects.create(profile=profile, prompt_text="b", prompt_hash="hb", raw_response="rb")
+    AEOExtractionSnapshot.objects.create(
+        response_snapshot=r1,
+        brand_mentioned=True,
+        mention_position="top",
+        mention_count=1,
+        competitors_json=[],
+        citations_json=[],
+        sentiment="neutral",
+        confidence_score=0.5,
+        extraction_model="prev",
+        extraction_parse_failed=False,
+    )
+
+    called_ids: list[int] = []
+
+    def fake_single_extraction(snapshot, save=True, competitor_hints=None):
+        called_ids.append(snapshot.id)
+        row = AEOExtractionSnapshot.objects.create(
+            response_snapshot=snapshot,
+            brand_mentioned=True,
+            mention_position="top",
+            mention_count=1,
+            competitors_json=[],
+            citations_json=[],
+            sentiment="neutral",
+            confidence_score=0.5,
+            extraction_model="fake",
+            extraction_parse_failed=False,
+        )
+        return {"extraction_snapshot_id": row.id, "save_error": None}
+
+    monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda _rid: None)
+
+    run_aeo_phase3_extraction_task(run.id, [r1.id, r2.id])
+    run.refresh_from_db()
+    assert called_ids == [r2.id]
+    assert run.extraction_count == 1
 
 
 @pytest.mark.django_db

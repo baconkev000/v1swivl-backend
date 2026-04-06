@@ -14,7 +14,7 @@ Optional Django settings (defaults are conservative for repeatable runs):
     AEO_EXECUTION_MAX_TOKENS — default 1200 (clamped 256–4096)
     AEO_OPENAI_TIMEOUT — HTTP timeout seconds, default 45
     AEO_EXECUTION_MAX_ATTEMPTS — per-prompt retries for transient errors, default 2
-    AEO_EXECUTION_MAX_WORKERS — ThreadPoolExecutor size for batch runs, default 20 (clamped 1–64)
+    AEO_EXECUTION_MAX_WORKERS — ThreadPoolExecutor size for batch runs and Phase 3 extraction; default 20 (clamped 1–64); see worker_limits.aeo_execution_max_workers
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from ..models import AEOExecutionRun, AEOResponseSnapshot, BusinessProfile
 from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
 from .aeo_prompts import AEO_EXECUTION_SYSTEM_PROMPT
 from .aeo_utils import normalize_aeo_prompt_dict
+from .worker_limits import aeo_execution_max_workers
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +85,7 @@ def _execution_max_attempts() -> int:
 
 
 def _execution_max_workers() -> int:
-    v = getattr(settings, "AEO_EXECUTION_MAX_WORKERS", 20)
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        n = 20
-    return max(1, min(64, n))
+    return aeo_execution_max_workers()
 
 
 def normalize_prompt_for_hash(prompt_text: str) -> str:

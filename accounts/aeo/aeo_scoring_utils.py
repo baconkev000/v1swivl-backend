@@ -66,6 +66,10 @@ def calculate_visibility_score(
 
     Counts a row when ``brand_mentioned`` is true or the profile website matches a competitor URL
     in ``competitors_json`` (models often list the target only there).
+
+    Rows with ``brand_mentioned_url_status`` in ``mentioned_url_wrong_*`` still count as *not* cited
+    here (``brand_mentioned`` remains false) until product opts into partial credit; the status field
+    is for UI/diagnostics only.
     """
     n = len(extractions)
     if n == 0:

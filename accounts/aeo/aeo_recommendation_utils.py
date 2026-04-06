@@ -25,7 +25,7 @@ from ..models import (
     OnboardingOnPageCrawl,
 )
 from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
-from .aeo_extraction_utils import brand_effectively_cited
+from .aeo_extraction_utils import brand_effectively_cited, canonical_registrable_domain
 from .aeo_prompts import (
     AEO_RECOMMENDATION_NL_SYSTEM_PROMPT,
     AEO_RECOMMENDATION_TYPE_SYSTEM_PROMPT,
@@ -254,17 +254,82 @@ def _top_competitors_from_score(score: AEOScoreSnapshot | None, limit: int = 3) 
     return out
 
 
+def _url_identity_fields_from_extraction(
+    ex: AEOExtractionSnapshot,
+    *,
+    canonical_domain: str,
+) -> dict[str, Any]:
+    """
+    Per-extraction web-identity context for Phase 5 (wrong-domain live vs broken vs not flagged).
+
+    ``canonical_domain`` should already be normalized (``canonical_registrable_domain``).
+    """
+    canon = (canonical_domain or "").strip().lower().rstrip(".")
+    raw_status = getattr(ex, "brand_mentioned_url_status", None)
+    status_str = str(raw_status).strip() if raw_status else ""
+    if not status_str:
+        status_str = "not_mentioned"
+
+    cited_raw = (getattr(ex, "cited_domain_or_url", None) or "").strip()
+    cited_list = [cited_raw] if cited_raw else []
+
+    notes = getattr(ex, "url_verification_notes", None) or {}
+    if not isinstance(notes, dict):
+        notes = {}
+
+    verify_parts: list[str] = []
+    if notes.get("verification_disabled"):
+        verify_parts.append("probe_skipped")
+    elif notes:
+        if "dns_ok" in notes:
+            verify_parts.append("dns_" + ("ok" if notes.get("dns_ok") else "fail"))
+        if "http_ok" in notes:
+            verify_parts.append("http_" + ("ok" if notes.get("http_ok") else "fail"))
+        sc = notes.get("status_code")
+        if sc is not None:
+            verify_parts.append(f"status_{sc}")
+    verification_summary = ";".join(verify_parts)
+
+    summary = ""
+    if status_str == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_LIVE:
+        other = cited_raw or "another domain"
+        canon_disp = canon or "(no canonical domain on file)"
+        summary = (
+            f"Modeled answers tied your brand to {other} while your registered site is {canon_disp}; {other} resolves "
+            f"over the network (likely a different entity—disambiguate in content and schema)."
+        )
+    elif status_str == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN:
+        other = cited_raw or "a URL"
+        summary = (
+            f"Modeled answers tied your brand to {other}; that destination does not resolve reliably—treat it as a bad "
+            f"citation and reinforce your official URL in schema, footer, and major listings."
+        )
+
+    return {
+        "brand_mentioned_url_status": status_str,
+        "canonical_domain": canon,
+        "cited_domain_in_answer": cited_list,
+        "url_identity_summary": summary,
+        "verification_summary": verification_summary,
+    }
+
+
 def analyze_visibility_gaps(
     score_snapshot: AEOScoreSnapshot | None,
     extraction_snapshots: list[AEOExtractionSnapshot],
     *,
     tracked_website_url: str = "",
+    canonical_domain: str = "",
 ) -> list[dict[str, Any]]:
     """
     Gaps where the target brand did not appear in the modeled answer for a prompt.
 
-    Each gap carries ids for traceability to extraction / response rows.
+    Each gap carries ids for traceability to extraction / response rows, plus URL/identity context from the
+    paired ``AEOExtractionSnapshot`` when available.
     """
+    canon = (canonical_domain or "").strip().lower().rstrip(".") or canonical_registrable_domain(
+        tracked_website_url or ""
+    )
     gaps: list[dict[str, Any]] = []
     for ex in extraction_snapshots:
         if brand_effectively_cited(
@@ -274,17 +339,17 @@ def analyze_visibility_gaps(
         ):
             continue
         resp = ex.response_snapshot
-        gaps.append(
-            {
-                "gap_kind": "visibility_miss",
-                "prompt_text": (resp.prompt_text or "").strip(),
-                "extraction_snapshot_id": ex.id,
-                "response_snapshot_id": resp.id,
-                "competitors_in_answer": list(ex.competitors_json or [])
-                if isinstance(ex.competitors_json, list)
-                else [],
-            }
-        )
+        row: dict[str, Any] = {
+            "gap_kind": "visibility_miss",
+            "prompt_text": (resp.prompt_text or "").strip(),
+            "extraction_snapshot_id": ex.id,
+            "response_snapshot_id": resp.id,
+            "competitors_in_answer": list(ex.competitors_json or [])
+            if isinstance(ex.competitors_json, list)
+            else [],
+        }
+        row.update(_url_identity_fields_from_extraction(ex, canonical_domain=canon))
+        gaps.append(row)
     return gaps
 
 
@@ -357,6 +422,7 @@ def _recommendation_nl_enrichment(
     region_label = _region_label_for_profile(profile, city)
     crawl = _latest_completed_onboarding_crawl(profile)
     onpage_summary = _build_onpage_crawl_summary(crawl)
+    site = (getattr(profile, "website_url", None) or "").strip()
     out: dict[str, Any] = {
         "business_name": (profile.business_name or "").strip(),
         "city": city,
@@ -364,12 +430,38 @@ def _recommendation_nl_enrichment(
         "industry": (profile.industry or "").strip(),
         "services": "",  # placeholder when profile gains structured services
         "onpage_crawl_summary": onpage_summary,
+        "canonical_domain": canonical_registrable_domain(site),
     }
     if score is not None:
         comps = _top_competitors_from_score(score, limit=5)
         if comps:
             out["competitors"] = ", ".join(comps)
     return out
+
+
+def _prompt_short_label(prompt_text: str | None, *, max_words: int = 10) -> str:
+    """Short intent phrase for copy and LLM JSON—never embed the full consumer prompt."""
+    s = re.sub(r"\s+", " ", (prompt_text or "").strip())
+    if not s:
+        return "this type of question"
+    words = s.split()
+    if len(words) <= max_words:
+        return s
+    clip = " ".join(words[:max_words]).rstrip(".,;:!?")
+    return clip + "…"
+
+
+def _industry_snippet_for_copy(industry: str | None, *, max_len: int = 60) -> str:
+    """First comma-separated segment, capped—avoids dumping long keyword-stuffed industry fields."""
+    raw = (industry or "").strip()
+    if not raw:
+        return ""
+    first = raw.split(",")[0].strip()
+    if len(first) < 2:
+        return ""
+    if len(first) > max_len:
+        return first[: max_len - 1].rstrip() + "…"
+    return first
 
 
 def generate_natural_language_recommendation(
@@ -406,9 +498,10 @@ def _nl_template_no_gap(gap: dict[str, Any]) -> str:
     location = (gap.get("region_label") or gap.get("city") or "").strip() or "your area"
     bn = (gap.get("business_name") or "").strip() or "your business"
     return (
-        f"No single prompt gap fired on the latest run; visibility is about {vis:.0f}% and citation-style "
-        f"share about {cite:.0f}%. Keep monitoring and refresh entity + FAQ signals for {location} so "
-        f"{bn} stays easy for answer engines to surface."
+        f"No single prompt was flagged this pass—your headline visibility is about {vis:.0f}% and citation-style "
+        f"share about {cite:.0f}%. You should align your homepage and top service page so the legal name of {bn} "
+        f"matches your Google Business Profile, and add one FAQ pair that answers a common buyer question for {location} "
+        f"so models have a citable snippet."
     )
 
 
@@ -424,33 +517,49 @@ def _nl_context_labels(gap: dict[str, Any]) -> tuple[str, str, str, str]:
 def _nl_template(gap: dict[str, Any]) -> str:
     kind = gap.get("gap_kind")
     bn, region, industry, services = _nl_context_labels(gap)
-    ind_suffix = f" in the {industry} category" if industry else ""
-    svc_clause = f" Mention {services} plainly where it matches the query." if services else ""
+    ind_snip = _industry_snippet_for_copy(industry)
+    ind_lead = f"As a {ind_snip} operator, " if ind_snip else ""
+    svc_tail = f" Where it is truthful, mention {services} on that page." if services else ""
 
     if kind == "visibility_miss":
-        prompt = (gap.get("prompt_text") or "this type of question").strip()
-        if len(prompt) > 140:
-            prompt = prompt[:137].rstrip() + "…"
+        uid = (gap.get("url_identity_summary") or "").strip()
+        st = (gap.get("brand_mentioned_url_status") or "").strip()
+        if uid and st == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_LIVE:
+            return (
+                f"{ind_lead}{uid} "
+                f"You should publish clear legal/trading-name copy, Organization or LocalBusiness JSON-LD with your true "
+                f"url and sameAs to Google Business Profile and key profiles, plus a short disambiguation line so models "
+                f"map {bn} to your canonical site—not the other domain.{svc_tail}"
+            ).strip()
+        if uid and st == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN:
+            return (
+                f"{ind_lead}{uid} "
+                f"You should audit schema url fields, add a visible footer or FAQ “official website” line pointing to your "
+                f"live domain, and ensure sitemap or listings expose that URL so models prefer it over dead links.{svc_tail}"
+            ).strip()
+
         comps = gap.get("competitors_in_answer") or []
-        comp_str = ", ".join(_competitor_display_names(comps if isinstance(comps, list) else [], limit=8)[:3])
+        comp_str = ", ".join(_competitor_display_names(comps if isinstance(comps, list) else [], limit=3))
+        bench_raw = (gap.get("competitors") or "").strip()
+        bench_list = [x.strip() for x in bench_raw.split(",") if x.strip()][:3]
+        bench_disp = ", ".join(bench_list)
         if comp_str:
             return (
-                f"For “{prompt}”{ind_suffix}, modeled answers in {region} already name {comp_str}; tighten FAQs, "
-                f"service pages, and entity/schema so {bn} is cited for the same intent.{svc_clause}"
-            )
-        bench = (gap.get("competitors") or "").strip()
-        if bench:
-            if len(bench) > 85:
-                bench = bench[:82].rstrip() + "…"
+                f"{ind_lead}you should add or expand an on-page FAQ block plus matching FAQPage or Organization JSON-LD "
+                f"on the service URL that fits this query intent in {region}, because modeled answers already cite "
+                f"{comp_str} while {bn} is missing for this type of question.{svc_tail}"
+            ).strip()
+        if bench_disp:
             return (
-                f"For “{prompt}”{ind_suffix}, publish concise, location-grounded copy in {region} (offers, FAQs, "
-                f"Organization/LocalBusiness signals) so {bn} can appear when this question is answered—"
-                f"your score snapshot also surfaces {bench} as frequent comparables.{svc_clause}"
-            )
+                f"{ind_lead}you should strengthen the service page that matches this intent in {region} with clear "
+                f"headings, a short FAQ, and schema that uses the same business name as your Google Business Profile so "
+                f"{bn} can be extracted; your benchmarks often include {bench_disp}.{svc_tail}"
+            ).strip()
         return (
-            f"For “{prompt}”{ind_suffix}, publish concise, location-grounded copy in {region} (offers, FAQs, "
-            f"Organization/LocalBusiness signals) so {bn} can appear when this question is answered.{svc_clause}"
-        )
+            f"{ind_lead}you should add a visible FAQ section and Organization or LocalBusiness structured data on your "
+            f"strongest commercial page for this intent in {region}, keeping entity naming aligned with live listings "
+            f"so {bn} is eligible to be cited.{svc_tail}"
+        ).strip()
 
     if kind == "citation_share":
         dom = gap.get("source_domain")
@@ -460,10 +569,11 @@ def _nl_template(gap: dict[str, Any]) -> str:
             cite = 0.0
         comp = (gap.get("top_competitor_hint") or "named competitors").strip()
         if dom:
-            cite_tail = f" Reflect {services} in public profiles where accurate." if services else ""
+            cite_tail = f" Use categories and services you can verify." if services else ""
             return (
-                f"Citation-style share is about {cite:.0f}%—pursue verifiable mentions on {dom} and similar trusted "
-                f"sources for {region}, where {comp} may already earn more model-visible citations than {bn}.{cite_tail}"
+                f"Your modeled citation-style share is about {cite:.0f}%; you should claim or refresh a verifiable "
+                f"profile or listing for {bn} on {dom} (and similar hubs in {region}), mirroring how {comp} appears "
+                f"there without inventing attributes you do not offer.{cite_tail}"
             )
         return _nl_template({**gap, "gap_kind": "citation_share_generic"})
 
@@ -473,15 +583,16 @@ def _nl_template(gap: dict[str, Any]) -> str:
         except (TypeError, ValueError):
             cite = 0.0
         comp = (gap.get("top_competitor_hint") or "alternatives").strip()
-        cite_tail = f" Reflect {services} in titles or blurbs where truthful." if services else ""
+        cite_tail = f" Keep wording factual." if services else ""
         return (
-            f"Citation-style share is about {cite:.0f}%—earn listings, profiles, or editorial mentions on authoritative "
-            f"domains tied to {region} and your sector so models cite {bn} alongside {comp}.{cite_tail}"
+            f"Your modeled citation-style share is about {cite:.0f}%; you should line up trusted third-party listings "
+            f"and data sources in {region} where {comp} already earns visibility, using consistent {bn} naming and "
+            f"service categories across each profile.{cite_tail}"
         )
 
     return (
-        f"Review latest AEO snapshots for {region}: strengthen on-page clarity, third-party mentions, and entity "
-        f"consistency so {bn} stays visible across transactional, trust, and comparison-style queries."
+        f"You should tighten how {bn} appears on core service pages and in structured data for {region}, and keep "
+        f"third-party mentions aligned so transactional and comparison-style answers can cite you consistently."
     )
 
 
@@ -563,15 +674,20 @@ def _competitor_strings_for_nl(gap_object: dict[str, Any]) -> list[str]:
 def _build_sanitized_nl_signals(gap_object: dict[str, Any]) -> dict[str, Any]:
     """
     Strip high-level ``reason`` / ``nl_explanation`` and ids; only raw signals for the model.
-    Keys: prompt, action_type, competitors, business_name, region, gap_kind, score, crawl_summary.
+    Keys: prompt, action_type, competitors, business_name, region, gap_kind, score, crawl_summary;
+    for ``visibility_miss`` also optional URL-identity keys (brand_mentioned_url_status, canonical_domain,
+    cited_domain_in_answer, url_identity_summary, verification_summary).
+
+    ``prompt`` is a short intent label only (not the full monitored question) so the LLM is not prompted to quote it.
     """
-    prompt = (gap_object.get("prompt_text") or gap_object.get("prompt") or "").strip()
+    full_pt = (gap_object.get("prompt_text") or gap_object.get("prompt") or "").strip()
+    prompt = _prompt_short_label(full_pt, max_words=10)
     bn = (gap_object.get("business_name") or "").strip()
     region = (gap_object.get("region_label") or gap_object.get("region") or gap_object.get("city") or "").strip()
     crawl_summary = (gap_object.get("onpage_crawl_summary") or gap_object.get("crawl_summary") or "").strip()
     gk = gap_object.get("gap_kind")
     gap_kind = str(gk).strip() if gk is not None else ""
-    return {
+    out: dict[str, Any] = {
         "prompt": prompt,
         "action_type": _infer_action_type_for_nl(gap_object),
         "competitors": _competitor_strings_for_nl(gap_object),
@@ -581,6 +697,23 @@ def _build_sanitized_nl_signals(gap_object: dict[str, Any]) -> dict[str, Any]:
         "score": _normalize_score_for_nl(gap_object),
         "crawl_summary": crawl_summary[:8000],
     }
+    if gap_kind == "visibility_miss":
+        cd = (gap_object.get("canonical_domain") or "").strip()
+        if cd:
+            out["canonical_domain"] = cd
+        st = (gap_object.get("brand_mentioned_url_status") or "").strip()
+        if st and st != "not_mentioned":
+            out["brand_mentioned_url_status"] = st
+        cited = gap_object.get("cited_domain_in_answer")
+        if isinstance(cited, list) and cited:
+            out["cited_domain_in_answer"] = [str(x).strip() for x in cited[:5] if str(x).strip()]
+        uis = (gap_object.get("url_identity_summary") or "").strip()
+        if uis:
+            out["url_identity_summary"] = uis[:600]
+        vs = (gap_object.get("verification_summary") or "").strip()
+        if vs:
+            out["verification_summary"] = vs[:200]
+    return out
 
 
 def _parse_recommendation_type_response(text: str) -> str:
@@ -645,10 +778,20 @@ def _nl_via_openai(
         f'recommendation_type: "{rec_type}"\n\n'
         "Gap signals (JSON only):\n"
         f"{payload}\n\n"
-        "Write exactly 2 sentences:\n"
-        "1) specific website/content action\n"
-        "2) why this closes the AEO gap for this query\n"
-        "Avoid repeating the JSON wording."
+        "Write for the business owner. Second person (\"you\").\n"
+        "Do not quote or repeat the consumer prompt text; say \"for this type of question\" or "
+        "\"for this query intent\" only. The JSON \"prompt\" field is a short label—not text to paste.\n"
+        "Sentence 1: specific actions (what to add or change on the site, or where to seek citations).\n"
+        "Sentence 2: why answer engines are more likely to mention the business for this intent.\n"
+        "If crawl_summary is non-empty, anchor at least one action to a page or topic from it.\n"
+        "If crawl_summary is empty, still be specific; do not apologize.\n"
+        "When brand_mentioned_url_status and domain fields are present: for mentioned_url_wrong_live, focus on entity "
+        "disambiguation versus another business (canonical Organization/LocalBusiness name + url, sameAs, About/legal "
+        "name clarity, GBP and major listing alignment)—do not treat the wrong domain as the client. For "
+        "mentioned_url_wrong_broken, focus on strengthening discoverable official URLs and schema so models stop "
+        "latching onto dead or hallucinated links (footer or FAQ “official site” only as a concrete tactic). For matched, "
+        "do not invent URL problems.\n"
+        "Avoid repeating the JSON wording verbatim."
     )
     completion = chat_completion_create_logged(
         client,
@@ -677,14 +820,17 @@ def _build_create_content_recommendation(
     city = infer_city_from_address(business_profile.business_address or "")
     region = _region_label_for_profile(business_profile, city)
     bn = (business_profile.business_name or "").strip() or "This business"
-    industry = (business_profile.industry or "").strip()
-    ind_bit = f" ({industry})" if industry else ""
+    ind_snip = _industry_snippet_for_copy((business_profile.industry or "").strip())
+    ind_bit = f" ({ind_snip})" if ind_snip else ""
     prompt_display = gap.get("prompt_text") or ""
     reason = (
-        f"Visibility gap: {bn} was not mentioned in the captured answer for this query{ind_bit}. "
-        f"Improve content, entity consistency, and local relevance for {region} so transactional and trust queries "
-        f"can surface {bn} alongside named alternatives."
+        f"{bn} did not appear in the captured model answer for this monitored query{ind_bit}. "
+        f"Add or tune a service-level page, FAQ block, and matching Organization/LocalBusiness schema for {region} "
+        f"so this intent can cite {bn}."
     )
+    uid = (gap.get("url_identity_summary") or "").strip()
+    if uid:
+        reason += f" {uid}"
     if score is not None and score.visibility_score < 20:
         reason += f" Overall visibility score for {bn} is {score.visibility_score:.1f}% (high priority)."
     elif score is not None:
@@ -712,6 +858,8 @@ def _build_acquire_citation_recommendation(
     priority: str,
     business_profile: BusinessProfile,
 ) -> dict[str, Any]:
+    city = infer_city_from_address(business_profile.business_address or "")
+    region = _region_label_for_profile(business_profile, city)
     dom = gap.get("source_domain")
     try:
         cite = float(gap.get("citation_share_at_check") or 0)
@@ -721,16 +869,16 @@ def _build_acquire_citation_recommendation(
     bn = (business_profile.business_name or "").strip() or "This business"
     if dom:
         reason = (
-            f"Citation gap: modeled citation-style share is {cite:.1f}%; earn verifiable mentions on {dom} "
-            f"and comparable authoritative domains so answer engines can cite {bn}."
+            f"Citation-style signal is weak ({cite:.1f}%); prioritize a verifiable listing or profile for {bn} on {dom} "
+            f"and peer domains in {region}."
         )
     else:
         reason = (
-            f"Citation gap: modeled citation-style share is {cite:.1f}%; pursue trusted third-party listings, "
-            f"profiles, and editorial references your category relies on so models can cite {bn} in AI answers."
+            f"Citation-style signal is weak ({cite:.1f}%); add consistent {bn} profiles on category-trusted sites and "
+            f"data sources models use in {region}."
         )
     if comp:
-        reason += f" Recent answers often name {comp}—mirror the citation patterns those sources reward so {bn} is included."
+        reason += f" Answers often reference {comp}—match factual categories and proof patterns, not unverifiable claims."
     rec: dict[str, Any] = {
         "action_type": "acquire_citation",
         "reason": reason,
@@ -794,7 +942,13 @@ def generate_aeo_recommendations(
 
     priority = _priority_from_scores(visibility, citation)
 
-    vis_gaps = analyze_visibility_gaps(score, extractions, tracked_website_url=site)
+    canonical_dom = canonical_registrable_domain(site)
+    vis_gaps = analyze_visibility_gaps(
+        score,
+        extractions,
+        tracked_website_url=site,
+        canonical_domain=canonical_dom,
+    )
     cite_gaps = analyze_citation_gaps(score, extractions, citation_share=citation)
 
     recommendations: list[dict[str, Any]] = []
@@ -856,9 +1010,9 @@ def generate_aeo_recommendations(
         low_rec = {
             "action_type": "review_visibility",
             "reason": (
-                f"No prompt-level visibility or citation gaps were flagged on this pass for {bn}; headline scores are "
-                f"visibility {visibility:.1f}% and citation-style share {citation:.1f}%. Re-run after content or "
-                f"off-site citation updates so regressions surface early."
+                f"No single prompt gap fired for {bn} this run (visibility {visibility:.1f}%, citation-style "
+                f"{citation:.1f}%). Re-check after you update FAQs, schema, or key listings so the next snapshot can "
+                f"catch shifts."
             ),
             "priority": "low" if priority == "low" else priority,
             "references": {
