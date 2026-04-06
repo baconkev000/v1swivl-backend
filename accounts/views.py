@@ -60,9 +60,14 @@ from .aeo.aeo_utils import (
     build_full_aeo_prompt_plan,
     plan_items_from_saved_prompt_strings,
 )
+from .aeo.perplexity_execution_utils import perplexity_execution_enabled
 from .gemini_utils import gemini_execution_enabled
 
 logger = logging.getLogger(__name__)
+
+# Prompt coverage + pending checks: stored AEOResponseSnapshot.platform values we surface in the UI.
+_AEO_COVERAGE_PLATFORM_SET = frozenset({"openai", "gemini", "perplexity"})
+_AEO_PENDING_PLATFORM_ORDER = ("openai", "perplexity", "gemini")
 User = get_user_model()
 
 
@@ -1244,6 +1249,7 @@ def seo_overview(request: HttpRequest) -> Response:
             domain,
             location_code=location_code,
             language_code=getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en"),
+            business_profile=profile,
         )
         # #region agent log
         _debug.log("views.py:seo_overview:after_dataforseo", "visibility_data result", {"is_none": visibility_data is None, "has_keys": list(visibility_data.keys()) if visibility_data else []}, "H4")
@@ -1956,18 +1962,43 @@ def _improvement_recommendations_for_prompt(
     """
     out: list = []
     key = (prompt_key or "").strip()
+
+    def _norm_text(s: str) -> str:
+        return " ".join((s or "").split()).strip().lower()
+
+    key_norm = _norm_text(key)
     seen_text: set[str] = set()
     for rec in recs:
         if not isinstance(rec, dict):
             continue
         at = rec.get("action_type")
         matched = False
-        if at == "create_content":
+        refs = rec.get("references") if isinstance(rec.get("references"), dict) else {}
+        matched_prompt_texts = refs.get("matched_prompt_texts")
+        matched_response_snapshot_ids = refs.get("matched_response_snapshot_ids")
+
+        # Precedence 1: explicit matched prompt membership.
+        if isinstance(matched_prompt_texts, list) and matched_prompt_texts:
+            norm_members = {_norm_text(str(x)) for x in matched_prompt_texts if str(x).strip()}
+            if key_norm and key_norm in norm_members:
+                matched = True
+        # Precedence 2: explicit grouped response id membership.
+        elif isinstance(matched_response_snapshot_ids, list) and matched_response_snapshot_ids:
+            ids: set[int] = set()
+            for x in matched_response_snapshot_ids:
+                try:
+                    v = int(x)
+                except (TypeError, ValueError):
+                    continue
+                ids.add(v)
+            if ids.intersection(response_ids):
+                matched = True
+        # Legacy behavior fallback.
+        elif at == "create_content":
             p = (rec.get("prompt") or "").strip()
-            if p == key:
+            if _norm_text(p) == key_norm:
                 matched = True
         elif at == "acquire_citation":
-            refs = rec.get("references") if isinstance(rec.get("references"), dict) else {}
             rid = refs.get("response_snapshot_id")
             try:
                 rid_int = int(rid) if rid is not None else None
@@ -1980,9 +2011,10 @@ def _improvement_recommendations_for_prompt(
         body = (rec.get("nl_explanation") or rec.get("reason") or "").strip()
         if not body:
             continue
-        if body in seen_text:
+        body_key = _norm_text(body)
+        if body_key in seen_text:
             continue
-        seen_text.add(body)
+        seen_text.add(body_key)
         item = {
             "action_type": at,
             "priority": (rec.get("priority") or "medium"),
@@ -1997,7 +2029,7 @@ def _improvement_recommendations_for_prompt(
 
 def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     """
-    One row per monitored / seen prompt; per-platform (OpenAI / Gemini) cells from latest snapshot each.
+    One row per monitored / seen prompt; per-platform (OpenAI / Gemini / Perplexity) cells from latest snapshot each.
     """
     from .aeo.aeo_extraction_utils import (
         brand_effectively_cited,
@@ -2037,7 +2069,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         best: dict[str, object] = {}
         for r in sorted(rows, key=_response_sort_key, reverse=True):
             plat = str(r.platform or "").strip().lower()
-            if plat not in ("openai", "gemini"):
+            if plat not in _AEO_COVERAGE_PLATFORM_SET:
                 continue
             if plat not in best:
                 best[plat] = r
@@ -2112,6 +2144,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         platforms = {
             "openai": platform_cell(plat_latest["openai"]) if "openai" in plat_latest else dict(empty_cell),
             "gemini": platform_cell(plat_latest["gemini"]) if "gemini" in plat_latest else dict(empty_cell),
+            "perplexity": platform_cell(plat_latest["perplexity"]) if "perplexity" in plat_latest else dict(empty_cell),
         }
         any_row = next(iter(rows), None)
         prompt_type = ""
@@ -2119,14 +2152,17 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
             prompt_type = str(any_row.prompt_type or "")
         o_cell = platforms["openai"]
         g_cell = platforms["gemini"]
+        p_cell = platforms["perplexity"]
         pos_candidates: list[int] = []
         if o_cell.get("has_data") and o_cell.get("cited") and o_cell.get("target_url_position") is not None:
             pos_candidates.append(int(o_cell["target_url_position"]))
         if g_cell.get("has_data") and g_cell.get("cited") and g_cell.get("target_url_position") is not None:
             pos_candidates.append(int(g_cell["target_url_position"]))
+        if p_cell.get("has_data") and p_cell.get("cited") and p_cell.get("target_url_position") is not None:
+            pos_candidates.append(int(p_cell["target_url_position"]))
         target_url_position_best = min(pos_candidates) if pos_candidates else None
 
-        merged_ranking = merge_citations_rankings_across_platform_cells([o_cell, g_cell])
+        merged_ranking = merge_citations_rankings_across_platform_cells([o_cell, g_cell, p_cell])
         target_from_merged = merged_target_url_position(merged_ranking)
         combined_ranking = merged_ranking
         combined_target = (
@@ -2205,7 +2241,7 @@ def _aeo_profile_visibility_pending(profile: BusinessProfile) -> bool:
         best: dict[str, object] = {}
         for r in sorted(rows, key=_response_sort_key, reverse=True):
             plat = str(r.platform or "").strip().lower()
-            if plat not in ("openai", "gemini"):
+            if plat not in _AEO_COVERAGE_PLATFORM_SET:
                 continue
             if plat not in best:
                 best[plat] = r
@@ -2214,7 +2250,7 @@ def _aeo_profile_visibility_pending(profile: BusinessProfile) -> bool:
     for key in monitored:
         rows = by_prompt.get(key, [])
         plat_latest = latest_snapshot_per_platform(rows)
-        for plat in ("openai", "gemini"):
+        for plat in _AEO_PENDING_PLATFORM_ORDER:
             if plat not in plat_latest:
                 continue
             resp = plat_latest[plat]
@@ -2230,7 +2266,7 @@ def _aeo_profile_visibility_pending(profile: BusinessProfile) -> bool:
 def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     """
     Cached-only prompt coverage read for AI Visibility UI.
-    One row per unique prompt text; per-platform (OpenAI / Gemini) citation from latest snapshot each.
+    One row per unique prompt text; per-platform (OpenAI / Gemini / Perplexity) citation from latest snapshot each.
     """
     profile = (
         BusinessProfile.objects.filter(user=request.user, is_main=True).first()
@@ -2249,8 +2285,8 @@ def aeo_platform_visibility_data(request: HttpRequest) -> Response:
     """
     Per-LLM visibility % from extractions: share of prompts with a scan where the brand is cited.
 
-    OpenAI (ChatGPT) and Gemini are computed from stored snapshots. Other platforms return 0%
-    until integrations exist (frontend still shows them).
+    OpenAI (ChatGPT), Gemini, and Perplexity are computed from stored snapshots when present.
+    Other platforms return 0% until integrations exist (frontend still shows them).
     """
     profile = (
         BusinessProfile.objects.filter(user=request.user, is_main=True).first()
@@ -2280,6 +2316,7 @@ def aeo_platform_visibility_data(request: HttpRequest) -> Response:
         return round(100.0 * float(cited_count) / float(with_data), 1)
 
     o_w, o_c = aggregate("openai")
+    p_w, p_c = aggregate("perplexity")
     g_w, g_c = aggregate("gemini")
 
     platforms_out = [
@@ -2295,11 +2332,11 @@ def aeo_platform_visibility_data(request: HttpRequest) -> Response:
         {
             "key": "perplexity",
             "label": "Perplexity",
-            "visibility_pct": 0.0,
-            "has_data": False,
-            "prompts_with_data": 0,
-            "prompts_cited": 0,
-            "has_backend": False,
+            "visibility_pct": pct(p_w, p_c),
+            "has_data": p_w > 0,
+            "prompts_with_data": p_w,
+            "prompts_cited": p_c,
+            "has_backend": True,
         },
         {
             "key": "gemini",
@@ -2516,7 +2553,7 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
     """
     Re-run Phase 2 (LLM answers) and downstream extraction/scoring for prompts already saved on the profile.
 
-    JSON body: ``{"platform": "openai" | "gemini"}`` — refresh ChatGPT (OpenAI) or Gemini only.
+    JSON body: ``{"platform": "openai" | "gemini" | "perplexity"}`` — refresh one provider only.
     Does not regenerate the prompt list (onboarding / OpenAI prompt planning unchanged).
     """
     from .models import AEOExecutionRun
@@ -2531,15 +2568,21 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
 
     body = request.data if isinstance(request.data, dict) else {}
     platform = str(body.get("platform") or "").strip().lower()
-    if platform not in ("openai", "gemini"):
+    if platform not in ("openai", "gemini", "perplexity"):
         return Response(
-            {"detail": 'Invalid or missing "platform"; expected "openai" or "gemini".'},
+            {"detail": 'Invalid or missing "platform"; expected "openai", "gemini", or "perplexity".'},
             status=400,
         )
 
     if platform == "gemini" and not gemini_execution_enabled():
         return Response(
             {"detail": "Gemini is not configured (set GEMINI_API_KEY)."},
+            status=400,
+        )
+
+    if platform == "perplexity" and not perplexity_execution_enabled():
+        return Response(
+            {"detail": "Perplexity is not configured (set PERPLEXITY_API_KEY)."},
             status=400,
         )
 
@@ -2567,7 +2610,11 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
             status=409,
         )
 
-    providers = ["openai"] if platform == "openai" else ["gemini"]
+    providers = {
+        "openai": ["openai"],
+        "gemini": ["gemini"],
+        "perplexity": ["perplexity"],
+    }[platform]
 
     run = AEOExecutionRun.objects.create(
         profile=profile,
@@ -2677,6 +2724,82 @@ def refresh_aeo_gemini(request: HttpRequest) -> Response:
             "provider": "gemini",
             "prompt_count_requested": len(selected),
             "message": "Gemini refresh queued.",
+        },
+        status=202,
+    )
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def refresh_aeo_perplexity(request: HttpRequest) -> Response:
+    """
+    Dedicated Perplexity-only AEO refresh endpoint (same pattern as refresh-gemini).
+    """
+    from .models import AEOExecutionRun
+    from .tasks import run_aeo_perplexity_refresh_task
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"detail": "No main business profile is configured."}, status=400)
+
+    if not perplexity_execution_enabled():
+        return Response({"detail": "Perplexity is not configured (set PERPLEXITY_API_KEY)."}, status=400)
+
+    saved = profile.selected_aeo_prompts or []
+    if not isinstance(saved, list):
+        saved = []
+    saved_nonempty = [str(x).strip() for x in saved if str(x).strip()]
+    if not saved_nonempty:
+        return Response(
+            {"detail": "No saved AEO prompts to refresh. Complete onboarding first."},
+            status=400,
+        )
+
+    target = _aeo_prompt_target_count()
+    selected = plan_items_from_saved_prompt_strings(saved_nonempty)[:target]
+    if not selected:
+        return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
+
+    marker = "refresh_provider=perplexity"
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+        error_message__icontains=marker,
+    ).exists()
+    if inflight:
+        return Response(
+            {"detail": "A Perplexity refresh is already in progress for this profile."},
+            status=409,
+        )
+
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        prompt_count_requested=len(selected),
+        status=AEOExecutionRun.STATUS_PENDING,
+        error_message=marker,
+    )
+    transaction.on_commit(
+        lambda rid=run.id, payload=selected: run_aeo_perplexity_refresh_task.delay(rid, payload)
+    )
+
+    logger.info(
+        "[AEO refresh_perplexity] provider=perplexity run_id=%s profile_id=%s prompts=%s status=pending",
+        run.id,
+        profile.id,
+        len(selected),
+    )
+    return Response(
+        {
+            "run_id": run.id,
+            "status": "pending",
+            "provider": "perplexity",
+            "prompt_count_requested": len(selected),
+            "message": "Perplexity refresh queued.",
         },
         status=202,
     )
@@ -3248,6 +3371,8 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         #
         # Instead, we ONLY re-run enrichment tasks (gap keywords + next steps) on the
         # existing snapshot, so ranks stay intact and refresh is meaningful.
+        from accounts.third_party_usage import usage_profile_context
+
         from .dataforseo_utils import (
             normalize_domain,
             enrich_with_gap_keywords,
@@ -3295,27 +3420,29 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
             user = snapshot.user
 
             top_keywords: list[dict] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]
-            enrich_with_gap_keywords(
-                domain=domain,
-                location_code=location_code,
-                language_code=language_code,
-                user=user,
-                top_keywords=top_keywords,
-            )
-            external_api_called = True
-            enrich_with_llm_keywords(
-                user=user,
-                location_code=location_code,
-                top_keywords=top_keywords,
-            )
-            rank_stats = enrich_keyword_ranks_from_labs(
-                domain=domain,
-                location_code=location_code,
-                language_code=language_code,
-                top_keywords=top_keywords,
-                user=user,
-            )
-            external_api_called = True
+            with usage_profile_context(profile):
+                enrich_with_gap_keywords(
+                    domain=domain,
+                    location_code=location_code,
+                    language_code=language_code,
+                    user=user,
+                    top_keywords=top_keywords,
+                )
+                external_api_called = True
+                enrich_with_llm_keywords(
+                    user=user,
+                    location_code=location_code,
+                    top_keywords=top_keywords,
+                )
+                rank_stats = enrich_keyword_ranks_from_labs(
+                    domain=domain,
+                    location_code=location_code,
+                    language_code=language_code,
+                    top_keywords=top_keywords,
+                    user=user,
+                    business_profile=profile,
+                )
+                external_api_called = True
             total = int(rank_stats.get("total") or 0)
             ranked_after = int(rank_stats.get("non_null_after") or 0)
             coverage = (ranked_after / total) if total > 0 else 0.0
@@ -3411,6 +3538,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                     location_code=location_code,
                     language_code=language_code,
                     seo_location_mode=str(snapshot_mode or "organic"),
+                    business_profile=profile,
                 )
             )
             logger.info(

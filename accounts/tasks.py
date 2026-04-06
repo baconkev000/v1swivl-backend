@@ -161,6 +161,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
                 language_code=language_code,
                 top_keywords=top_keywords,
                 user=user,
+                business_profile=profile_for_usage,
             )
         total = int(rank_stats.get("total") or 0)
         ranked_after = int(rank_stats.get("non_null_after") or 0)
@@ -270,6 +271,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
                 location_code=location_code,
                 language_code=language_code,
                 seo_location_mode=snapshot_mode,
+                business_profile=profile_for_metrics,
             )
         )
         logger.info(
@@ -508,7 +510,7 @@ def run_aeo_phase1_execution_task(
     """
     Execute Phase 1 AEO prompt batch asynchronously with 30-day cache policy.
 
-    ``providers`` — optional ``['openai']`` or ``['gemini']`` for single-provider dashboard refresh.
+    ``providers`` — optional ``['openai']``, ``['gemini']``, ``['perplexity']``, or combinations, for dashboard refresh.
     ``force_refresh`` — when True, skip the 30-day execution cache (explicit user refresh).
     """
     from .models import AEOExecutionRun
@@ -528,7 +530,9 @@ def run_aeo_phase1_execution_task(
 
     profile = run.profile
     provider_set = {str(p).strip().lower() for p in (providers or []) if str(p).strip()}
-    extraction_platform: str | None = "gemini" if provider_set == {"gemini"} else None
+    extraction_platform: str | None = None
+    if len(provider_set) == 1:
+        extraction_platform = next(iter(provider_set))
 
     duplicate_inflight = AEOExecutionRun.objects.filter(
         profile=profile,
@@ -733,6 +737,55 @@ def run_aeo_gemini_refresh_task(
         run.id,
         prompt_set=selected,
         providers=["gemini"],
+        force_refresh=True,
+    )
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def run_aeo_perplexity_refresh_task(
+    self,
+    run_id: int,
+    prompt_set: list[dict] | None = None,
+) -> None:
+    """
+    Explicit Perplexity-only refresh path (dashboard button / API).
+    """
+    from .aeo.aeo_utils import plan_items_from_saved_prompt_strings
+    from .models import AEOExecutionRun
+
+    run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
+    if not run:
+        logger.warning("[AEO perplexity refresh] run not found run_id=%s", run_id)
+        return
+
+    profile = run.profile
+    selected = list(prompt_set or [])
+    if not selected:
+        saved = profile.selected_aeo_prompts or []
+        selected = plan_items_from_saved_prompt_strings([str(x) for x in saved if str(x).strip()])
+
+    if not selected:
+        run.status = AEOExecutionRun.STATUS_FAILED
+        run.error_message = "perplexity_refresh_no_selected_prompts"
+        run.finished_at = django_tz.now()
+        run.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        logger.warning(
+            "[AEO perplexity refresh] provider=perplexity run_id=%s profile_id=%s status=failed reason=no_prompts",
+            run.id,
+            profile.id,
+        )
+        return
+
+    logger.info(
+        "[AEO perplexity refresh] provider=perplexity run_id=%s profile_id=%s prompts=%s status=queued_phase1",
+        run.id,
+        profile.id,
+        len(selected),
+    )
+    run_aeo_phase1_execution_task(
+        run.id,
+        prompt_set=selected,
+        providers=["perplexity"],
         force_refresh=True,
     )
 

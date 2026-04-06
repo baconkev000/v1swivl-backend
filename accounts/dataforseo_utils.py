@@ -6,6 +6,10 @@ Helpers for calling DataForSEO Labs APIs for the SEO Agent.
 Primary endpoints used:
 - POST /v3/dataforseo_labs/google/ranked_keywords/live      → current visibility
 - POST /v3/dataforseo_labs/google/domain_intersection/live  → keyword gap vs competitors
+
+Usage logging: pass ``business_profile=`` into helpers (or set ``usage_profile_context``) so
+``ThirdPartyApiRequestLog.business_profile_id`` is populated for profile-scoped work. Account-agnostic
+helpers (e.g. niche-only question seeds) may log with a null profile.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -364,6 +368,7 @@ def get_competitors_for_domain_intersection(
             location_code=location_code,
             language_code=language_code,
             limit=min(max(limit * 2, limit + 2), 10),
+            business_profile=_profile,
         )
 
     # Filter out generic aggregators/social/map/listing domains.
@@ -638,6 +643,8 @@ def _get_auth() -> Optional[tuple[str, str]]:
 def _get_search_volumes_for_keywords(
     keywords: List[str],
     location_code: int,
+    *,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, int]:
     """
     Fetch monthly search volume for a list of keyword phrases via DataForSEO
@@ -653,7 +660,11 @@ def _get_search_volumes_for_keywords(
             "keywords": [str(k).strip() for k in keywords if str(k).strip()][:700],
         },
     ]
-    data = _post("/v3/keywords_data/google/search_volume/live", payload)
+    data = _post(
+        "/v3/keywords_data/google/search_volume/live",
+        payload,
+        business_profile=business_profile,
+    )
     if not data:
         return {}
     result: Dict[str, int] = {}
@@ -703,6 +714,18 @@ def _post(
         )
     except Exception as exc:  # pragma: no cover - network failure
         logger.exception("[DataForSEO] POST %s failed: %s", path, exc)
+        from accounts.models import ThirdPartyApiErrorLog, ThirdPartyApiProvider
+        from accounts.third_party_usage import record_third_party_api_error
+
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.DATAFORSEO,
+            operation=path,
+            error_kind=ThirdPartyApiErrorLog.ErrorKind.CONNECTION_ERROR,
+            message=str(exc)[:1024],
+            detail=str(exc),
+            http_status=None,
+            business_profile=business_profile,
+        )
         # #region agent log
         try:
             with open(DEBUG_LOG_PATH, "a") as f:
@@ -728,17 +751,27 @@ def _post(
             parsed_json = None
 
     operation_label = path if resp.status_code == 200 else f"{path} HTTP {resp.status_code}"
-    from accounts.third_party_usage import effective_usage_profile, record_dataforseo_request
+    from accounts.models import ThirdPartyApiErrorLog, ThirdPartyApiProvider
+    from accounts.third_party_usage import record_dataforseo_request, record_third_party_api_error
 
     record_dataforseo_request(
         operation=operation_label,
         response_json=parsed_json,
-        business_profile=effective_usage_profile(business_profile),
+        business_profile=business_profile,
     )
 
     if resp.status_code != 200:
         # DataForSEO returns 200 with status_code inside body for logical errors;
         # non-200 here is a transport-level issue.
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.DATAFORSEO,
+            operation=path,
+            error_kind=ThirdPartyApiErrorLog.ErrorKind.HTTP_ERROR,
+            message=f"HTTP {resp.status_code}",
+            detail=(resp.text or "")[:4000],
+            http_status=resp.status_code,
+            business_profile=business_profile,
+        )
         logger.warning(
             "[DataForSEO] POST %s HTTP %s: %s",
             path,
@@ -767,6 +800,15 @@ def _post(
         return None
 
     if parsed_json is None:
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.DATAFORSEO,
+            operation=path,
+            error_kind=ThirdPartyApiErrorLog.ErrorKind.PARSE_ERROR,
+            message="Non-JSON response body",
+            detail=(resp.text or "")[:4000],
+            http_status=resp.status_code,
+            business_profile=business_profile,
+        )
         logger.warning("[DataForSEO] POST %s returned non-JSON body.", path)
         # #region agent log
         try:
@@ -903,6 +945,7 @@ def _get_competitor_average_traffic(
     *,
     location_code: int,
     language_code: str,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> float:
     """
     Call competitors_domain/live to estimate the average organic traffic/visibility
@@ -934,7 +977,11 @@ def _get_competitor_average_traffic(
         },
     ]
 
-    data = _post("/v3/dataforseo_labs/google/competitors_domain/live", payload)
+    data = _post(
+        "/v3/dataforseo_labs/google/competitors_domain/live",
+        payload,
+        business_profile=business_profile,
+    )
     if not data:
         cache.set(cache_key, 0.0, timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
         return 0.0
@@ -993,6 +1040,7 @@ def _get_competitor_domains(
     location_code: int,
     language_code: str,
     limit: int = 5,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> List[str]:
     """
     Call competitors_domain/live and return 3–5 main competitor domain names
@@ -1022,7 +1070,11 @@ def _get_competitor_domains(
             "limit": min(limit + 5, 100),
         },
     ]
-    data = _post("/v3/dataforseo_labs/google/competitors_domain/live", payload)
+    data = _post(
+        "/v3/dataforseo_labs/google/competitors_domain/live",
+        payload,
+        business_profile=business_profile,
+    )
     if not data:
         cache.set(cache_key, [], timeout=COMPETITOR_LOOKUP_CACHE_TTL_SECONDS)
         return []
@@ -1076,6 +1128,7 @@ def get_ranked_keywords_visibility(
     location_code: int,
     language_code: str = "en",
     limit: int = 100,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Call ranked_keywords/live to get visibility & ranking metrics for a domain.
@@ -1098,7 +1151,11 @@ def get_ranked_keywords_visibility(
         },
     ]
 
-    data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
+    data = _post(
+        "/v3/dataforseo_labs/google/ranked_keywords/live",
+        payload,
+        business_profile=business_profile,
+    )
     # #region agent log
     _debug.log("dataforseo_utils.py:get_ranked_keywords_visibility:after_post", "API response", {"has_data": data is not None}, "H4")
     # #endregion
@@ -1184,6 +1241,7 @@ def get_question_intent_keywords(
     location_code: Optional[int] = None,
     language_code: str = "en",
     limit: int = 20,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> List[Dict[str, Any]]:
     """
     Retrieve question-intent keywords from DataForSEO for a business domain or niche.
@@ -1217,7 +1275,11 @@ def get_question_intent_keywords(
                     "limit": 200,
                 },
             ]
-            data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
+            data = _post(
+                "/v3/dataforseo_labs/google/ranked_keywords/live",
+                payload,
+                business_profile=business_profile,
+            )
             if data:
                 tasks = data.get("tasks") or []
                 for task in tasks:
@@ -1250,7 +1312,11 @@ def get_question_intent_keywords(
         niche_clean = (niche or "").strip()
         if niche_clean:
             seeded_keywords = [f"{prefix.strip()} {niche_clean}" for prefix in question_prefixes]
-            seed_volumes = _get_search_volumes_for_keywords(seeded_keywords, resolved_location_code)
+            seed_volumes = _get_search_volumes_for_keywords(
+                seeded_keywords,
+                resolved_location_code,
+                business_profile=business_profile,
+            )
             for kw_seed in seeded_keywords:
                 kw_seed_clean = kw_seed.strip()
                 if not _is_question_intent_keyword(kw_seed_clean):
@@ -1282,7 +1348,11 @@ def get_question_intent_keywords(
                         "depth": 20,
                     },
                 ]
-                data = _post("/v3/serp/google/organic/live/advanced", payload)
+                data = _post(
+                    "/v3/serp/google/organic/live/advanced",
+                    payload,
+                    business_profile=business_profile,
+                )
                 if not data:
                     continue
                 try:
@@ -1317,7 +1387,11 @@ def get_question_intent_keywords(
             ]
             paa_questions = _extract_paa_questions_for_terms(top_seed_terms)
             if paa_questions:
-                paa_volumes = _get_search_volumes_for_keywords(paa_questions, resolved_location_code)
+                paa_volumes = _get_search_volumes_for_keywords(
+                    paa_questions,
+                    resolved_location_code,
+                    business_profile=business_profile,
+                )
                 for q in paa_questions:
                     sv = int(paa_volumes.get(q.lower(), 0) or 0)
                     if sv <= 0:
@@ -1577,6 +1651,7 @@ def crawl_pages_for_onboarding(
     language_code: str = "en",
     max_pages: int = 10,
     timeout_seconds: int = 150,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, Any]:
     """
     On-Page crawl for onboarding (bounded pages, separate cache locks from AEO).
@@ -1616,6 +1691,7 @@ def crawl_pages_for_onboarding(
                     "enable_javascript": True,
                 },
             ],
+            business_profile=business_profile,
         )
         if not task_data:
             cache.delete(lock_key)
@@ -1669,6 +1745,7 @@ def crawl_pages_for_onboarding(
                     "order_by": ["page_rank,desc"],
                 },
             ],
+            business_profile=business_profile,
         )
         if not pages_data:
             out_base["exit_reason"] = "api_error"
@@ -1968,6 +2045,7 @@ def get_question_coverage_for_site(
     language_code: str = "en",
     pages: Optional[List[Dict[str, Any]]] = None,
     keywords_rows: Optional[List[Dict[str, Any]]] = None,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, Any]:
     """
     Compute question coverage score by matching question-intent keywords against crawled page content.
@@ -1992,6 +2070,7 @@ def get_question_coverage_for_site(
             location_code=location_code,
             language_code=language_code,
             limit=20,
+            business_profile=business_profile,
         )
         if not resolved_keywords_rows:
             return result
@@ -2035,6 +2114,7 @@ def get_question_coverage_for_site(
             location_code=location_code,
             language_code=language_code,
             max_pages=20,
+            business_profile=business_profile,
         )
         if isinstance(resolved_pages_raw, dict):
             resolved_pages = list(resolved_pages_raw.get("pages") or [])
@@ -2188,6 +2268,7 @@ def get_aeo_content_readiness_for_site(
             location_code=location_code,
             language_code=language_code,
             limit=20,
+            business_profile=usage_profile,
         )
         crawl_result = _crawl_pages_for_aeo(
             target_domain=normalized_domain,
@@ -2266,6 +2347,7 @@ def get_aeo_content_readiness_for_site(
             language_code=language_code,
             pages=pages,
             keywords_rows=question_keywords,
+            business_profile=usage_profile,
         )
         faq_data = compute_faq_readiness_for_pages(pages)
         snippet_data = compute_snippet_readiness_for_pages(pages)
@@ -2328,6 +2410,7 @@ def get_keyword_gap_keywords(
     location_code: int,
     language_code: str = "en",
     limit: int = 100,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> List[Dict[str, Any]]:
     """
     Call domain_intersection/live to compute keyword gaps vs competitors.
@@ -2365,7 +2448,11 @@ def get_keyword_gap_keywords(
             },
         ]
 
-        data = _post("/v3/dataforseo_labs/google/domain_intersection/live", payload)
+        data = _post(
+            "/v3/dataforseo_labs/google/domain_intersection/live",
+            payload,
+            business_profile=business_profile,
+        )
         if not data:
             continue
         try:
@@ -2707,6 +2794,7 @@ def fetch_ranked_keyword_items(
     user=None,
     *,
     limit: int = 100,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> List[Dict[str, Any]]:
     """
     Call DataForSEO Labs ranked_keywords/live and return parsed items list.
@@ -2726,7 +2814,11 @@ def fetch_ranked_keyword_items(
         domain,
         payload,
     )
-    ranked_data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
+    ranked_data = _post(
+        "/v3/dataforseo_labs/google/ranked_keywords/live",
+        payload,
+        business_profile=business_profile,
+    )
     # #region agent log
     _debug.log(
         "dataforseo_utils.py:fetch_ranked_keyword_items:response_shape",
@@ -3056,6 +3148,7 @@ def enrich_with_gap_keywords(
             location_code=location_code,
             language_code=language_code,
             limit=50,
+            business_profile=_profile,
         )
         gap_items_processed = 0
         gap_items_with_rank = 0
@@ -3323,6 +3416,7 @@ def run_local_keyword_rank_verification(
     keywords: List[str],
     location_name: str,
     language_code: str = "en",
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, int]:
     """
     Verify keyword ranks via SERP organic/live/advanced for a specific location.
@@ -3348,7 +3442,11 @@ def run_local_keyword_rank_verification(
                     "depth": 100,
                 }
             ]
-            data = _post("/v3/serp/google/organic/live/advanced", payload)
+            data = _post(
+                "/v3/serp/google/organic/live/advanced",
+                payload,
+                business_profile=business_profile,
+            )
             if not data:
                 continue
             best_rank: Optional[int] = None
@@ -3395,6 +3493,7 @@ def enrich_keyword_ranks_from_labs(
     language_code: str,
     top_keywords: List[Dict[str, Any]],
     user=None,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, int]:
     """
     Enrich existing top_keywords rank values using Labs APIs:
@@ -3413,6 +3512,10 @@ def enrich_keyword_ranks_from_labs(
             "filled_from_gap": 0,
         }
 
+    bp = business_profile if business_profile is not None else (
+        _resolve_profile_for_rank_enrichment(user) if user is not None else None
+    )
+
     total = len(top_keywords)
     null_before = sum(1 for k in top_keywords if k.get("rank") is None)
 
@@ -3421,6 +3524,7 @@ def enrich_keyword_ranks_from_labs(
         location_code=location_code,
         language_code=language_code,
         user=user,
+        business_profile=bp,
     )
     ranked_map = _best_rank_from_ranked_items(ranked_items)
     filled_from_ranked = 0
@@ -3460,7 +3564,7 @@ def enrich_keyword_ranks_from_labs(
             location_code=location_code,
             language_code=language_code,
             user=user,
-            profile=None,
+            profile=bp,
             limit=5,
             min_competitors=int(getattr(settings, "DATAFORSEO_MIN_COMPETITORS_FOR_GAP", 2)),
         )
@@ -3472,6 +3576,7 @@ def enrich_keyword_ranks_from_labs(
                 location_code=location_code,
                 language_code=language_code,
                 limit=100,
+                business_profile=bp,
             )
             gap_rank_map: Dict[str, int] = {}
             for item in gap_items:
@@ -3507,7 +3612,7 @@ def enrich_keyword_ranks_from_labs(
 
     # Add local rank verification metadata only when SEO location mode is local.
     # This step is intentionally non-breaking: baseline rank pipeline remains primary.
-    profile = _resolve_profile_for_rank_enrichment(user) if user is not None else None
+    profile = bp
     location_mode = _get_seo_location_mode(profile)
     for row in top_keywords:
         if "local_verified_rank" not in row:
@@ -3525,6 +3630,7 @@ def enrich_keyword_ranks_from_labs(
                     keywords=selected_keywords,
                     location_name=location_name,
                     language_code=language_code,
+                    business_profile=profile,
                 )
             except Exception:
                 local_rank_map = {}
@@ -3605,7 +3711,11 @@ def enrich_with_llm_keywords(
             # to any existing ranked keyword variant (e.g. "white pine dental"
             # vs "white pine dental care") so we don't falsely mark them
             # as not ranking.
-            volumes = _get_search_volumes_for_keywords(filtered_candidates, location_code)
+            volumes = _get_search_volumes_for_keywords(
+                filtered_candidates,
+                location_code,
+                business_profile=_profile,
+            )
             for phrase in filtered_candidates:
                 key_lower = phrase.lower()
                 existing_entry = existing_by_key.get(key_lower)
@@ -3725,6 +3835,7 @@ def compute_visibility_metrics(
     location_code: int,
     language_code: str,
     seo_location_mode: str = "organic",
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, Any]:
     """
     From combined top_keywords and ranked metrics, compute total_search_volume (from keywords),
@@ -3752,6 +3863,7 @@ def compute_visibility_metrics(
         domain,
         location_code=location_code,
         language_code=language_code,
+        business_profile=business_profile,
     )
     search_performance_score = compute_professional_seo_score(
         estimated_traffic=estimated_traffic,
@@ -3777,6 +3889,7 @@ def recompute_snapshot_metrics_from_keywords(
     location_code: int,
     language_code: str = "en",
     seo_location_mode: str = "organic",
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, int]:
     """
     Recompute aggregate snapshot metrics from enriched keyword rows.
@@ -3829,6 +3942,7 @@ def recompute_snapshot_metrics_from_keywords(
         int(location_code),
         language_code,
         seo_location_mode=seo_location_mode,
+        business_profile=business_profile,
     )
     return normalize_seo_snapshot_metrics(
         {
@@ -4184,6 +4298,7 @@ def get_or_refresh_seo_score_for_user(
                 location_code=int(ranking_location_code),
                 language_code=language_code,
                 seo_location_mode=location_mode,
+                business_profile=profile,
             )
             if location_mode == "local":
                 baseline_cmp = recompute_snapshot_metrics_from_keywords(
@@ -4192,6 +4307,7 @@ def get_or_refresh_seo_score_for_user(
                     location_code=int(ranking_location_code),
                     language_code=language_code,
                     seo_location_mode="organic",
+                    business_profile=profile,
                 )
                 affects_visibility = local_verification_affects_visibility(
                     seo_location_mode=location_mode,
@@ -4285,7 +4401,13 @@ def get_or_refresh_seo_score_for_user(
     from accounts.third_party_usage import usage_profile_context
 
     def _live_seo_refresh_branch() -> Dict[str, Any] | None:
-        items = fetch_ranked_keyword_items(domain, ranking_location_code, language_code, user)
+        items = fetch_ranked_keyword_items(
+            domain,
+            ranking_location_code,
+            language_code,
+            user,
+            business_profile=profile,
+        )
         if not items:
             # #region agent log
             _debug.log(
@@ -4317,6 +4439,7 @@ def get_or_refresh_seo_score_for_user(
                 location_code=int(ranking_location_code),
                 language_code=language_code,
                 seo_location_mode=location_mode,
+                business_profile=profile,
             )
         )
         affects_miss = False
@@ -4328,6 +4451,7 @@ def get_or_refresh_seo_score_for_user(
                     location_code=int(ranking_location_code),
                     language_code=language_code,
                     seo_location_mode="organic",
+                    business_profile=profile,
                 )
             )
             affects_miss = local_verification_affects_visibility(

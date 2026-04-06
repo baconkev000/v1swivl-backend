@@ -972,17 +972,23 @@ class AgentActivityLog(models.Model):
         return f"AgentActivityLog(user={self.user!s}, agent={self.agent}, at={self.created_at})"
 
 
+class ThirdPartyApiProvider(models.TextChoices):
+    """Shared provider slug for usage logs and error logs."""
+
+    DATAFORSEO = "dataforseo", "DataForSEO"
+    OPENAI = "openai", "OpenAI"
+    GEMINI = "gemini", "Google Gemini"
+    PERPLEXITY = "perplexity", "Perplexity"
+
+
 class ThirdPartyApiRequestLog(models.Model):
     """
-    One row per outbound call to DataForSEO, OpenAI, or Gemini (for usage graphs and cost tracking).
+    One row per outbound call to DataForSEO, OpenAI, Gemini, or Perplexity (for usage graphs and cost tracking).
     """
 
-    class Provider(models.TextChoices):
-        DATAFORSEO = "dataforseo", "DataForSEO"
-        OPENAI = "openai", "OpenAI"
-        GEMINI = "gemini", "Google Gemini"
+    Provider = ThirdPartyApiProvider  # backward-compatible alias
 
-    provider = models.CharField(max_length=32, choices=Provider.choices, db_index=True)
+    provider = models.CharField(max_length=32, choices=ThirdPartyApiProvider.choices, db_index=True)
     business_profile = models.ForeignKey(
         BusinessProfile,
         null=True,
@@ -1026,5 +1032,65 @@ class ThirdPartyApiRequestLog(models.Model):
 
     def __str__(self) -> str:
         return f"{self.provider} {self.operation[:40]!r} @ {self.created_at}"
+
+
+class ThirdPartyApiErrorLog(models.Model):
+    """
+    Failed or erroneous outbound third-party API calls (debugging; separate from usage/cost rows).
+    """
+
+    class ErrorKind(models.TextChoices):
+        HTTP_ERROR = "http_error", "HTTP error"
+        TIMEOUT = "timeout", "Timeout"
+        CONNECTION_ERROR = "connection_error", "Connection error"
+        PARSE_ERROR = "parse_error", "Parse error"
+        VALIDATION_ERROR = "validation_error", "Validation error"
+        UNKNOWN_EXCEPTION = "unknown_exception", "Unknown exception"
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    provider = models.CharField(max_length=32, choices=ThirdPartyApiProvider.choices, db_index=True)
+    business_profile = models.ForeignKey(
+        BusinessProfile,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="third_party_api_error_logs",
+    )
+    operation = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="Endpoint or logical operation name (same convention as ThirdPartyApiRequestLog).",
+    )
+    http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    error_kind = models.CharField(
+        max_length=32,
+        choices=ErrorKind.choices,
+        default=ErrorKind.UNKNOWN_EXCEPTION,
+        db_index=True,
+    )
+    message = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="Short summary (exception message or status-derived text).",
+    )
+    detail = models.TextField(
+        blank=True,
+        default="",
+        help_text="Truncated response body or extra context (no full prompts).",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Third-party API error"
+        verbose_name_plural = "Third-party API errors"
+        indexes = [
+            models.Index(fields=["provider", "created_at"]),
+            models.Index(fields=["business_profile", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.provider} {self.error_kind} {self.operation[:32]!r} @ {self.created_at}"
 
 

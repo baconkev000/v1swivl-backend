@@ -1,12 +1,13 @@
 """
-AEO prompt execution: OpenAI per prompt, optional parallel Google Gemini, raw response capture.
+AEO prompt execution: OpenAI per prompt, optional parallel Gemini and Perplexity Sonar, raw response capture.
 
 Uses existing OpenAI client resolution from accounts.openai_utils.
 Execution *system* prompt text lives in aeo_prompts.py (AEO_EXECUTION_SYSTEM_PROMPT);
 Gemini mirrors the same instruction via accounts.aeo.gemini_prompts.
 
-When ``GEMINI_API_KEY`` is set, batch runs use a shared ThreadPoolExecutor (see ``AEO_EXECUTION_MAX_WORKERS``)
-so many prompts’ OpenAI and Gemini calls can overlap; partial provider failure still persists the other provider’s row.
+When ``GEMINI_API_KEY`` and/or ``PERPLEXITY_API_KEY`` are set, batch runs use a shared ThreadPoolExecutor
+(see ``AEO_EXECUTION_MAX_WORKERS``) so many prompts’ provider calls can overlap; partial provider failure
+still persists the other providers’ rows (shared ``execution_pair_id`` per logical prompt).
 
 Optional Django settings (defaults are conservative for repeatable runs):
     AEO_EXECUTION_MODEL — env override; defaults to settings.OPENAI_MODEL
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM_OPENAI = "openai"
 PLATFORM_GEMINI = "gemini"
+PLATFORM_PERPLEXITY = "perplexity"
 DEFAULT_PLATFORM = PLATFORM_OPENAI
 DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
 
@@ -210,6 +212,7 @@ def run_single_aeo_prompt(
 
     raw = ""
     err: str | None = None
+    last_exc: BaseException | None = None
     attempts = _execution_max_attempts()
     for attempt in range(attempts):
         try:
@@ -217,6 +220,7 @@ def run_single_aeo_prompt(
                 exec_client,
                 operation="openai.chat.aeo_prompt_execution",
                 business_profile=business_profile,
+                emit_api_error_log=False,
                 model=model,
                 messages=[
                     {"role": "system", "content": AEO_EXECUTION_SYSTEM_PROMPT},
@@ -233,6 +237,7 @@ def run_single_aeo_prompt(
             err = None
             break
         except Exception as exc:
+            last_exc = exc
             err = f"{type(exc).__name__}: {exc}"
             logger.warning(
                 "AEO OpenAI execution failed (attempt %s/%s): %s",
@@ -244,6 +249,21 @@ def run_single_aeo_prompt(
                 time.sleep(1.0)
                 continue
             break
+
+    if err and last_exc is not None:
+        from accounts.models import ThirdPartyApiProvider
+        from accounts.third_party_usage import classify_openai_sdk_exception, record_third_party_api_error
+
+        kind, http = classify_openai_sdk_exception(last_exc)
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.OPENAI,
+            operation="openai.chat.aeo_prompt_execution",
+            error_kind=kind,
+            message=err[:1024] if err else str(last_exc)[:1024],
+            detail=None,
+            http_status=http,
+            business_profile=business_profile,
+        )
 
     executed_at = datetime.now(timezone.utc)
     snapshot_id: int | None = None
@@ -312,25 +332,38 @@ def _result_dict(
     }
 
 
-def _normalize_providers_arg(
-    providers: Sequence[str] | None,
-) -> tuple[str | None, str | None]:
+def _providers_explicit_filter(providers: Sequence[str] | None) -> frozenset[str] | None:
     """
-    Returns (openai_mode, gemini_mode) where each is 'only' | 'include' | None (omit).
-
-    None / empty providers → dual-provider when Gemini key exists (auto).
-    ('openai',) → OpenAI only; ('gemini',) → Gemini only.
+    None → auto (OpenAI + optional Gemini/Perplexity when API keys exist).
+    Non-empty sequence → run only the listed providers (lowercase names: openai, gemini, perplexity).
+    Empty sequence → same as None (auto).
     """
-    if not providers:
-        return (None, None)
+    if providers is None:
+        return None
     low = [str(p).strip().lower() for p in providers if str(p).strip()]
-    if set(low) == {"openai"}:
-        return ("only", None)
-    if set(low) == {"gemini"}:
-        return (None, "only")
-    if set(low) >= {"openai", "gemini"}:
-        return (None, None)
-    return (None, None)
+    if not low:
+        return None
+    return frozenset(low)
+
+
+def _execution_provider_flags(
+    explicit: frozenset[str] | None,
+) -> tuple[bool, bool, bool]:
+    """Returns (run_openai, run_gemini, run_perplexity)."""
+    from ..gemini_utils import gemini_execution_enabled
+    from .perplexity_execution_utils import perplexity_execution_enabled
+
+    if explicit is None:
+        return (
+            True,
+            gemini_execution_enabled(),
+            perplexity_execution_enabled(),
+        )
+    return (
+        "openai" in explicit,
+        "gemini" in explicit,
+        "perplexity" in explicit,
+    )
 
 
 def run_aeo_prompt_batch(
@@ -344,28 +377,25 @@ def run_aeo_prompt_batch(
     providers: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """
-    Run each prompt (OpenAI; plus Gemini in parallel when an API key is configured).
+    Run each prompt across enabled providers (OpenAI; plus Gemini and/or Perplexity when keys exist).
 
-    ``providers`` — optional filter: ``['openai']`` or ``['gemini']`` runs that provider only
-    (for dashboard refreshes). When omitted, uses dual execution if ``GEMINI_API_KEY`` is set.
+    ``providers`` — optional filter, e.g. ``['openai']``, ``['gemini']``, ``['perplexity']``, or
+    combinations, for dashboard refreshes. When omitted, auto-selects all configured providers.
 
-    ``executed`` counts successful provider saves; ``failed`` counts provider attempts that
-    errored (excluding Gemini skipped when no key). Celery-friendly; one provider failing
-    does not block the other.
+    ``executed`` counts successful provider saves; ``failed`` counts provider attempts that errored
+    (excluding ``skipped_no_api_key``). Celery-friendly; one provider failing does not block others.
 
-    Returns aggregate stats plus per-provider result dicts (two per prompt when dual-provider).
+    Returns aggregate stats plus one result dict per provider invocation (up to three per prompt).
     """
-    from ..gemini_utils import gemini_execution_enabled
     from .gemini_execution_utils import run_single_aeo_prompt_gemini
+    from .perplexity_execution_utils import run_single_aeo_prompt_perplexity
 
-    openai_p, gemini_p = _normalize_providers_arg(providers)
-    openai_only = openai_p == "only"
-    gemini_only = gemini_p == "only"
+    explicit = _providers_explicit_filter(providers)
+    run_openai, run_gemini, run_perplexity = _execution_provider_flags(explicit)
 
     results: list[dict[str, Any]] = []
     ok = 0
     failed = 0
-    dual = gemini_execution_enabled() and not openai_only and not gemini_only
     max_workers = _execution_max_workers()
 
     def _accumulate(one: dict[str, Any]) -> None:
@@ -386,33 +416,21 @@ def run_aeo_prompt_batch(
             "results": results,
         }
 
+    if not (run_openai or run_gemini or run_perplexity):
+        return {
+            "profile_id": business_profile.id,
+            "executed": 0,
+            "failed": 0,
+            "total": 0,
+            "results": [],
+        }
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        if gemini_only:
-            futures = []
-            for prompt_obj in prompt_set:
-                pair_id = uuid.uuid4() if execution_run else None
+        futures: list[Any] = []
+        for prompt_obj in prompt_set:
+            pair_id = uuid.uuid4() if execution_run else None
 
-                def gemini_job(
-                    po: Mapping[str, Any] = prompt_obj,
-                    pid: UUID | None = pair_id,
-                ) -> dict[str, Any]:
-                    return run_single_aeo_prompt_gemini(
-                        po,
-                        business_profile,
-                        save=save,
-                        execution_run=execution_run,
-                        execution_pair_id=pid,
-                    )
-
-                futures.append(pool.submit(gemini_job))
-            for fut in futures:
-                one = fut.result()
-                results.append(one)
-                _accumulate(one)
-        elif dual:
-            pair_futures: list[tuple[Any, Any]] = []
-            for prompt_obj in prompt_set:
-                pair_id = uuid.uuid4() if execution_run else None
+            if run_openai:
 
                 def openai_job(
                     po: Mapping[str, Any] = prompt_obj,
@@ -429,6 +447,10 @@ def run_aeo_prompt_batch(
                         execution_pair_id=pid,
                     )
 
+                futures.append(pool.submit(openai_job))
+
+            if run_gemini:
+
                 def gemini_job(
                     po: Mapping[str, Any] = prompt_obj,
                     pid: UUID | None = pair_id,
@@ -441,36 +463,28 @@ def run_aeo_prompt_batch(
                         execution_pair_id=pid,
                     )
 
-                pair_futures.append((pool.submit(openai_job), pool.submit(gemini_job)))
-            for fut_o, fut_g in pair_futures:
-                for one in (fut_o.result(), fut_g.result()):
-                    results.append(one)
-                    _accumulate(one)
-        else:
-            futures = []
-            for prompt_obj in prompt_set:
-                pair_id = uuid.uuid4() if execution_run else None
+                futures.append(pool.submit(gemini_job))
 
-                def openai_only_job(
+            if run_perplexity:
+
+                def perplexity_job(
                     po: Mapping[str, Any] = prompt_obj,
                     pid: UUID | None = pair_id,
                 ) -> dict[str, Any]:
-                    return run_single_aeo_prompt(
+                    return run_single_aeo_prompt_perplexity(
                         po,
                         business_profile,
-                        client=None,
                         save=save,
-                        platform=PLATFORM_OPENAI if openai_only else platform,
-                        api_key_env=api_key_env,
                         execution_run=execution_run,
                         execution_pair_id=pid,
                     )
 
-                futures.append(pool.submit(openai_only_job))
-            for fut in futures:
-                one = fut.result()
-                results.append(one)
-                _accumulate(one)
+                futures.append(pool.submit(perplexity_job))
+
+        for fut in futures:
+            one = fut.result()
+            results.append(one)
+            _accumulate(one)
 
     return {
         "profile_id": business_profile.id,

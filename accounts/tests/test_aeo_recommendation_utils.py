@@ -6,10 +6,12 @@ from accounts.aeo.aeo_recommendation_utils import (
     _build_onpage_crawl_summary,
     _build_sanitized_nl_signals,
     _competitor_display_names,
+    _group_gap_objects_for_recommendations,
     _industry_snippet_for_copy,
     _nl_template,
     _prompt_short_label,
     _region_label_for_profile,
+    analyze_citation_gaps,
     analyze_visibility_gaps,
 )
 from accounts.models import AEOExtractionSnapshot
@@ -64,11 +66,17 @@ def test_sanitized_nl_signals_omits_reason_and_nl_explanation():
         "gap_kind",
         "score",
         "crawl_summary",
+        "absence_reason",
+        "intent_type",
+        "content_angle",
     }
     assert "reason" not in s and "nl_explanation" not in s
     assert s["prompt"] == "Best dentist?"
     assert s["competitors"] == ["Acme"]
     assert s["score"]["visibility_pct"] == 12.0
+    assert s["absence_reason"] == "missing_category_page"
+    assert s["intent_type"] == "comparison"
+    assert s["content_angle"] == "comparison"
 
 
 def test_sanitized_nl_signals_prompt_is_short_label():
@@ -116,6 +124,7 @@ def test_sanitized_nl_signals_visibility_miss_url_identity():
     assert s["cited_domain_in_answer"] == ["wrong.com"]
     assert "wrong.com" in s["url_identity_summary"]
     assert s["verification_summary"] == "dns_ok;http_ok"
+    assert s["absence_reason"] == "entity_confusion"
 
 
 def test_sanitized_nl_signals_omits_not_mentioned_status():
@@ -130,6 +139,64 @@ def test_sanitized_nl_signals_omits_not_mentioned_status():
     s = _build_sanitized_nl_signals(raw)
     assert s["canonical_domain"] == "co.com"
     assert "brand_mentioned_url_status" not in s
+
+
+def test_sanitized_nl_signals_preserves_allowed_absence_and_intent():
+    raw = {
+        "gap_kind": "visibility_miss",
+        "prompt_text": "How much does this service cost?",
+        "business_name": "Co",
+        "region_label": "X",
+        "absence_reason": "missing_trust_signal",
+        "intent_type": "transactional",
+    }
+    s = _build_sanitized_nl_signals(raw)
+    assert s["absence_reason"] == "missing_trust_signal"
+    assert s["intent_type"] == "transactional"
+    assert s["content_angle"] == "trust_proof"
+
+
+def test_analyze_citation_gaps_filters_competitor_and_non_directory_domains():
+    ex = SimpleNamespace(
+        id=1,
+        response_snapshot_id=1,
+        citations_json=["competitor.com", "yelp.com", "randombrand.ai"],
+        competitors_json=[{"name": "Comp", "url": "https://competitor.com"}],
+    )
+    gaps = analyze_citation_gaps(None, [ex], citation_share=10.0)
+    domains = [g.get("source_domain") for g in gaps if g.get("source_domain")]
+    assert "competitor.com" not in domains
+    assert "randombrand.ai" not in domains
+    assert "yelp.com" in domains
+
+
+def test_group_gaps_by_absence_reason_and_content_angle():
+    grouped = _group_gap_objects_for_recommendations(
+        [
+            {
+                "gap_kind": "visibility_miss",
+                "prompt_text": "best forklift rental",
+                "absence_reason": "missing_category_page",
+                "content_angle": "service_offer",
+            },
+            {
+                "gap_kind": "visibility_miss",
+                "prompt_text": "forklift rental pricing",
+                "absence_reason": "missing_category_page",
+                "content_angle": "service_offer",
+            },
+            {
+                "gap_kind": "visibility_miss",
+                "prompt_text": "is forklift rental insured",
+                "absence_reason": "missing_trust_signal",
+                "content_angle": "trust_proof",
+            },
+        ],
+        action_type="create_content",
+    )
+    assert len(grouped) == 2
+    first = [g for g in grouped if g.get("absence_reason") == "missing_category_page"][0]
+    assert "(+1 similar prompts)" in first.get("prompt_text", "")
 
 
 def test_nl_template_wrong_live_vs_broken():
@@ -153,9 +220,10 @@ def test_nl_template_wrong_live_vs_broken():
             "brand_mentioned_url_status": AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN,
         }
     )
-    assert "sameAs" in live or "sameas" in live.lower()
-    assert "footer" in broken.lower() or "official" in broken.lower()
-    assert "disambiguat" in live.lower() or "disambiguation" in live.lower()
+    assert "official website" in live.lower()
+    assert "footer" in broken.lower() or "official website" in broken.lower()
+    assert "canonical" not in live.lower()
+    assert "disambiguation" not in live.lower()
 
 
 def test_analyze_visibility_gaps_merges_url_identity():

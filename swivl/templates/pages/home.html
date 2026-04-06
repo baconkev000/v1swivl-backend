@@ -18,7 +18,7 @@
         {% translate "requests;" %}
         {% translate "estimated" %}
         ${{ api_usage_total_cost_usd|floatformat:4 }}
-        {% translate "USD (DataForSEO task cost when provided; token-based estimates for OpenAI/Gemini)." %}
+        {% translate "USD. DataForSEO: per-request amounts from the API task cost field when present (not token-based). OpenAI/Gemini: estimated from reported token usage." %}
       </p>
       <form method="get" class="row g-2 align-items-end mb-4">
         <div class="col-auto">
@@ -39,6 +39,7 @@
             <option value="dataforseo" {% if selected_tokens_platform_filter == "dataforseo" %}selected{% endif %}>DataForSEO</option>
             <option value="openai" {% if selected_tokens_platform_filter == "openai" %}selected{% endif %}>OpenAI</option>
             <option value="gemini" {% if selected_tokens_platform_filter == "gemini" %}selected{% endif %}>Gemini</option>
+            <option value="perplexity" {% if selected_tokens_platform_filter == "perplexity" %}selected{% endif %}>Perplexity</option>
           </select>
         </div>
       </form>
@@ -50,7 +51,7 @@
           </div>
         </div>
         <div class="col-lg-6">
-          <h3 class="h6">{% translate "Estimated cost (USD) per month" %}</h3>
+          <h3 class="h6">{% translate "Cost (USD) per month" %}</h3>
           <div class="position-relative w-100 overflow-hidden" style="height: 300px; max-height: 45vh">
             <canvas id="apiUsageCostChart" aria-label="{% translate 'Cost chart' %}"></canvas>
           </div>
@@ -58,7 +59,7 @@
       </div>
       <h3 class="h6 mt-4">{% translate "Tokens sent vs received" %}</h3>
       <p class="text-muted small mb-2">
-        {% translate "Input (prompt) and output (completion) tokens from OpenAI and Gemini when the provider reports usage. DataForSEO has no token counts." %}
+        {% translate "Input (prompt) and output (completion) tokens from OpenAI and Gemini when the provider reports usage. DataForSEO is billed per API request; it does not expose token counts—use the cost chart above for DataForSEO spend." %}
         {% translate "Chart window totals — sent:" %}
         {{ token_usage_totals.sent }}
         {% translate "received:" %}

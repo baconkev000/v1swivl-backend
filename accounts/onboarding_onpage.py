@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 from django.conf import settings
 
 from .constants import ONBOARDING_RANKED_KEYWORDS_LIMIT
+from accounts.third_party_usage import usage_profile_context
+
 from .dataforseo_utils import crawl_pages_for_onboarding, fetch_ranked_keyword_items
 from .models import OnboardingOnPageCrawl
 from .onboarding_keyword_filter import apply_aeo_keyword_pipeline, ranked_rows_as_labs_api_shape
@@ -273,45 +275,48 @@ def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
     crawl.save(update_fields=["status", "updated_at"])
 
     try:
-        result = crawl_pages_for_onboarding(
-            target_domain=crawl.domain,
-            max_pages=min(crawl.max_pages, 10),
-            timeout_seconds=150,
-        )
-        raw_pages: List[Dict[str, Any]] = result.get("pages") or []
-        context = crawl.context if isinstance(crawl.context, dict) else {}
-        extracted = [
-            extract_onboarding_page_record(p, context) for p in raw_pages[: crawl.max_pages]
-        ]
-        crawl.pages = extracted
-        crawl.task_id = str(result.get("task_id") or "")[:128]
-        crawl.exit_reason = str(result.get("exit_reason") or "")[:64]
-        if extracted:
-            crawl.status = OnboardingOnPageCrawl.STATUS_COMPLETED
-            crawl.error_message = ""
-        else:
-            crawl.status = OnboardingOnPageCrawl.STATUS_FAILED
-            crawl.error_message = (
-                result.get("exit_reason")
-                or result.get("crawl_status")
-                or "no_pages"
-            )[:2000]
-
-        location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
-        language_code = str(getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en") or "en")
-        ranked_items: List[Dict[str, Any]] = []
-        crawl.ranked_keywords_error = ""
-        try:
-            ranked_items = fetch_ranked_keyword_items(
-                crawl.domain,
-                location_code,
-                language_code,
-                user=crawl.user,
-                limit=ONBOARDING_RANKED_KEYWORDS_LIMIT,
+        with usage_profile_context(crawl.business_profile):
+            result = crawl_pages_for_onboarding(
+                target_domain=crawl.domain,
+                max_pages=min(crawl.max_pages, 10),
+                timeout_seconds=150,
+                business_profile=crawl.business_profile,
             )
-        except Exception as exc:
-            logger.exception("[onboarding onpage] ranked_keywords fetch crawl_id=%s", crawl_id)
-            crawl.ranked_keywords_error = str(exc)[:2000]
+            raw_pages: List[Dict[str, Any]] = result.get("pages") or []
+            context = crawl.context if isinstance(crawl.context, dict) else {}
+            extracted = [
+                extract_onboarding_page_record(p, context) for p in raw_pages[: crawl.max_pages]
+            ]
+            crawl.pages = extracted
+            crawl.task_id = str(result.get("task_id") or "")[:128]
+            crawl.exit_reason = str(result.get("exit_reason") or "")[:64]
+            if extracted:
+                crawl.status = OnboardingOnPageCrawl.STATUS_COMPLETED
+                crawl.error_message = ""
+            else:
+                crawl.status = OnboardingOnPageCrawl.STATUS_FAILED
+                crawl.error_message = (
+                    result.get("exit_reason")
+                    or result.get("crawl_status")
+                    or "no_pages"
+                )[:2000]
+
+            location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+            language_code = str(getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en") or "en")
+            ranked_items: List[Dict[str, Any]] = []
+            crawl.ranked_keywords_error = ""
+            try:
+                ranked_items = fetch_ranked_keyword_items(
+                    crawl.domain,
+                    location_code,
+                    language_code,
+                    user=crawl.user,
+                    limit=ONBOARDING_RANKED_KEYWORDS_LIMIT,
+                    business_profile=crawl.business_profile,
+                )
+            except Exception as exc:
+                logger.exception("[onboarding onpage] ranked_keywords fetch crawl_id=%s", crawl_id)
+                crawl.ranked_keywords_error = str(exc)[:2000]
 
         bundle = build_topic_clusters(extracted, ranked_items)
         filtered_ranked = apply_aeo_keyword_pipeline(

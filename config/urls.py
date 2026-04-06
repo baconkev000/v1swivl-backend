@@ -86,6 +86,11 @@ urlpatterns += [
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
     path("api/aeo/refresh-gemini/", accounts_views.refresh_aeo_gemini, name="refresh-aeo-gemini"),
     path(
+        "api/aeo/refresh-perplexity/",
+        accounts_views.refresh_aeo_perplexity,
+        name="refresh-aeo-perplexity",
+    ),
+    path(
         "api/aeo/refresh-execution/",
         accounts_views.aeo_refresh_execution,
         name="aeo-refresh-execution",

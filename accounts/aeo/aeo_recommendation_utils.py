@@ -52,6 +52,60 @@ RECOMMENDATION_TYPE_CHOICES: frozenset[str] = frozenset(
     }
 )
 
+ABSENCE_REASON_CHOICES: frozenset[str] = frozenset(
+    {
+        "competitor_authority",
+        "missing_category_page",
+        "entity_confusion",
+        "missing_local_signal",
+        "missing_trust_signal",
+    }
+)
+
+INTENT_TYPE_CHOICES: frozenset[str] = frozenset(
+    {
+        "transactional",
+        "trust",
+        "comparison",
+        "local",
+        "informational",
+    }
+)
+
+CONTENT_ANGLE_CHOICES: frozenset[str] = frozenset(
+    {
+        "service_offer",
+        "trust_proof",
+        "comparison",
+        "local_availability",
+        "brand_identity",
+        "safety_authority",
+    }
+)
+
+_TRUSTED_CITATION_DOMAIN_HINTS: tuple[str, ...] = (
+    "yelp",
+    "yellowpages",
+    "bbb.",
+    "angi",
+    "homeadvisor",
+    "thumbtack",
+    "houzz",
+    "tripadvisor",
+    "trustpilot",
+    "g2.",
+    "clutch",
+    "capterra",
+    "chamberofcommerce",
+    ".org",
+    ".gov",
+    "wikipedia",
+    "linkedin",
+    "facebook.com",
+    "instagram.com",
+    "youtube.com",
+)
+
 # Country / macro-region strings that are too vague alone for AEO locality copy
 _VAGUE_LOCALITY_ONLY: frozenset[str] = frozenset(
     {
@@ -239,6 +293,40 @@ def _first_extraction_ids_for_domain(
     return None, None
 
 
+def _domain_from_any(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    if not s:
+        return ""
+    if "://" not in s and "/" not in s:
+        s = "https://" + s
+    return canonical_registrable_domain(s) or ""
+
+
+def _competitor_domains_from_extractions(extraction_snapshots: list[AEOExtractionSnapshot]) -> set[str]:
+    out: set[str] = set()
+    for ex in extraction_snapshots:
+        comps = ex.competitors_json or []
+        if not isinstance(comps, list):
+            continue
+        for c in comps:
+            if not isinstance(c, dict):
+                continue
+            for key in ("url", "domain"):
+                dom = _domain_from_any(str(c.get(key) or ""))
+                if dom:
+                    out.add(dom)
+    return out
+
+
+def _is_allowed_citation_target_domain(domain: str, *, excluded: set[str]) -> bool:
+    d = (domain or "").strip().lower()
+    if not d or "." not in d:
+        return False
+    if d in excluded:
+        return False
+    return any(h in d for h in _TRUSTED_CITATION_DOMAIN_HINTS)
+
+
 def _top_competitors_from_score(score: AEOScoreSnapshot | None, limit: int = 3) -> list[str]:
     if not score:
         return []
@@ -295,14 +383,14 @@ def _url_identity_fields_from_extraction(
         other = cited_raw or "another domain"
         canon_disp = canon or "(no canonical domain on file)"
         summary = (
-            f"Modeled answers tied your brand to {other} while your registered site is {canon_disp}; {other} resolves "
-            f"over the network (likely a different entity—disambiguate in content and schema)."
+            f"Answer results are pointing to {other} instead of your official site {canon_disp}. "
+            f"Make your business name and official website explicit across your homepage, About page, and listings."
         )
     elif status_str == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN:
         other = cited_raw or "a URL"
         summary = (
-            f"Modeled answers tied your brand to {other}; that destination does not resolve reliably—treat it as a bad "
-            f"citation and reinforce your official URL in schema, footer, and major listings."
+            f"Answer results are pointing to {other}, but that link is broken or unreliable. "
+            f"Reinforce your official website everywhere your business is listed so engines stop using bad links."
         )
 
     return {
@@ -369,14 +457,21 @@ def analyze_citation_gaps(
     if cite >= 30.0:
         return gaps
 
+    own_domain = canonical_registrable_domain(
+        getattr(score_snapshot, "profile", None).website_url if score_snapshot and getattr(score_snapshot, "profile", None) else ""
+    )
+    excluded_domains = _competitor_domains_from_extractions(extraction_snapshots)
+    if own_domain:
+        excluded_domains.add(own_domain)
+
     dom_counter: Counter[str] = Counter()
     for ex in extraction_snapshots:
         cites = ex.citations_json or []
         if not isinstance(cites, list):
             continue
         for raw in cites:
-            d = str(raw).strip().lower()
-            if d and "." in d:
+            d = _domain_from_any(str(raw))
+            if d and _is_allowed_citation_target_domain(d, excluded=excluded_domains):
                 dom_counter[d] += 1
 
     top_domains = [h for h, _ in dom_counter.most_common(5)]
@@ -464,6 +559,70 @@ def _industry_snippet_for_copy(industry: str | None, *, max_len: int = 60) -> st
     return first
 
 
+def _derive_absence_reason(gap_object: dict[str, Any]) -> str:
+    raw = str(gap_object.get("absence_reason") or "").strip().lower()
+    if raw in ABSENCE_REASON_CHOICES:
+        return raw
+    status = str(gap_object.get("brand_mentioned_url_status") or "").strip()
+    if status in (
+        AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_LIVE,
+        AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN,
+    ):
+        return "entity_confusion"
+    kind = str(gap_object.get("gap_kind") or "").strip()
+    if kind in ("citation_share", "citation_share_generic"):
+        return "competitor_authority"
+    action_type = str(gap_object.get("action_type") or "").strip()
+    if action_type == "create_content":
+        return "missing_category_page"
+    return ""
+
+
+def _derive_intent_type(gap_object: dict[str, Any]) -> str:
+    raw = str(gap_object.get("intent_type") or "").strip().lower()
+    if raw in INTENT_TYPE_CHOICES:
+        return raw
+    p = str(gap_object.get("prompt_text") or gap_object.get("prompt") or "").strip().lower()
+    if p:
+        if any(tok in p for tok in ("near me", "nearby", "in ", "local", "city", "area")):
+            return "local"
+        if any(tok in p for tok in ("best", "top", "vs", "compare", "comparison", "alternative")):
+            return "comparison"
+        if any(tok in p for tok in ("price", "pricing", "cost", "quote", "book", "hire", "buy")):
+            return "transactional"
+        if any(tok in p for tok in ("review", "trusted", "safe", "licensed", "certified", "reliable")):
+            return "trust"
+    action_type = str(gap_object.get("action_type") or "").strip()
+    if action_type == "acquire_citation":
+        return "trust"
+    if action_type == "create_content":
+        return "transactional"
+    return "informational"
+
+
+def _derive_content_angle(gap_object: dict[str, Any]) -> str:
+    raw = str(gap_object.get("content_angle") or "").strip().lower()
+    if raw in CONTENT_ANGLE_CHOICES:
+        return raw
+    absence_reason = _derive_absence_reason(gap_object)
+    intent_type = _derive_intent_type(gap_object)
+    status = str(gap_object.get("brand_mentioned_url_status") or "").strip()
+    if status in (
+        AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_LIVE,
+        AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN,
+    ) or absence_reason == "entity_confusion":
+        return "brand_identity"
+    if absence_reason == "missing_local_signal" or intent_type == "local":
+        return "local_availability"
+    if absence_reason == "missing_trust_signal" or intent_type == "trust":
+        return "trust_proof"
+    if absence_reason == "competitor_authority":
+        return "safety_authority"
+    if intent_type == "comparison":
+        return "comparison"
+    return "service_offer"
+
+
 def generate_natural_language_recommendation(
     gap_object: dict[str, Any],
     *,
@@ -498,10 +657,8 @@ def _nl_template_no_gap(gap: dict[str, Any]) -> str:
     location = (gap.get("region_label") or gap.get("city") or "").strip() or "your area"
     bn = (gap.get("business_name") or "").strip() or "your business"
     return (
-        f"No single prompt was flagged this pass—your headline visibility is about {vis:.0f}% and citation-style "
-        f"share about {cite:.0f}%. You should align your homepage and top service page so the legal name of {bn} "
-        f"matches your Google Business Profile, and add one FAQ pair that answers a common buyer question for {location} "
-        f"so models have a citable snippet."
+        f"Update your homepage and top service page so {bn} is written the same way as your business listings, then add one short FAQ for buyers in {location}. "
+        f"This gives answer engines clearer details to trust, which helps your business appear more often in AI-generated answers."
     )
 
 
@@ -515,85 +672,94 @@ def _nl_context_labels(gap: dict[str, Any]) -> tuple[str, str, str, str]:
 
 
 def _nl_template(gap: dict[str, Any]) -> str:
-    kind = gap.get("gap_kind")
-    bn, region, industry, services = _nl_context_labels(gap)
-    ind_snip = _industry_snippet_for_copy(industry)
-    ind_lead = f"As a {ind_snip} operator, " if ind_snip else ""
-    svc_tail = f" Where it is truthful, mention {services} on that page." if services else ""
+    kind = str(gap.get("gap_kind") or "").strip()
+    bn, region, _industry, services = _nl_context_labels(gap)
+    absence_reason = _derive_absence_reason(gap)
+    intent_type = _derive_intent_type(gap)
+    content_angle = _derive_content_angle(gap)
+    status = str(gap.get("brand_mentioned_url_status") or "").strip()
+    cited = ""
+    cited_raw = gap.get("cited_domain_in_answer")
+    if isinstance(cited_raw, list) and cited_raw:
+        cited = str(cited_raw[0] or "").strip()
+    canonical = str(gap.get("canonical_domain") or "").strip()
 
-    if kind == "visibility_miss":
-        uid = (gap.get("url_identity_summary") or "").strip()
-        st = (gap.get("brand_mentioned_url_status") or "").strip()
-        if uid and st == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_LIVE:
-            return (
-                f"{ind_lead}{uid} "
-                f"You should publish clear legal/trading-name copy, Organization or LocalBusiness JSON-LD with your true "
-                f"url and sameAs to Google Business Profile and key profiles, plus a short disambiguation line so models "
-                f"map {bn} to your canonical site—not the other domain.{svc_tail}"
-            ).strip()
-        if uid and st == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN:
-            return (
-                f"{ind_lead}{uid} "
-                f"You should audit schema url fields, add a visible footer or FAQ “official website” line pointing to your "
-                f"live domain, and ensure sitemap or listings expose that URL so models prefer it over dead links.{svc_tail}"
-            ).strip()
+    if status == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_LIVE:
+        action = (
+            f"Add a short About section that says {canonical or 'your website'} is your official website and keep the same business name on your site and listings"
+        )
+        why = (
+            f"This helps answer engines stop confusing you with {cited or 'another business'} and mention {bn} more often in relevant answers."
+        )
+        return f"{action}. {why}"
+    if status == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN:
+        action = (
+            "Add an \"Official website\" line in your footer and contact page, then update your main listings to the same live URL"
+        )
+        why = (
+            "This gives answer engines one trusted website to reference instead of broken links, so your business appears more consistently."
+        )
+        return f"{action}. {why}"
 
-        comps = gap.get("competitors_in_answer") or []
-        comp_str = ", ".join(_competitor_display_names(comps if isinstance(comps, list) else [], limit=3))
-        bench_raw = (gap.get("competitors") or "").strip()
-        bench_list = [x.strip() for x in bench_raw.split(",") if x.strip()][:3]
-        bench_disp = ", ".join(bench_list)
-        if comp_str:
-            return (
-                f"{ind_lead}you should add or expand an on-page FAQ block plus matching FAQPage or Organization JSON-LD "
-                f"on the service URL that fits this query intent in {region}, because modeled answers already cite "
-                f"{comp_str} while {bn} is missing for this type of question.{svc_tail}"
-            ).strip()
-        if bench_disp:
-            return (
-                f"{ind_lead}you should strengthen the service page that matches this intent in {region} with clear "
-                f"headings, a short FAQ, and schema that uses the same business name as your Google Business Profile so "
-                f"{bn} can be extracted; your benchmarks often include {bench_disp}.{svc_tail}"
-            ).strip()
-        return (
-            f"{ind_lead}you should add a visible FAQ section and Organization or LocalBusiness structured data on your "
-            f"strongest commercial page for this intent in {region}, keeping entity naming aligned with live listings "
-            f"so {bn} is eligible to be cited.{svc_tail}"
-        ).strip()
-
-    if kind == "citation_share":
-        dom = gap.get("source_domain")
-        try:
-            cite = float(gap.get("citation_share_at_check") or 0)
-        except (TypeError, ValueError):
-            cite = 0.0
-        comp = (gap.get("top_competitor_hint") or "named competitors").strip()
-        if dom:
-            cite_tail = f" Use categories and services you can verify." if services else ""
-            return (
-                f"Your modeled citation-style share is about {cite:.0f}%; you should claim or refresh a verifiable "
-                f"profile or listing for {bn} on {dom} (and similar hubs in {region}), mirroring how {comp} appears "
-                f"there without inventing attributes you do not offer.{cite_tail}"
-            )
-        return _nl_template({**gap, "gap_kind": "citation_share_generic"})
-
-    if kind == "citation_share_generic":
-        try:
-            cite = float(gap.get("citation_share_at_check") or 0)
-        except (TypeError, ValueError):
-            cite = 0.0
-        comp = (gap.get("top_competitor_hint") or "alternatives").strip()
-        cite_tail = f" Keep wording factual." if services else ""
-        return (
-            f"Your modeled citation-style share is about {cite:.0f}%; you should line up trusted third-party listings "
-            f"and data sources in {region} where {comp} already earns visibility, using consistent {bn} naming and "
-            f"service categories across each profile.{cite_tail}"
+    if content_angle == "brand_identity":
+        action = (
+            "Clarify your business identity on the homepage and About page, including your exact business name and official website"
+        )
+    elif content_angle == "local_availability":
+        action = (
+            f"Add service-area copy for {region} on your main service pages and match that same location wording across your business listings"
+        )
+    elif content_angle == "trust_proof":
+        action = (
+            "Add a short FAQ with proof points such as credentials, reviews, and project examples on the most relevant page"
+        )
+    elif content_angle == "comparison":
+        action = (
+            "Publish a comparison section that explains how your service differs and add concrete proof like certifications, partnerships, or project outcomes"
+        )
+    elif content_angle == "safety_authority":
+        action = (
+            "Add an authority section with certifications, safety standards, and real project examples on your key service page"
+        )
+    elif absence_reason == "missing_category_page" or intent_type == "transactional":
+        action = (
+            f"Create a dedicated service page for this offer in {region} with clear pricing, scope, and a strong contact section"
+        )
+    elif absence_reason == "missing_local_signal" or intent_type == "local":
+        action = (
+            f"Add service-area copy for {region} on your main service pages and match that same location wording across your business listings"
+        )
+    elif absence_reason == "missing_trust_signal" or intent_type == "trust":
+        action = (
+            "Add a short FAQ with proof points such as credentials, reviews, and project examples on the most relevant page"
+        )
+    elif absence_reason == "competitor_authority" or intent_type == "comparison":
+        action = (
+            "Publish a comparison section that explains how your service differs and add concrete proof like certifications, partnerships, or project outcomes"
+        )
+    else:
+        action = (
+            "Add a concise Q&A section that answers common buyer questions on the page most related to this intent"
         )
 
-    return (
-        f"You should tighten how {bn} appears on core service pages and in structured data for {region}, and keep "
-        f"third-party mentions aligned so transactional and comparison-style answers can cite you consistently."
+    if kind in ("citation_share", "citation_share_generic"):
+        dom = str(gap.get("source_domain") or "").strip()
+        if dom:
+            action = (
+                f"Update your profile on {dom} and similar trusted directories with the same business name, services, and website you use on your own site"
+            )
+        else:
+            action = (
+                "Update your top third-party listings so your business name, services, and website are consistent everywhere"
+            )
+
+    if services:
+        action += f", including services like {services}"
+
+    why = (
+        "This gives answer engines clearer, verifiable business details they can trust when choosing who to mention for this type of question."
     )
+    return f"{action}. {why}"
 
 
 def _infer_action_type_for_nl(g: dict[str, Any]) -> str:
@@ -687,6 +853,9 @@ def _build_sanitized_nl_signals(gap_object: dict[str, Any]) -> dict[str, Any]:
     crawl_summary = (gap_object.get("onpage_crawl_summary") or gap_object.get("crawl_summary") or "").strip()
     gk = gap_object.get("gap_kind")
     gap_kind = str(gk).strip() if gk is not None else ""
+    absence_reason = _derive_absence_reason(gap_object)
+    intent_type = _derive_intent_type(gap_object)
+    content_angle = _derive_content_angle(gap_object)
     out: dict[str, Any] = {
         "prompt": prompt,
         "action_type": _infer_action_type_for_nl(gap_object),
@@ -697,6 +866,12 @@ def _build_sanitized_nl_signals(gap_object: dict[str, Any]) -> dict[str, Any]:
         "score": _normalize_score_for_nl(gap_object),
         "crawl_summary": crawl_summary[:8000],
     }
+    if absence_reason:
+        out["absence_reason"] = absence_reason
+    if intent_type:
+        out["intent_type"] = intent_type
+    if content_angle:
+        out["content_angle"] = content_angle
     if gap_kind == "visibility_miss":
         cd = (gap_object.get("canonical_domain") or "").strip()
         if cd:
@@ -778,18 +953,20 @@ def _nl_via_openai(
         f'recommendation_type: "{rec_type}"\n\n'
         "Gap signals (JSON only):\n"
         f"{payload}\n\n"
-        "Write for the business owner. Second person (\"you\").\n"
-        "Do not quote or repeat the consumer prompt text; say \"for this type of question\" or "
-        "\"for this query intent\" only. The JSON \"prompt\" field is a short label—not text to paste.\n"
-        "Sentence 1: specific actions (what to add or change on the site, or where to seek citations).\n"
-        "Sentence 2: why answer engines are more likely to mention the business for this intent.\n"
+        "Write for a non-technical business owner. Second person (\"you\").\n"
+        "Do not quote or repeat the consumer prompt text; say \"for this type of question\" only.\n"
+        "Use exactly two short sentences.\n"
+        "Sentence 1: exact action to take.\n"
+        "Sentence 2: simple reason this helps the business appear more often in AI-generated answers.\n"
+        "Never begin with: \"As a business owner\", \"As an operator\", or \"As {business_name} operator\".\n"
+        "Never use these terms: modeled answers, canonical, entity graph, disambiguation, attribution, citation share, gap score.\n"
+        "Prefer plain language; if schema is needed, explain it simply as structured business details/search markup.\n"
+        "Use content_angle and absence_reason to choose emphasis before writing.\n"
         "If crawl_summary is non-empty, anchor at least one action to a page or topic from it.\n"
         "If crawl_summary is empty, still be specific; do not apologize.\n"
-        "When brand_mentioned_url_status and domain fields are present: for mentioned_url_wrong_live, focus on entity "
-        "disambiguation versus another business (canonical Organization/LocalBusiness name + url, sameAs, About/legal "
-        "name clarity, GBP and major listing alignment)—do not treat the wrong domain as the client. For "
-        "mentioned_url_wrong_broken, focus on strengthening discoverable official URLs and schema so models stop "
-        "latching onto dead or hallucinated links (footer or FAQ “official site” only as a concrete tactic). For matched, "
+        "When brand_mentioned_url_status and domain fields are present: for mentioned_url_wrong_live, focus on making the "
+        "official business name and website clear across homepage/About/listings; do not treat the wrong domain as the client. "
+        "For mentioned_url_wrong_broken, focus on reinforcing one live official website across site and listings. For matched, "
         "do not invent URL problems.\n"
         "Avoid repeating the JSON wording verbatim."
     )
@@ -836,18 +1013,34 @@ def _build_create_content_recommendation(
     elif score is not None:
         reason += f" Snapshot visibility score for {bn}: {score.visibility_score:.1f}%."
     comps = gap.get("competitors_in_answer") or []
+    grouped_prompts = gap.get("_grouped_prompts") if isinstance(gap.get("_grouped_prompts"), list) else []
+    matched_prompt_texts = [str(p).strip() for p in grouped_prompts if str(p).strip()]
+    grouped_resp = gap.get("_grouped_response_ids") if isinstance(gap.get("_grouped_response_ids"), list) else []
+    matched_response_snapshot_ids: list[int] = []
+    for rid in grouped_resp:
+        try:
+            v = int(rid)
+        except (TypeError, ValueError):
+            continue
+        if v not in matched_response_snapshot_ids:
+            matched_response_snapshot_ids.append(v)
+    references: dict[str, Any] = {
+        "score_snapshot_id": score.id if score else None,
+        "extraction_snapshot_id": gap.get("extraction_snapshot_id"),
+        "response_snapshot_id": gap.get("response_snapshot_id"),
+        "competitors": comps,
+        "city_context": city or None,
+    }
+    if matched_prompt_texts:
+        references["matched_prompt_texts"] = matched_prompt_texts
+    if matched_response_snapshot_ids:
+        references["matched_response_snapshot_ids"] = matched_response_snapshot_ids
     return {
         "action_type": "create_content",
         "prompt": prompt_display,
         "reason": reason,
         "priority": priority,
-        "references": {
-            "score_snapshot_id": score.id if score else None,
-            "extraction_snapshot_id": gap.get("extraction_snapshot_id"),
-            "response_snapshot_id": gap.get("response_snapshot_id"),
-            "competitors": comps,
-            "city_context": city or None,
-        },
+        "references": references,
     }
 
 
@@ -879,20 +1072,102 @@ def _build_acquire_citation_recommendation(
         )
     if comp:
         reason += f" Answers often reference {comp}—match factual categories and proof patterns, not unverifiable claims."
+    grouped_prompts = gap.get("_grouped_prompts") if isinstance(gap.get("_grouped_prompts"), list) else []
+    matched_prompt_texts = [str(p).strip() for p in grouped_prompts if str(p).strip()]
+    grouped_resp = gap.get("_grouped_response_ids") if isinstance(gap.get("_grouped_response_ids"), list) else []
+    matched_response_snapshot_ids: list[int] = []
+    for rid in grouped_resp:
+        try:
+            v = int(rid)
+        except (TypeError, ValueError):
+            continue
+        if v not in matched_response_snapshot_ids:
+            matched_response_snapshot_ids.append(v)
+    references: dict[str, Any] = {
+        "score_snapshot_id": score.id if score else None,
+        "extraction_snapshot_id": gap.get("extraction_snapshot_id"),
+        "response_snapshot_id": gap.get("response_snapshot_id"),
+        "competitors": _top_competitors_from_score(score),
+    }
+    if matched_prompt_texts:
+        references["matched_prompt_texts"] = matched_prompt_texts
+    if matched_response_snapshot_ids:
+        references["matched_response_snapshot_ids"] = matched_response_snapshot_ids
     rec: dict[str, Any] = {
         "action_type": "acquire_citation",
         "reason": reason,
         "priority": priority,
-        "references": {
-            "score_snapshot_id": score.id if score else None,
-            "extraction_snapshot_id": gap.get("extraction_snapshot_id"),
-            "response_snapshot_id": gap.get("response_snapshot_id"),
-            "competitors": _top_competitors_from_score(score),
-        },
+        "references": references,
     }
     if dom:
         rec["source"] = dom
     return rec
+
+
+def _group_gap_objects_for_recommendations(
+    gaps: list[dict[str, Any]],
+    *,
+    action_type: str,
+) -> list[dict[str, Any]]:
+    """
+    Consolidate repeated advice: group by (absence_reason, content_angle, action_type) so multiple
+    prompts with the same root issue produce one stronger client-facing recommendation.
+    """
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for g in gaps:
+        ar = _derive_absence_reason(g)
+        ca = _derive_content_angle(g)
+        key = (ar, ca, action_type)
+        base = grouped.get(key)
+        if base is None:
+            base = dict(g)
+            base["absence_reason"] = ar
+            base["content_angle"] = ca
+            base["_grouped_prompt_count"] = 0
+            base["_grouped_prompts"] = []
+            grouped[key] = base
+
+        prompt = str(g.get("prompt_text") or "").strip()
+        if prompt:
+            seen = {str(x).strip().lower() for x in base["_grouped_prompts"]}
+            if prompt.lower() not in seen and len(base["_grouped_prompts"]) < 8:
+                base["_grouped_prompts"].append(prompt)
+        base["_grouped_prompt_count"] += 1
+
+        if not base.get("source_domain") and g.get("source_domain"):
+            base["source_domain"] = g.get("source_domain")
+        if base.get("extraction_snapshot_id") is None and g.get("extraction_snapshot_id") is not None:
+            base["extraction_snapshot_id"] = g.get("extraction_snapshot_id")
+        if base.get("response_snapshot_id") is None and g.get("response_snapshot_id") is not None:
+            base["response_snapshot_id"] = g.get("response_snapshot_id")
+        if "_grouped_response_ids" not in base:
+            base["_grouped_response_ids"] = []
+        rid = g.get("response_snapshot_id")
+        try:
+            rid_int = int(rid) if rid is not None else None
+        except (TypeError, ValueError):
+            rid_int = None
+        if rid_int is not None and rid_int not in base["_grouped_response_ids"] and len(base["_grouped_response_ids"]) < 50:
+            base["_grouped_response_ids"].append(rid_int)
+
+        comp_base = base.get("competitors_in_answer")
+        comp_add = g.get("competitors_in_answer")
+        if isinstance(comp_base, list) and isinstance(comp_add, list):
+            merged = comp_base + comp_add
+            base["competitors_in_answer"] = merged[:20]
+
+    out: list[dict[str, Any]] = []
+    for row in grouped.values():
+        prompts = row.get("_grouped_prompts") or []
+        if isinstance(prompts, list) and prompts:
+            if len(prompts) == 1:
+                row["prompt_text"] = prompts[0]
+            else:
+                row["prompt_text"] = f"{prompts[0]} (+{len(prompts) - 1} similar prompts)"
+        row.pop("_grouped_prompts", None)
+        row.pop("_grouped_prompt_count", None)
+        out.append(row)
+    return out
 
 
 def save_recommendation_run(
@@ -943,13 +1218,15 @@ def generate_aeo_recommendations(
     priority = _priority_from_scores(visibility, citation)
 
     canonical_dom = canonical_registrable_domain(site)
-    vis_gaps = analyze_visibility_gaps(
+    vis_gaps_raw = analyze_visibility_gaps(
         score,
         extractions,
         tracked_website_url=site,
         canonical_domain=canonical_dom,
     )
-    cite_gaps = analyze_citation_gaps(score, extractions, citation_share=citation)
+    cite_gaps_raw = analyze_citation_gaps(score, extractions, citation_share=citation)
+    vis_gaps = _group_gap_objects_for_recommendations(vis_gaps_raw, action_type="create_content")
+    cite_gaps = _group_gap_objects_for_recommendations(cite_gaps_raw, action_type="acquire_citation")
 
     recommendations: list[dict[str, Any]] = []
     nl_ctx = _recommendation_nl_enrichment(business_profile, score=score)

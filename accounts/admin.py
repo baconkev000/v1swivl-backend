@@ -11,6 +11,7 @@ from .models import (
     AEOExecutionRun,
     AEOScoreSnapshot,
     BusinessProfile,
+    ThirdPartyApiErrorLog,
     ThirdPartyApiRequestLog,
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
@@ -114,20 +115,18 @@ class AEOExtractionSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 
 @admin.register(AEOResponseSnapshot)
 class AEOResponseSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = (
-        "id",
-        "profile",
-        "execution_run",
-        "execution_pair_id",
-        "prompt_hash",
-        "prompt_type",
-        "model_name",
-        "platform",
-        "created_at",
-    )
+    list_display = ("profile_business_name", "platform")
     list_filter = ("platform", "prompt_type", "is_dynamic")
     search_fields = ("prompt_hash", "prompt_text", "profile__business_name", "execution_pair_id")
     raw_id_fields = ("profile", "execution_run")
+
+    @admin.display(description="Profile", ordering="profile__business_name")
+    def profile_business_name(self, obj: AEOResponseSnapshot) -> str:
+        p = obj.profile
+        if p is None:
+            return "—"
+        name = (p.business_name or "").strip()
+        return name or f"Profile #{p.pk}"
 
 
 @admin.register(AEOExecutionRun)
@@ -253,6 +252,39 @@ class ReviewsConversationAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 class ReviewsMessageAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "conversation", "role", "created_at")
     search_fields = ("conversation__user__email", "conversation__user__username", "content")
+
+
+@admin.register(ThirdPartyApiErrorLog)
+class ThirdPartyApiErrorLogAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "provider",
+        "error_kind",
+        "http_status",
+        "business_profile",
+        "operation",
+        "message",
+        "created_at",
+    )
+    list_filter = ("provider", "error_kind", "created_at")
+    search_fields = ("operation", "message", "business_profile__business_name")
+    raw_id_fields = ("business_profile",)
+    readonly_fields = (
+        "created_at",
+        "provider",
+        "business_profile",
+        "operation",
+        "http_status",
+        "error_kind",
+        "message",
+        "detail",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(ThirdPartyApiRequestLog)

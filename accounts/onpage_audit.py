@@ -38,6 +38,9 @@ def _post(
         return None
 
     url = f"{BASE_URL}{path}"
+    from accounts.models import ThirdPartyApiErrorLog, ThirdPartyApiProvider
+    from accounts.third_party_usage import record_dataforseo_request, record_third_party_api_error
+
     try:
         resp = requests.post(
             url,
@@ -47,9 +50,42 @@ def _post(
         )
     except Exception as exc:  # pragma: no cover - network failure
         logger.exception("[OnPageAudit] POST %s failed: %s", path, exc)
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.DATAFORSEO,
+            operation=path,
+            error_kind=ThirdPartyApiErrorLog.ErrorKind.CONNECTION_ERROR,
+            message=str(exc)[:1024],
+            detail=str(exc),
+            http_status=None,
+            business_profile=business_profile,
+        )
         return None
 
+    parsed: dict[str, Any] | None = None
+    if resp.content:
+        try:
+            parsed = resp.json()
+        except ValueError:
+            parsed = None
+
+    op_label = path if resp.status_code == 200 else f"{path} HTTP {resp.status_code}"
+
+    record_dataforseo_request(
+        operation=op_label,
+        response_json=parsed,
+        business_profile=business_profile,
+    )
+
     if resp.status_code != 200:
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.DATAFORSEO,
+            operation=path,
+            error_kind=ThirdPartyApiErrorLog.ErrorKind.HTTP_ERROR,
+            message=f"HTTP {resp.status_code}",
+            detail=(resp.text or "")[:4000],
+            http_status=resp.status_code,
+            business_profile=business_profile,
+        )
         logger.warning(
             "[OnPageAudit] POST %s HTTP %s: %s",
             path,
@@ -58,20 +94,20 @@ def _post(
         )
         return None
 
-    try:
-        data = resp.json()
-    except ValueError:
+    if parsed is None:
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.DATAFORSEO,
+            operation=path,
+            error_kind=ThirdPartyApiErrorLog.ErrorKind.PARSE_ERROR,
+            message="Non-JSON response body",
+            detail=(resp.text or "")[:4000],
+            http_status=resp.status_code,
+            business_profile=business_profile,
+        )
         logger.warning("[OnPageAudit] POST %s returned non-JSON body.", path)
         return None
 
-    from accounts.third_party_usage import record_dataforseo_request
-
-    record_dataforseo_request(
-        operation=path,
-        response_json=data,
-        business_profile=business_profile,
-    )
-    return data
+    return parsed
 
 
 def _normalize_domain(site_url: str) -> Optional[str]:

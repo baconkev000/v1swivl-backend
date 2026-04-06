@@ -105,12 +105,37 @@ def chat_completion_create_logged(
     *,
     operation: str,
     business_profile: BusinessProfile | None = None,
+    emit_api_error_log: bool = True,
     **kwargs: Any,
 ) -> Any:
-    """Call ``client.chat.completions.create`` and append a usage log row (best-effort)."""
-    from accounts.third_party_usage import record_openai_chat_completion
+    """
+    Call ``client.chat.completions.create`` and append a usage log row on success (best-effort).
 
-    completion = client.chat.completions.create(**kwargs)
+    On API failure: when ``emit_api_error_log`` is True (default), records one error row and re-raises.
+    Callers with internal retries should pass ``emit_api_error_log=False`` and log once after retries exhaust.
+    """
+    from accounts.models import ThirdPartyApiProvider
+    from accounts.third_party_usage import (
+        classify_openai_sdk_exception,
+        record_openai_chat_completion,
+        record_third_party_api_error,
+    )
+
+    try:
+        completion = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        if emit_api_error_log:
+            kind, http = classify_openai_sdk_exception(exc)
+            record_third_party_api_error(
+                provider=ThirdPartyApiProvider.OPENAI,
+                operation=operation,
+                error_kind=kind,
+                message=str(exc)[:1024],
+                detail=None,
+                http_status=http,
+                business_profile=business_profile,
+            )
+        raise
     record_openai_chat_completion(
         operation=operation,
         response=completion,

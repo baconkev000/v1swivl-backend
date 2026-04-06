@@ -4,10 +4,10 @@ Phase 4: deterministic AEO metrics from extraction snapshots.
 Formulas are explicit (no hidden multipliers). Imports only flatten helpers from
 ``aeo_extraction_utils`` for competitor JSON shapes.
 
-Dual-provider Phase 2 (OpenAI + Gemini) creates two ``AEOResponseSnapshot`` rows per prompt.
-Headline scores and share-of-voice use **OpenAI responses only** (``platform="openai"``) so prompts
-are not double-counted. Use ``latest_extraction_per_response(..., response_platform=None)`` to include
-every platform (e.g. custom reporting).
+Phase 2 can create multiple ``AEOResponseSnapshot`` rows per prompt (OpenAI, Gemini, Perplexity when configured).
+Headline Phase-4 scores use **OpenAI responses only** (``platform="openai"``) so prompts are not double-counted;
+Gemini and Perplexity extractions still power prompt-coverage UI and share-of-voice when using
+``latest_extraction_per_response(..., response_platform=None)``.
 """
 
 from __future__ import annotations
@@ -288,7 +288,7 @@ def aggregate_aeo_share_of_voice_from_extractions(
 
 
 def aggregate_aeo_share_of_voice(business_profile: BusinessProfile) -> dict[str, Any]:
-    # Share-of-voice should reflect all monitored providers (OpenAI + Gemini).
+    # Share-of-voice reflects all monitored providers (OpenAI, Gemini, Perplexity, …).
     # Phase-4 headline scoring remains OpenAI-primary via default platform filtering elsewhere.
     extractions = latest_extraction_per_response(business_profile, response_platform=None)
     name = (getattr(business_profile, "business_name", None) or "").strip() or "Your business"

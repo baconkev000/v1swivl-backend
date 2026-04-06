@@ -13,8 +13,8 @@ import time
 
 from django.conf import settings
 
-from .models import BusinessProfile
-from .third_party_usage import record_gemini_request
+from .models import BusinessProfile, ThirdPartyApiErrorLog, ThirdPartyApiProvider
+from .third_party_usage import record_gemini_request, record_third_party_api_error
 
 logger = logging.getLogger(__name__)
 
@@ -151,5 +151,23 @@ def generate_gemini_execution_text(
                 time.sleep(1.0)
                 continue
             break
+
+    # One error row per logical Gemini call after retries (not per retry attempt).
+    if err and err not in ("skipped_no_api_key",):
+        if err == "gemini_sdk_missing":
+            ek = ThirdPartyApiErrorLog.ErrorKind.VALIDATION_ERROR
+        elif "DeadlineExceeded" in err or "Timeout" in err or "timeout" in err.lower():
+            ek = ThirdPartyApiErrorLog.ErrorKind.TIMEOUT
+        else:
+            ek = ThirdPartyApiErrorLog.ErrorKind.UNKNOWN_EXCEPTION
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.GEMINI,
+            operation="gemini.generate_content.aeo_execution",
+            error_kind=ek,
+            message=err[:1024],
+            detail=err,
+            http_status=None,
+            business_profile=business_profile,
+        )
 
     return out, err

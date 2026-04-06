@@ -1,5 +1,11 @@
 """
-Record and aggregate third-party API usage (DataForSEO, OpenAI, Gemini) for staff dashboards.
+Record and aggregate third-party API usage (DataForSEO, OpenAI, Gemini, Perplexity) for staff dashboards.
+Failed calls can be persisted separately via ``record_third_party_api_error`` (debugging; one row per logical
+failure—call from the outermost layer when retries are internal, not once per retry).
+
+DataForSEO: each HTTP call is billed per API task; ``cost_usd`` is the sum of ``tasks[].cost`` from the
+response body when present (not token-based). OpenAI/Gemini rows use token metadata with USD estimates.
+Perplexity rows log reported token counts; ``cost_usd`` is set only when the API returns an explicit cost field.
 """
 
 from __future__ import annotations
@@ -21,9 +27,18 @@ from accounts.aeo.aeo_scoring_utils import (
     calculate_visibility_score,
     latest_extraction_per_response_in_window,
 )
-from accounts.models import AEOResponseSnapshot, BusinessProfile, ThirdPartyApiRequestLog
+from accounts.models import (
+    AEOResponseSnapshot,
+    BusinessProfile,
+    ThirdPartyApiErrorLog,
+    ThirdPartyApiProvider,
+    ThirdPartyApiRequestLog,
+)
 
 logger = logging.getLogger(__name__)
+
+# Max length stored on ThirdPartyApiErrorLog.detail (avoid huge bodies; no full prompts).
+THIRD_PARTY_ERROR_DETAIL_MAX_CHARS = 6000
 
 _usage_business_profile: ContextVar[BusinessProfile | None] = ContextVar(
     "usage_business_profile",
@@ -53,6 +68,79 @@ def effective_usage_profile(explicit: BusinessProfile | None) -> BusinessProfile
     return get_usage_business_profile()
 
 
+def _truncate_third_party_error_detail(text: str | None) -> str:
+    s = (text or "").strip()
+    if len(s) <= THIRD_PARTY_ERROR_DETAIL_MAX_CHARS:
+        return s
+    return s[:THIRD_PARTY_ERROR_DETAIL_MAX_CHARS] + "\n…[truncated]"
+
+
+def classify_openai_sdk_exception(exc: BaseException) -> tuple[str, int | None]:
+    """
+    Map an OpenAI SDK (or generic) exception to (ThirdPartyApiErrorLog.ErrorKind value, http_status_or_none).
+    """
+    http_raw = getattr(exc, "status_code", None)
+    if http_raw is None:
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            http_raw = getattr(resp, "status_code", None)
+    http: int | None = None
+    if http_raw is not None:
+        try:
+            http = int(http_raw)
+        except (TypeError, ValueError):
+            http = None
+
+    try:
+        from openai import APIConnectionError, APITimeoutError
+        from openai import APIStatusError
+
+        if isinstance(exc, APITimeoutError):
+            return ThirdPartyApiErrorLog.ErrorKind.TIMEOUT, http
+        if isinstance(exc, APIConnectionError):
+            return ThirdPartyApiErrorLog.ErrorKind.CONNECTION_ERROR, http
+        if isinstance(exc, APIStatusError):
+            return ThirdPartyApiErrorLog.ErrorKind.HTTP_ERROR, http
+    except ImportError:
+        pass
+
+    name = type(exc).__name__
+    if "Timeout" in name:
+        return ThirdPartyApiErrorLog.ErrorKind.TIMEOUT, http
+    if "Connection" in name or "ConnectError" in name:
+        return ThirdPartyApiErrorLog.ErrorKind.CONNECTION_ERROR, http
+    if http is not None:
+        return ThirdPartyApiErrorLog.ErrorKind.HTTP_ERROR, http
+    return ThirdPartyApiErrorLog.ErrorKind.UNKNOWN_EXCEPTION, http
+
+
+def record_third_party_api_error(
+    *,
+    provider: str,
+    operation: str,
+    error_kind: str,
+    message: str,
+    detail: str | None = None,
+    http_status: int | None = None,
+    business_profile: BusinessProfile | None = None,
+) -> None:
+    """
+    Persist one outbound API failure row. Never raises (logs and swallows DB errors).
+    """
+    try:
+        ThirdPartyApiErrorLog.objects.create(
+            provider=provider,
+            business_profile=effective_usage_profile(business_profile),
+            operation=(operation or "")[:512],
+            http_status=http_status,
+            error_kind=error_kind,
+            message=(message or "")[:1024],
+            detail=_truncate_third_party_error_detail(detail),
+        )
+    except Exception:
+        logger.exception("record_third_party_api_error failed op=%s provider=%s", operation, provider)
+
+
 # Rough USD per 1M tokens when usage is not itemized (override via settings)
 _DEFAULT_OPENAI_INPUT_PER_M = Decimal("2.50")
 _DEFAULT_OPENAI_OUTPUT_PER_M = Decimal("10.00")
@@ -75,16 +163,29 @@ def record_dataforseo_request(
     business_profile: BusinessProfile | None = None,
 ) -> None:
     try:
-        cost = None
+        cost: Decimal | None = None
         if response_json is not None:
             tasks = response_json.get("tasks") or []
-            if tasks and isinstance(tasks[0], dict):
-                c = tasks[0].get("cost")
-                if c is not None:
-                    cost = Decimal(str(c))
+            total = Decimal("0")
+            any_cost = False
+            if isinstance(tasks, list):
+                for task in tasks:
+                    if not isinstance(task, dict):
+                        continue
+                    c = task.get("cost")
+                    if c is None:
+                        continue
+                    try:
+                        total += Decimal(str(c))
+                        any_cost = True
+                    except Exception:
+                        continue
+            if any_cost:
+                cost = total
+        bp = effective_usage_profile(business_profile)
         ThirdPartyApiRequestLog.objects.create(
             provider=ThirdPartyApiRequestLog.Provider.DATAFORSEO,
-            business_profile=business_profile,
+            business_profile=bp,
             operation=(operation or "")[:512],
             cost_usd=cost,
         )
@@ -142,6 +243,32 @@ def _gemini_price_per_m() -> tuple[Decimal, Decimal]:
         Decimal(str(getattr(settings, "GEMINI_INPUT_USD_PER_MILLION", "0.075"))),
         Decimal(str(getattr(settings, "GEMINI_OUTPUT_USD_PER_MILLION", "0.30"))),
     )
+
+
+def record_perplexity_request(
+    *,
+    operation: str,
+    response_status: int,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    cost_usd: Decimal | None = None,
+    business_profile: BusinessProfile | None = None,
+) -> None:
+    """
+    Log a Perplexity Sonar Chat Completions call. No USD estimate from tokens; ``cost_usd`` only if
+    the API returns a cost field. Token counts stored when ``usage`` is present for staff charts.
+    """
+    try:
+        ThirdPartyApiRequestLog.objects.create(
+            provider=ThirdPartyApiRequestLog.Provider.PERPLEXITY,
+            business_profile=effective_usage_profile(business_profile),
+            operation=(operation or "")[:512],
+            cost_usd=cost_usd,
+            tokens_sent=max(0, int(prompt_tokens)) if prompt_tokens is not None else None,
+            tokens_received=max(0, int(completion_tokens)) if completion_tokens is not None else None,
+        )
+    except Exception:
+        logger.exception("record_perplexity_request failed op=%s", operation)
 
 
 def record_gemini_request(
@@ -250,16 +377,19 @@ def build_monthly_api_usage_chart_context(
         ThirdPartyApiRequestLog.Provider.DATAFORSEO,
         ThirdPartyApiRequestLog.Provider.OPENAI,
         ThirdPartyApiRequestLog.Provider.GEMINI,
+        ThirdPartyApiRequestLog.Provider.PERPLEXITY,
     ]
     provider_labels = {
         ThirdPartyApiRequestLog.Provider.DATAFORSEO: "DataForSEO",
         ThirdPartyApiRequestLog.Provider.OPENAI: "OpenAI",
         ThirdPartyApiRequestLog.Provider.GEMINI: "Gemini",
+        ThirdPartyApiRequestLog.Provider.PERPLEXITY: "Perplexity",
     }
     colors = {
         ThirdPartyApiRequestLog.Provider.DATAFORSEO: "rgba(54, 162, 235, 0.7)",
         ThirdPartyApiRequestLog.Provider.OPENAI: "rgba(75, 192, 192, 0.7)",
         ThirdPartyApiRequestLog.Provider.GEMINI: "rgba(255, 159, 64, 0.7)",
+        ThirdPartyApiRequestLog.Provider.PERPLEXITY: "rgba(124, 58, 237, 0.7)",
     }
 
     count_datasets = []
@@ -313,7 +443,7 @@ def build_monthly_token_usage_chart_context(
 ) -> dict[str, Any]:
     """
     Monthly sums of tokens_sent / tokens_received for staff charts.
-    ``tokens_platform``: ``all`` | ``dataforseo`` | ``openai`` | ``gemini``.
+    ``tokens_platform``: ``all`` | ``dataforseo`` | ``openai`` | ``gemini`` | ``perplexity``.
     """
     month_keys = _last_n_calendar_month_starts(months)
     labels = [_month_label(y, mo) for y, mo in month_keys]
@@ -332,20 +462,23 @@ def build_monthly_token_usage_chart_context(
         ThirdPartyApiRequestLog.Provider.DATAFORSEO,
         ThirdPartyApiRequestLog.Provider.OPENAI,
         ThirdPartyApiRequestLog.Provider.GEMINI,
+        ThirdPartyApiRequestLog.Provider.PERPLEXITY,
     ]
     provider_labels = {
         ThirdPartyApiRequestLog.Provider.DATAFORSEO: "DataForSEO",
         ThirdPartyApiRequestLog.Provider.OPENAI: "OpenAI",
         ThirdPartyApiRequestLog.Provider.GEMINI: "Gemini",
+        ThirdPartyApiRequestLog.Provider.PERPLEXITY: "Perplexity",
     }
     colors = {
         ThirdPartyApiRequestLog.Provider.DATAFORSEO: "rgba(54, 162, 235, 0.75)",
         ThirdPartyApiRequestLog.Provider.OPENAI: "rgba(75, 192, 192, 0.75)",
         ThirdPartyApiRequestLog.Provider.GEMINI: "rgba(255, 159, 64, 0.75)",
+        ThirdPartyApiRequestLog.Provider.PERPLEXITY: "rgba(124, 58, 237, 0.75)",
     }
 
     tp = (tokens_platform or "all").strip().lower()
-    if tp not in ("all", "dataforseo", "openai", "gemini"):
+    if tp not in ("all", "dataforseo", "openai", "gemini", "perplexity"):
         tp = "all"
 
     tz = timezone.get_current_timezone()
@@ -454,6 +587,8 @@ def _platform_chart_label(slug: str) -> str:
         return "OpenAI"
     if s == "gemini":
         return "Gemini"
+    if s == "perplexity":
+        return "Perplexity"
     return (slug or "unknown").replace("_", " ").title()
 
 
@@ -480,6 +615,7 @@ def _visibility_pct_for_profile_month(
 _PLATFORM_LINE_COLORS: dict[str, str] = {
     "openai": "rgb(16, 163, 127)",
     "gemini": "rgb(66, 133, 244)",
+    "perplexity": "rgb(124, 58, 237)",
 }
 
 
@@ -529,7 +665,7 @@ def build_monthly_aeo_visibility_chart_context(
         }
     )
     if not platform_slugs:
-        platform_slugs = ["openai", "gemini"]
+        platform_slugs = ["openai", "gemini", "perplexity"]
 
     total_data: list[float] = []
     for y, mo in month_keys:
