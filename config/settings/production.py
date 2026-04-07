@@ -25,6 +25,18 @@ ALLOWED_HOSTS = env.list(
         "api.ripplerank.ai",
     ],
 )
+# Always allow canonical production hosts even when DJANGO_ALLOWED_HOSTS is overridden in env.
+_required_hosts = [
+    "getswivl.ai",
+    "www.getswivl.ai",
+    "api.getswivl.ai",
+    "ripplerank.ai",
+    "www.ripplerank.ai",
+    "api.ripplerank.ai",
+]
+for _h in _required_hosts:
+    if _h not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_h)
 
 # DATABASES
 # ------------------------------------------------------------------------------
