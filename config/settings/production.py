@@ -16,7 +16,14 @@ SECRET_KEY = env("DJANGO_SECRET_KEY")
 # https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
 ALLOWED_HOSTS = env.list(
     "DJANGO_ALLOWED_HOSTS",
-    default=["getswivl.ai", "www.getswivl.ai", "api.getswivl.ai"],
+    default=[
+        "getswivl.ai",
+        "www.getswivl.ai",
+        "api.getswivl.ai",
+        "ripplerank.ai",
+        "www.ripplerank.ai",
+        "api.ripplerank.ai",
+    ],
 )
 
 # DATABASES
@@ -92,12 +99,17 @@ STORAGES = {
 CORS_ALLOWED_ORIGINS = [
     "https://getswivl.ai",
     "https://www.getswivl.ai",
+    "https://ripplerank.ai",
+    "https://www.ripplerank.ai",
     "http://localhost:3000",
 ]
 CSRF_TRUSTED_ORIGINS = [
     "https://api.getswivl.ai",
     "https://getswivl.ai",
     "https://www.getswivl.ai",
+    "https://api.ripplerank.ai",
+    "https://ripplerank.ai",
+    "https://www.ripplerank.ai",
     "http://localhost:3000",
 ]
 
