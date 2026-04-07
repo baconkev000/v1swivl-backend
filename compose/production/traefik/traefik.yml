@@ -28,7 +28,7 @@ certificatesResolvers:
 http:
   routers:
     web-secure-router:
-      rule: 'Host(`api.getswivl.ai`)'
+      rule: 'Host(`api.ripplerank.ai`) || Host(`api.getswivl.ai`)'
       entryPoints:
         - web-secure
       middlewares:
