@@ -7,6 +7,7 @@ Uses template/metadata from aeo_prompts.py; batch *generation* uses openai_utils
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -153,6 +154,213 @@ def _website_domain_from_url(url: str) -> str:
         return host
     except Exception:
         return ""
+
+
+# --- LLM-only topic sanitization (onboarding keywords / services / industry) -----------------
+
+# Registrable-label tokens this short or generic are not treated as brand roots for removal
+# (avoids stripping "best", "usa", common TLD-ish labels from unrelated text).
+_REGISTRABLE_ROOT_BLOCKLIST: Final[frozenset[str]] = frozenset(
+    {
+        "best",
+        "us",
+        "usa",
+        "www",
+        "com",
+        "net",
+        "org",
+        "gov",
+        "edu",
+        "mail",
+        "blog",
+        "shop",
+        "app",
+        "dev",
+        "api",
+        "cdn",
+        "ftp",
+        "inc",
+        "llc",
+        "ltd",
+        "corp",
+        "co",
+    }
+)
+
+_TOPIC_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "for",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "by",
+        "with",
+        "vs",
+    }
+)
+
+
+def _normalize_topic_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _token_boundary_pattern(core: str) -> str:
+    """
+    Whole-token match for alnum + hyphen tokens (\\b breaks on hyphenated brands like mh-usa).
+    """
+    return rf"(?<![\w\-]){re.escape(core)}(?![\w\-])"
+
+
+def _topic_only_stopwords(text: str) -> bool:
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return len(tokens) == 0 or all(t in _TOPIC_STOPWORDS for t in tokens)
+
+
+def _remove_multiword_brand_phrase(text: str, business_name: str) -> str:
+    phrase = _normalize_topic_whitespace(business_name)
+    words = phrase.split()
+    if len(words) < 2:
+        return text
+    parts = [_token_boundary_pattern(w) for w in words]
+    gap = r"[\s\W]+"
+    pattern = gap.join(parts)
+    return re.sub(pattern, " ", text, flags=re.IGNORECASE)
+
+
+def _remove_singleword_brand_token(text: str, token: str) -> str:
+    t = _normalize_topic_whitespace(token)
+    if len(t) < 4 or t.lower() in _REGISTRABLE_ROOT_BLOCKLIST:
+        return text
+    return re.sub(_token_boundary_pattern(t), " ", text, flags=re.IGNORECASE)
+
+
+def _strip_host_literals(text: str, host: str) -> str:
+    if not host:
+        return text
+    h = host.strip().lower()
+    for variant in (h, "www." + h):
+        text = re.sub(re.escape(variant), " ", text, flags=re.IGNORECASE)
+    for prefix in ("https://", "http://"):
+        text = re.sub(re.escape(prefix + h), " ", text, flags=re.IGNORECASE)
+        text = re.sub(re.escape(prefix + "www." + h), " ", text, flags=re.IGNORECASE)
+    return text
+
+
+def _registrable_label_from_host(host: str) -> str:
+    """
+    First DNS label of the normalized host (same string shape as _website_domain_from_url).
+    For mh-usa.example.co.uk returns mh-usa — not a naive split that drops multi-part public suffixes
+    incorrectly; the *label* is still the leftmost segment, which matches typical branded hosts.
+    """
+    h = (host or "").strip().lower()
+    if h.startswith("www."):
+        h = h[4:]
+    if not h:
+        return ""
+    return h.split(".", 1)[0]
+
+
+def _strip_registrable_brand_tokens(text: str, host: str) -> str:
+    root = _registrable_label_from_host(host)
+    if len(root) < 4 or root.lower() in _REGISTRABLE_ROOT_BLOCKLIST:
+        return text
+    text = re.sub(_token_boundary_pattern(root), " ", text, flags=re.IGNORECASE)
+    if "-" in root:
+        text = re.sub(_token_boundary_pattern(root.replace("-", " ")), " ", text, flags=re.IGNORECASE)
+    return text
+
+
+def sanitize_topic(topic: str, business_name: str, website_domain: str) -> str:
+    """
+    Remove tracked business name and domain tokens from a topic string for LLM payloads only.
+
+    Uses phrase-safe removal for multi-word business names and token boundaries that tolerate
+    hyphens (so ``mh-usa`` and ``mh usa`` both match) without naive substring damage to unrelated
+    words (e.g. ``super`` inside ``supercharger``).
+
+    Edge cases (still possible): competitor brands embedded in keywords, extremely generic one-word
+    business names, model non-compliance despite sanitized inputs.
+    """
+    original = _normalize_topic_whitespace(topic)
+    if not original:
+        return "this category"
+
+    text = original
+    bn = _normalize_topic_whitespace(business_name)
+    host = (website_domain or "").strip().lower()
+
+    if bn:
+        bw = bn.split()
+        if len(bw) >= 2:
+            text = _remove_multiword_brand_phrase(text, bn)
+        elif len(bw) == 1:
+            text = _remove_singleword_brand_token(text, bw[0])
+
+    text = _strip_host_literals(text, host)
+    text = _strip_registrable_brand_tokens(text, host)
+
+    text = _normalize_topic_whitespace(text)
+    if not text or _topic_only_stopwords(text):
+        return "this category"
+    return text
+
+
+def prompt_contains_tracked_brand_leakage(
+    prompt: str,
+    business_name: str,
+    website_domain: str,
+) -> bool:
+    """
+    Second-line defense: drop generated prompts that still mention the tracked brand or domain.
+
+    Single-word business names only count when length >= 4 and not blocklisted (avoids matching
+    generic words like ``best``). Registrable host labels use the same length/blocklist rules.
+    """
+    t = prompt or ""
+    if not t:
+        return False
+    tl = t.lower()
+    bn = _normalize_topic_whitespace(business_name)
+    host = (website_domain or "").strip().lower()
+
+    if bn:
+        bw = bn.split()
+        if len(bw) >= 2:
+            parts = [_token_boundary_pattern(w) for w in bw]
+            gap = r"[\s\W]+"
+            if re.search(gap.join(parts), t, flags=re.IGNORECASE):
+                return True
+        elif len(bw) == 1:
+            w = bw[0]
+            if len(w) >= 4 and w.lower() not in _REGISTRABLE_ROOT_BLOCKLIST:
+                if re.search(_token_boundary_pattern(w), t, flags=re.IGNORECASE):
+                    return True
+
+    if host:
+        if host in tl:
+            return True
+        if f"www.{host}" in tl:
+            return True
+
+    root = _registrable_label_from_host(host)
+    if len(root) >= 4 and root.lower() not in _REGISTRABLE_ROOT_BLOCKLIST:
+        if re.search(_token_boundary_pattern(root), t, flags=re.IGNORECASE):
+            return True
+        if "-" in root and re.search(
+            _token_boundary_pattern(root.replace("-", " ")),
+            t,
+            flags=re.IGNORECASE,
+        ):
+            return True
+
+    return False
 
 
 def infer_city_from_address(address: str) -> str:
@@ -469,21 +677,36 @@ def build_openai_batch_user_content(
     *,
     onboarding_topic_details: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
+    biz_for_llm = copy.deepcopy(business.as_dict())
+    bn = business.business_name
+    wd = business.website_domain
+    svc = business.services or []
+    biz_for_llm["services"] = [sanitize_topic(str(s), bn, wd) for s in svc]
+    ind_raw = str(biz_for_llm.get("industry") or "")
+    if ind_raw.strip():
+        ind_parts = [p.strip() for p in ind_raw.split(",") if p.strip()]
+        biz_for_llm["industry"] = ", ".join(sanitize_topic(p, bn, wd) for p in ind_parts)[:500]
     lines = [
         AEO_BATCH_USER_PROMPT_INTRO,
         "Business context (JSON):\n",
-        json.dumps(business.as_dict(), ensure_ascii=False),
+        json.dumps(biz_for_llm, ensure_ascii=False),
         f"\n\nGenerate at most {max_additional} new prompts not overlapping the seed list.",
         "\n\nSeed prompts (JSON array, may be empty):\n",
         json.dumps(list(seed_prompts or []), ensure_ascii=False),
     ]
     if onboarding_topic_details:
+        sanitized_rows: list[dict[str, Any]] = []
+        for row in onboarding_topic_details:
+            r = copy.deepcopy(dict(row))
+            kw = str(r.get("keyword") or "")
+            r["keyword"] = sanitize_topic(kw, bn, wd)
+            sanitized_rows.append(r)
         lines.extend(
             [
                 "\n\nUser-selected monitoring topics from onboarding (prioritize natural consumer "
                 "or buyer questions that relate to these themes; vary wording). "
                 "JSON may include Labs/AEO metadata (search volume, rank, category) — use as weak hints, not hard constraints:\n",
-                json.dumps(list(onboarding_topic_details), ensure_ascii=False),
+                json.dumps(sanitized_rows, ensure_ascii=False),
             ],
         )
     lines.extend(["\n\n", AEO_BATCH_JSON_SCHEMA_INSTRUCTION])
@@ -533,7 +756,16 @@ def run_prompt_batch_via_openai(
         raw = (completion.choices[0].message.content or "").strip()
     except Exception:
         return []
-    return parse_aeo_prompt_json_array(raw)
+    parsed = parse_aeo_prompt_json_array(raw)
+    return [
+        p
+        for p in parsed
+        if not prompt_contains_tracked_brand_leakage(
+            str(p.get("prompt") or ""),
+            business.business_name,
+            business.website_domain,
+        )
+    ]
 
 
 def parse_aeo_prompt_json_array(raw_text: str) -> list[dict[str, Any]]:

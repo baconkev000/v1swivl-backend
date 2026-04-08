@@ -38,20 +38,22 @@ class AEOPromptTemplateSpec:
 # --- System prompts (OpenAI layers) ------------------------------------------
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT: Final[str] = (
-"You generate realistic consumer prompts for Answer Engine Optimization testing. "
-"Prompts must sound like genuine human questions asked naturally in search or conversation. "
-"Use business profile context only to infer likely services, category, and buying considerations. "
-"Never include the business name, brand, domain, slogans, or unique marketing language. "
-"Prompts must remain category-correct, location-aware when relevant, and commercially realistic. "
-"At least 40 percent of prompts should naturally trigger named business recommendations or provider comparisons. "
-"Prefer prompts that create realistic business selection behavior. "
-"Avoid meta-prompts that ask what people ask; output the actual consumer question directly."
-"Keep prompts under 180 characters."
+    "You generate realistic consumer prompts for Answer Engine Optimization testing. "
+    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
+    "Prompts must sound like genuine human questions asked naturally in search or conversation. "
+    "Use business profile context only to infer likely services, category, and buying considerations. "
+    "Never include the business name, brand, domain, slogans, or unique marketing language. "
+    "Prompts must remain category-correct, location-aware when relevant, and commercially realistic. "
+    "At least 40 percent of prompts should naturally trigger named business recommendations or provider comparisons. "
+    "Prefer prompts that create realistic business selection behavior. "
+    "Avoid meta-prompts that ask what people ask; output the actual consumer question directly. "
+    "Keep prompts under 180 characters."
 )
 
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL: Final[str] = (
     "You generate transactional consumer discovery prompts for Answer Engine Optimization testing. "
+    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
     "Generate natural decision-stage questions that indicate a person is ready to choose where to go. "
     "Use the provided business metadata (industry + location) for context and realism, "
     "but never include the tracked business name or domain. "
@@ -62,6 +64,7 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL: Final[str] = (
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRUST: Final[str] = (
     "You generate trust-focused consumer discovery prompts for Answer Engine Optimization testing. "
+    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
     "Generate natural questions about reliability, credibility, safety, or confidence signals. "
     "Use the provided business metadata (industry + location) for context and realism, "
     "but never include the tracked business name or domain. "
@@ -72,6 +75,7 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRUST: Final[str] = (
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_COMPARISON: Final[str] = (
     "You generate comparison-style consumer discovery prompts for Answer Engine Optimization testing. "
+    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
     "Generate natural questions that compare options, tradeoffs, or selection criteria. "
     "Use the provided business metadata (industry + location) for context and realism, "
     "but never include the tracked business name or domain. "
@@ -82,6 +86,7 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT_COMPARISON: Final[str] = (
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_AUTHORITY: Final[str] = (
     "You generate authority-style consumer discovery prompts for Answer Engine Optimization testing. "
+    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
     "Generate natural questions about expertise, qualifications, standards, or evidence of competence. "
     "Use the provided business metadata (industry + location) for context and realism, "
     "but never include the tracked business name or domain. "
