@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from .dataforseo_utils import normalize_domain
 from .models import (
+    AEOExecutionRun,
     AEOExtractionSnapshot,
     AEOResponseSnapshot,
     BusinessProfile,
@@ -56,6 +57,29 @@ def profile_has_aeo_extraction_snapshots(profile: BusinessProfile) -> bool:
     return AEOExtractionSnapshot.objects.filter(response_snapshot__profile=profile).exists()
 
 
+def profile_has_valid_aeo_run_artifacts(profile: BusinessProfile) -> bool:
+    """
+    Redirect/readiness guard: require persisted response + extraction artifacts tied to a completed run.
+    Aggregate rows alone are not sufficient.
+    """
+    run = (
+        AEOExecutionRun.objects.filter(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
+        .order_by("-created_at")
+        .first()
+    )
+    if run is None:
+        return False
+    response_count = AEOResponseSnapshot.objects.filter(profile=profile, execution_run=run).count()
+    extraction_count = AEOExtractionSnapshot.objects.filter(
+        response_snapshot__profile=profile,
+        response_snapshot__execution_run=run,
+    ).count()
+    minimum = max(1, int(run.prompt_count_executed or 0))
+    if response_count < minimum or extraction_count < minimum:
+        return False
+    return True
+
+
 def business_profile_fully_onboarded(profile: BusinessProfile | None) -> bool:
     if profile is None:
         return False
@@ -79,10 +103,7 @@ def business_profile_fully_onboarded(profile: BusinessProfile | None) -> bool:
     if not profile_has_ranked_keywords(profile):
         return False
 
-    if not profile_has_aeo_response_snapshots(profile):
-        return False
-
-    if not profile_has_aeo_extraction_snapshots(profile):
+    if not profile_has_valid_aeo_run_artifacts(profile):
         return False
 
     return True

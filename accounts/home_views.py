@@ -5,14 +5,17 @@ Site home page: optional staff-only third-party API usage charts.
 from __future__ import annotations
 
 from django.shortcuts import render
+from django.http import HttpResponseForbidden
 from django.utils.translation import gettext as _
 
 from accounts.models import BusinessProfile
 from accounts.third_party_usage import (
+    build_aeo_pass_count_analytics_context,
     build_monthly_aeo_visibility_chart_context,
     build_monthly_api_usage_chart_context,
     build_monthly_token_usage_chart_context,
 )
+from accounts.models import AEOExecutionRun
 
 
 def site_home(request):
@@ -63,3 +66,38 @@ def site_home(request):
             "recvDatasets": token_chart["token_recv_datasets"],
         }
     return render(request, "pages/home.html", ctx)
+
+
+def aeo_pass_count_staff_page(request):
+    if not request.user.is_authenticated or not request.user.is_staff:
+        return HttpResponseForbidden("Staff only")
+    run_raw = request.GET.get("run_id")
+    profile_raw = request.GET.get("profile_id")
+    run_id: int | None = None
+    profile_id: int | None = None
+    try:
+        if run_raw not in (None, "", "all"):
+            run_id = int(str(run_raw))
+    except (TypeError, ValueError):
+        run_id = None
+    try:
+        if profile_raw not in (None, "", "all"):
+            profile_id = int(str(profile_raw))
+    except (TypeError, ValueError):
+        profile_id = None
+    analytics = build_aeo_pass_count_analytics_context(
+        execution_run_id=run_id,
+        profile_id=profile_id,
+    )
+    ctx = {
+        "analytics": analytics,
+        "selected_run_id": "all" if run_id is None else str(run_id),
+        "selected_profile_id": "all" if profile_id is None else str(profile_id),
+        "business_profiles_for_usage": list(
+            BusinessProfile.objects.order_by("business_name", "pk").values("id", "business_name")[:500]
+        ),
+        "aeo_runs_for_filter": list(
+            AEOExecutionRun.objects.order_by("-created_at").values("id")[:500]
+        ),
+    }
+    return render(request, "pages/aeo_pass_count_staff.html", ctx)

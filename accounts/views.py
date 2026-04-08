@@ -198,6 +198,9 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
                 "domain": domain,
                 "reused": True,
                 "ranked_keywords": reused.ranked_keywords or [],
+                "prompt_plan_status": reused.prompt_plan_status,
+                "prompt_plan_prompt_count": int(reused.prompt_plan_prompt_count or 0),
+                "prompt_plan_error": reused.prompt_plan_error or "",
             },
         )
 
@@ -221,7 +224,16 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
             onboarding_onpage_crawl_task.delay(cid)
 
         transaction.on_commit(_enqueue)
-        return Response({"id": crawl.id, "status": crawl.status, "domain": domain})
+        return Response(
+            {
+                "id": crawl.id,
+                "status": crawl.status,
+                "domain": domain,
+                "prompt_plan_status": crawl.prompt_plan_status,
+                "prompt_plan_prompt_count": int(crawl.prompt_plan_prompt_count or 0),
+                "prompt_plan_error": crawl.prompt_plan_error or "",
+            }
+        )
     except Exception:
         logger.exception(
             "[onboarding_onpage_crawl_start] failed user_id=%s domain=%s",
@@ -258,6 +270,9 @@ def onboarding_crawl_latest(request: HttpRequest) -> Response:
             "ranked_keywords": crawl.ranked_keywords or [],
             "exit_reason": crawl.exit_reason,
             "ranked_keywords_error": crawl.ranked_keywords_error or "",
+            "prompt_plan_status": crawl.prompt_plan_status,
+            "prompt_plan_prompt_count": int(crawl.prompt_plan_prompt_count or 0),
+            "prompt_plan_error": crawl.prompt_plan_error or "",
         },
     )
 
@@ -2515,6 +2530,37 @@ def aeo_pipeline_status_data(request: HttpRequest) -> Response:
             },
         }
     )
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_pass_count_analytics_data(request: HttpRequest) -> Response:
+    """Staff-only analytics for provider pass counts and conditional third-pass stability."""
+    if not bool(getattr(request.user, "is_staff", False)):
+        return Response({"detail": "Forbidden"}, status=403)
+    from .third_party_usage import build_aeo_pass_count_analytics_context
+
+    run_raw = request.GET.get("run_id")
+    profile_raw = request.GET.get("profile_id")
+    run_id: int | None = None
+    profile_id: int | None = None
+    try:
+        if run_raw not in (None, "", "all"):
+            run_id = int(str(run_raw))
+    except (TypeError, ValueError):
+        run_id = None
+    try:
+        if profile_raw not in (None, "", "all"):
+            profile_id = int(str(profile_raw))
+    except (TypeError, ValueError):
+        profile_id = None
+    payload = build_aeo_pass_count_analytics_context(
+        execution_run_id=run_id,
+        profile_id=profile_id,
+    )
+    return Response(payload)
 
 
 @csrf_exempt

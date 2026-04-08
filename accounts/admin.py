@@ -5,6 +5,7 @@ from django.contrib import admin
 from django.http import HttpResponse
 
 from .models import (
+    AEOPromptExecutionAggregate,
     AEOExtractionSnapshot,
     AEOResponseSnapshot,
     AEORecommendationRun,
@@ -139,12 +140,66 @@ class AEOExecutionRunAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "prompt_count_requested",
         "prompt_count_executed",
         "prompt_count_failed",
+        "background_status",
+        "phase1_provider_calls",
+        "phase1_completed_at",
+        "extraction_count",
+        "extraction_status",
+        "scoring_status",
         "created_at",
         "finished_at",
     )
-    list_filter = ("status", "fetch_mode", "created_at")
+    list_filter = ("status", "fetch_mode", "background_status", "extraction_status", "scoring_status", "created_at")
     search_fields = ("profile__business_name", "profile__user__email")
     raw_id_fields = ("profile",)
+
+
+@admin.register(AEOPromptExecutionAggregate)
+class AEOPromptExecutionAggregateAdmin(CsvExportAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "id",
+        "profile",
+        "execution_run",
+        "short_prompt_hash",
+        "prompt_category",
+        "openai_pass_count",
+        "gemini_pass_count",
+        "total_pass_count",
+        "openai_brand_cited_count",
+        "gemini_brand_cited_count",
+        "total_brand_cited_count",
+        "openai_stability_status",
+        "gemini_stability_status",
+        "openai_third_pass_required",
+        "gemini_third_pass_required",
+        "openai_third_pass_ran",
+        "gemini_third_pass_ran",
+        "stability_status",
+        "updated_at",
+    )
+    list_filter = (
+        "stability_status",
+        "openai_stability_status",
+        "gemini_stability_status",
+        "prompt_category",
+        "execution_run",
+        "created_at",
+        "updated_at",
+    )
+    search_fields = (
+        "profile__business_name",
+        "prompt_text",
+        "prompt_hash",
+    )
+    raw_id_fields = ("profile", "execution_run")
+    readonly_fields = (
+        "created_at",
+        "updated_at",
+    )
+
+    @admin.display(description="Prompt hash")
+    def short_prompt_hash(self, obj: AEOPromptExecutionAggregate) -> str:
+        return (obj.prompt_hash or "")[:12]
 
 
 @admin.register(BusinessProfile)
@@ -196,10 +251,12 @@ class OnboardingOnPageCrawlAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "status",
         "max_pages",
         "task_id",
+        "prompt_plan_status",
+        "prompt_plan_prompt_count",
         "exit_reason",
         "created_at",
     )
-    list_filter = ("status", "created_at")
+    list_filter = ("status", "prompt_plan_status", "created_at")
     search_fields = (
         "domain",
         "user__email",
@@ -207,6 +264,8 @@ class OnboardingOnPageCrawlAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "business_profile__business_name",
         "task_id",
         "exit_reason",
+        "prompt_plan_status",
+        "prompt_plan_task_id",
     )
     raw_id_fields = ("user", "business_profile")
     readonly_fields = ("created_at", "updated_at")

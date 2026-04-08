@@ -7,6 +7,7 @@ from rest_framework.test import APIClient
 from accounts.models import (
     AEOExecutionRun,
     AEOExtractionSnapshot,
+    AEOPromptExecutionAggregate,
     AEOResponseSnapshot,
     AEOScoreSnapshot,
     BusinessProfile,
@@ -36,16 +37,35 @@ def test_phase1_completion_enqueues_extraction_on_partial_failures(monkeypatch):
         raw_response="r1",
     )
 
-    monkeypatch.setattr(
-        "accounts.aeo.aeo_execution_utils.run_aeo_prompt_batch",
-        lambda *args, **kwargs: {
+    def fake_batch(*args, **kwargs):
+        one_ok = {"success": True, "snapshot_id": snap.id}
+        one_fail = {"success": False, "snapshot_id": None}
+        cb = kwargs.get("on_result")
+        if cb is not None:
+            cb(one_ok, {"prompt_obj": {"prompt": "q1", "type": "transactional", "dynamic": True, "weight": 1.0}})
+            cb(one_fail, {"prompt_obj": {"prompt": "q1"}})
+        return {
             "executed": 1,
             "failed": 1,
-            "results": [
-                {"success": True, "snapshot_id": snap.id},
-                {"success": False, "snapshot_id": None},
-            ],
-        },
+            "results": [one_ok, one_fail],
+        }
+
+    monkeypatch.setattr("accounts.aeo.aeo_execution_utils.run_aeo_prompt_batch", fake_batch)
+    row = AEOExtractionSnapshot.objects.create(
+        response_snapshot=snap,
+        brand_mentioned=True,
+        mention_position="top",
+        mention_count=1,
+        competitors_json=[],
+        citations_json=[],
+        sentiment="neutral",
+        confidence_score=0.9,
+        extraction_model="fake",
+        extraction_parse_failed=False,
+    )
+    monkeypatch.setattr(
+        "accounts.aeo.aeo_extraction_utils.run_single_extraction",
+        lambda snapshot, save=True, competitor_hints=None: {"extraction_snapshot_id": row.id},
     )
 
     queued = []
@@ -55,6 +75,8 @@ def test_phase1_completion_enqueues_extraction_on_partial_failures(monkeypatch):
             (run_id, snapshot_ids or [], response_platform)
         ),
     )
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase2_confidence_task.delay", lambda *args, **kwargs: None)
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda *args, **kwargs: None)
 
     run_aeo_phase1_execution_task(run.id, [{"prompt": "q1"}])
     run.refresh_from_db()
@@ -62,6 +84,58 @@ def test_phase1_completion_enqueues_extraction_on_partial_failures(monkeypatch):
     assert run.prompt_count_executed == 1
     assert run.prompt_count_failed == 1
     assert queued == [(run.id, [snap.id], None)]
+
+
+@pytest.mark.django_db
+def test_phase1_missing_snapshot_id_marks_run_failed(monkeypatch):
+    user = User.objects.create_user(username="p1m", email="p1m@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_PENDING)
+
+    monkeypatch.setattr(
+        "accounts.aeo.aeo_execution_utils.run_aeo_prompt_batch",
+        lambda *args, **kwargs: {
+            "executed": 1,
+            "failed": 0,
+            "results": [{"success": True, "snapshot_id": None}],
+        },
+    )
+    queued = []
+    monkeypatch.setattr("accounts.tasks.trigger_seo_warmup_after_aeo_task.delay", lambda rid: queued.append(rid))
+    run_aeo_phase1_execution_task(run.id, [{"prompt": "q1"}])
+    run.refresh_from_db()
+    assert run.status == AEOExecutionRun.STATUS_FAILED
+    assert run.extraction_status == AEOExecutionRun.STAGE_FAILED
+    assert "artifact_mismatch" in (run.error_message or "")
+    assert queued == [run.id]
+
+
+@pytest.mark.django_db
+def test_phase1_extraction_failure_skips_aggregate_and_fails_readiness(monkeypatch):
+    user = User.objects.create_user(username="p1e", email="p1e@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_PENDING)
+    snap = AEOResponseSnapshot.objects.create(
+        profile=profile,
+        execution_run=run,
+        prompt_text="q1",
+        prompt_hash="h1e",
+        raw_response="r1",
+        platform="openai",
+    )
+    monkeypatch.setattr(
+        "accounts.aeo.aeo_execution_utils.run_aeo_prompt_batch",
+        lambda *args, **kwargs: {"executed": 1, "failed": 0, "results": [{"success": True, "snapshot_id": snap.id}]},
+    )
+    monkeypatch.setattr(
+        "accounts.aeo.aeo_extraction_utils.run_single_extraction",
+        lambda snapshot, save=True, competitor_hints=None: {"extraction_snapshot_id": None},
+    )
+    monkeypatch.setattr("accounts.tasks.trigger_seo_warmup_after_aeo_task.delay", lambda *args, **kwargs: None)
+    run_aeo_phase1_execution_task(run.id, [{"prompt": "q1"}])
+    run.refresh_from_db()
+    assert run.status == AEOExecutionRun.STATUS_FAILED
+    assert AEOPromptExecutionAggregate.objects.filter(profile=profile, execution_run=run).count() == 0
 
 
 @pytest.mark.django_db

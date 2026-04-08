@@ -352,6 +352,21 @@ def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
             "updated_at",
         ]
         crawl.save(update_fields=save_fields)
+        if crawl.status == OnboardingOnPageCrawl.STATUS_COMPLETED and crawl.ranked_keywords:
+            # Trigger prompt generation immediately after keyword pipeline completion.
+            if crawl.prompt_plan_status not in {
+                OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED,
+                OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING,
+                OnboardingOnPageCrawl.PROMPT_PLAN_COMPLETED,
+            }:
+                from .tasks import onboarding_prompt_generation_task
+
+                crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED
+                crawl.prompt_plan_error = ""
+                crawl.save(update_fields=["prompt_plan_status", "prompt_plan_error", "updated_at"])
+                task = onboarding_prompt_generation_task.delay(crawl.id)
+                crawl.prompt_plan_task_id = str(getattr(task, "id", "") or "")[:128]
+                crawl.save(update_fields=["prompt_plan_task_id", "updated_at"])
         logger.info(
             "[onboarding onpage] crawl id=%s status=%s pages=%s",
             crawl_id,

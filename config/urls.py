@@ -6,7 +6,7 @@ from django.urls import path
 from django.views import defaults as default_views
 from django.views.generic import TemplateView
 
-from accounts.home_views import site_home
+from accounts.home_views import aeo_pass_count_staff_page, site_home
 from drf_spectacular.views import SpectacularAPIView
 from drf_spectacular.views import SpectacularSwaggerView
 from rest_framework.authtoken.views import obtain_auth_token
@@ -21,6 +21,7 @@ urlpatterns = [
         TemplateView.as_view(template_name="pages/about.html"),
         name="about",
     ),
+    path("staff/aeo-pass-counts/", aeo_pass_count_staff_page, name="staff-aeo-pass-counts"),
     # Django Admin, use {% url 'admin:index' %}
     path(settings.ADMIN_URL, admin.site.urls),
     # User management
@@ -83,6 +84,7 @@ urlpatterns += [
         name="aeo-onboarding-competitors-data",
     ),
     path("api/aeo/pipeline-status/", accounts_views.aeo_pipeline_status_data, name="aeo-pipeline-status-data"),
+    path("api/staff/aeo-pass-counts/", accounts_views.aeo_pass_count_analytics_data, name="aeo-pass-count-analytics"),
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
     path("api/aeo/refresh-gemini/", accounts_views.refresh_aeo_gemini, name="refresh-aeo-gemini"),
     path(

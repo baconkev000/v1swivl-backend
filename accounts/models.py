@@ -367,13 +367,7 @@ class AEOResponseSnapshot(models.Model):
                 name="accounts_aeo_rsp_ph_cr",
             ),
         ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["execution_run", "prompt_hash", "platform"],
-                condition=models.Q(execution_run__isnull=False),
-                name="accounts_aeo_rsp_run_hash_platform_uq",
-            ),
-        ]
+        constraints = []
 
     def __str__(self) -> str:
         short = (self.prompt_hash or "")[:12]
@@ -483,6 +477,121 @@ class AEOExtractionSnapshot(models.Model):
         return f"AEOExtractionSnapshot(response_id={self.response_snapshot_id}, ok={not self.extraction_parse_failed})"
 
 
+class AEOPromptExecutionAggregate(models.Model):
+    """
+    Canonical per-prompt aggregate (read model) updated in-place across passes/providers.
+
+    Raw attempt artifacts still live in AEOResponseSnapshot/AEOExtractionSnapshot.
+    """
+
+    STABILITY_PENDING = "pending"
+    STABILITY_STABLE = "stable"
+    STABILITY_UNSTABLE = "unstable"
+    STABILITY_STABILIZED_AFTER_THIRD = "stabilized_after_third"
+    STABILITY_CHOICES = [
+        (STABILITY_PENDING, "Pending"),
+        (STABILITY_STABLE, "Stable"),
+        (STABILITY_UNSTABLE, "Unstable"),
+        (STABILITY_STABILIZED_AFTER_THIRD, "Stabilized After Third"),
+    ]
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_prompt_execution_aggregates",
+    )
+    execution_run = models.ForeignKey(
+        "AEOExecutionRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="prompt_aggregates",
+    )
+    prompt_hash = models.CharField(max_length=64, db_index=True)
+    prompt_text = models.TextField(blank=True, default="")
+    prompt_type = models.CharField(max_length=32, blank=True, default="")
+    prompt_category = models.CharField(max_length=32, blank=True, default="")
+
+    openai_pass_count = models.IntegerField(default=0)
+    gemini_pass_count = models.IntegerField(default=0)
+    openai_brand_cited_count = models.IntegerField(default=0)
+    gemini_brand_cited_count = models.IntegerField(default=0)
+    openai_wrong_url_count = models.IntegerField(default=0)
+    gemini_wrong_url_count = models.IntegerField(default=0)
+    total_pass_count = models.IntegerField(default=0)
+    total_brand_cited_count = models.IntegerField(default=0)
+
+    last_openai_response_snapshot = models.ForeignKey(
+        AEOResponseSnapshot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    last_gemini_response_snapshot = models.ForeignKey(
+        AEOResponseSnapshot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    last_openai_competitors_json = models.JSONField(default=list, blank=True)
+    last_gemini_competitors_json = models.JSONField(default=list, blank=True)
+    last_openai_citations_json = models.JSONField(default=list, blank=True)
+    last_gemini_citations_json = models.JSONField(default=list, blank=True)
+    last_openai_brand_mentioned = models.BooleanField(default=False)
+    last_gemini_brand_mentioned = models.BooleanField(default=False)
+    openai_last_wrong_url_status = models.CharField(max_length=40, blank=True, default="")
+    gemini_last_wrong_url_status = models.CharField(max_length=40, blank=True, default="")
+    openai_brand_mention_history = models.JSONField(default=list, blank=True)
+    gemini_brand_mention_history = models.JSONField(default=list, blank=True)
+    openai_pass_history_json = models.JSONField(default=list, blank=True)
+    gemini_pass_history_json = models.JSONField(default=list, blank=True)
+    openai_stability_status = models.CharField(
+        max_length=28,
+        choices=STABILITY_CHOICES,
+        default=STABILITY_PENDING,
+        db_index=True,
+    )
+    gemini_stability_status = models.CharField(
+        max_length=28,
+        choices=STABILITY_CHOICES,
+        default=STABILITY_PENDING,
+        db_index=True,
+    )
+    openai_third_pass_required = models.BooleanField(default=False)
+    gemini_third_pass_required = models.BooleanField(default=False)
+    openai_third_pass_ran = models.BooleanField(default=False)
+    gemini_third_pass_ran = models.BooleanField(default=False)
+
+    stability_status = models.CharField(
+        max_length=28,
+        choices=STABILITY_CHOICES,
+        default=STABILITY_PENDING,
+        db_index=True,
+    )
+    stability_reasons = models.JSONField(default=list, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-updated_at", "-id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["profile", "execution_run", "prompt_hash"],
+                name="accounts_aeo_prompt_agg_profile_run_hash_uq",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["profile", "execution_run", "stability_status"]),
+            models.Index(fields=["profile", "prompt_hash"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"AEOPromptExecutionAggregate(profile_id={self.profile_id}, hash={self.prompt_hash[:12]}...)"
+
+
 class AEOScoreSnapshot(models.Model):
     """
     Append-only AEO scoring run derived from extraction snapshots (trend / reporting).
@@ -494,6 +603,25 @@ class AEOScoreSnapshot(models.Model):
         BusinessProfile,
         on_delete=models.CASCADE,
         related_name="aeo_score_snapshots",
+    )
+    LAYER_SAMPLE = "sample"
+    LAYER_CONFIDENCE = "confidence"
+    SCORE_LAYER_CHOICES = [
+        (LAYER_SAMPLE, "Sample"),
+        (LAYER_CONFIDENCE, "Confidence"),
+    ]
+    score_layer = models.CharField(
+        max_length=16,
+        choices=SCORE_LAYER_CHOICES,
+        default=LAYER_CONFIDENCE,
+        db_index=True,
+    )
+    execution_run = models.ForeignKey(
+        "AEOExecutionRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="score_snapshots",
     )
     visibility_score = models.FloatField(default=0.0)
     weighted_position_score = models.FloatField(default=0.0)
@@ -631,6 +759,13 @@ class AEOExecutionRun(models.Model):
         choices=STAGE_CHOICES,
         default=STAGE_PENDING,
     )
+    background_status = models.CharField(
+        max_length=16,
+        choices=STAGE_CHOICES,
+        default=STAGE_PENDING,
+    )
+    phase1_completed_at = models.DateTimeField(null=True, blank=True)
+    phase1_provider_calls = models.IntegerField(default=0)
     extraction_count = models.IntegerField(default=0)
     score_snapshot_id = models.IntegerField(null=True, blank=True)
     recommendation_run_id = models.IntegerField(null=True, blank=True)
@@ -715,6 +850,18 @@ class OnboardingOnPageCrawl(models.Model):
         (STATUS_COMPLETED, "Completed"),
         (STATUS_FAILED, "Failed"),
     ]
+    PROMPT_PLAN_PENDING = "pending"
+    PROMPT_PLAN_QUEUED = "queued"
+    PROMPT_PLAN_RUNNING = "running"
+    PROMPT_PLAN_COMPLETED = "completed"
+    PROMPT_PLAN_FAILED = "failed"
+    PROMPT_PLAN_STATUS_CHOICES = [
+        (PROMPT_PLAN_PENDING, "Pending"),
+        (PROMPT_PLAN_QUEUED, "Queued"),
+        (PROMPT_PLAN_RUNNING, "Running"),
+        (PROMPT_PLAN_COMPLETED, "Completed"),
+        (PROMPT_PLAN_FAILED, "Failed"),
+    ]
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -754,6 +901,17 @@ class OnboardingOnPageCrawl(models.Model):
     task_id = models.CharField(max_length=128, blank=True, default="")
     exit_reason = models.CharField(max_length=64, blank=True, default="")
     error_message = models.TextField(blank=True, default="")
+    prompt_plan_status = models.CharField(
+        max_length=16,
+        choices=PROMPT_PLAN_STATUS_CHOICES,
+        default=PROMPT_PLAN_PENDING,
+        db_index=True,
+    )
+    prompt_plan_prompt_count = models.IntegerField(default=0)
+    prompt_plan_error = models.TextField(blank=True, default="")
+    prompt_plan_task_id = models.CharField(max_length=128, blank=True, default="")
+    prompt_plan_started_at = models.DateTimeField(null=True, blank=True)
+    prompt_plan_finished_at = models.DateTimeField(null=True, blank=True)
     context = models.JSONField(
         default=dict,
         blank=True,

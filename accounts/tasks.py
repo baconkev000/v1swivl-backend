@@ -40,6 +40,10 @@ def _aeo_target_prompt_count() -> int:
         return 50
 
 
+def _is_onboarding_sample_size() -> bool:
+    return _aeo_target_prompt_count() == 10
+
+
 def _aeo_recommendation_stage_enabled() -> bool:
     return bool(getattr(settings, "AEO_ENABLE_RECOMMENDATION_STAGE", False))
 
@@ -513,8 +517,15 @@ def run_aeo_phase1_execution_task(
     ``providers`` — optional ``['openai']``, ``['gemini']``, ``['perplexity']``, or combinations, for dashboard refresh.
     ``force_refresh`` — when True, skip the 30-day execution cache (explicit user refresh).
     """
-    from .models import AEOExecutionRun
+    from .models import AEOExecutionRun, AEOResponseSnapshot
     from .aeo.aeo_execution_utils import run_aeo_prompt_batch
+    from .aeo.aeo_extraction_utils import run_single_extraction
+    from .aeo.progressive_onboarding import (
+        PASSES_PER_PROVIDER_TARGET,
+        build_phase1_provider_batches,
+        classify_prompt_category,
+        update_prompt_aggregate_from_extraction,
+    )
 
     run = (
         AEOExecutionRun.objects.select_related("profile")
@@ -629,15 +640,114 @@ def run_aeo_phase1_execution_task(
 
     from accounts.third_party_usage import usage_profile_context
 
+    extraction_created = 0
+    extraction_failed = 0
+
+    def _process_result(one: dict[str, Any], meta: dict[str, Any]) -> None:
+        nonlocal extraction_created, extraction_failed
+        if not one.get("success"):
+            return
+        snapshot_id = one.get("snapshot_id")
+        if snapshot_id is None:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase1] success result missing snapshot_id run_id=%s profile_id=%s prompt_hash=%s",
+                run.id,
+                profile.id,
+                one.get("prompt_hash"),
+            )
+            return
+        snap = AEOResponseSnapshot.objects.select_related("profile").filter(id=snapshot_id).first()
+        if snap is None:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase1] snapshot missing for callback run_id=%s profile_id=%s snapshot_id=%s",
+                run.id,
+                profile.id,
+                snapshot_id,
+            )
+            return
+        if snap.profile_id != profile.id:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase1] snapshot profile mismatch run_id=%s profile_id=%s snapshot_profile_id=%s snapshot_id=%s",
+                run.id,
+                profile.id,
+                snap.profile_id,
+                snapshot_id,
+            )
+            return
+        ex = run_single_extraction(snap, save=True)
+        ex_id = ex.get("extraction_snapshot_id")
+        if not ex_id:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase1] extraction missing id run_id=%s profile_id=%s snapshot_id=%s",
+                run.id,
+                profile.id,
+                snapshot_id,
+            )
+            return
+        extraction_created += 1
+        extraction_row = snap.extraction_snapshots.filter(id=ex_id).first()
+        if extraction_row is None:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase1] extraction row missing run_id=%s profile_id=%s snapshot_id=%s extraction_id=%s",
+                run.id,
+                profile.id,
+                snapshot_id,
+                ex_id,
+            )
+            return
+        prompt_obj = meta.get("prompt_obj") if isinstance(meta, dict) else {}
+        prompt_category = str(
+            (prompt_obj or {}).get("_aeo_category") or classify_prompt_category(prompt_obj or {})
+        )
+        update_prompt_aggregate_from_extraction(
+            profile=profile,
+            execution_run_id=run.id,
+            response_snapshot=snap,
+            extraction_snapshot=extraction_row,
+            prompt_category=prompt_category,
+        )
+
     try:
         with usage_profile_context(profile):
-            batch = run_aeo_prompt_batch(
-                selected,
-                profile,
-                save=True,
-                execution_run=run,
-                providers=providers,
-            )
+            if _is_onboarding_sample_size() and providers is None:
+                p1_batches = build_phase1_provider_batches(selected)
+                openai_selected = p1_batches.get("openai", [])
+                gemini_selected = p1_batches.get("gemini", [])
+                batch_openai = run_aeo_prompt_batch(
+                    openai_selected,
+                    profile,
+                    save=True,
+                    execution_run=run,
+                    providers=["openai"],
+                    on_result=_process_result,
+                )
+                batch_gemini = run_aeo_prompt_batch(
+                    gemini_selected,
+                    profile,
+                    save=True,
+                    execution_run=run,
+                    providers=["gemini"],
+                    on_result=_process_result,
+                )
+                batch = {
+                    "executed": int(batch_openai.get("executed") or 0) + int(batch_gemini.get("executed") or 0),
+                    "failed": int(batch_openai.get("failed") or 0) + int(batch_gemini.get("failed") or 0),
+                    "results": list(batch_openai.get("results") or []) + list(batch_gemini.get("results") or []),
+                }
+            else:
+                batch = run_aeo_prompt_batch(
+                    selected,
+                    profile,
+                    save=True,
+                    execution_run=run,
+                    providers=providers,
+                    on_result=_process_result,
+                )
         response_snapshot_ids = [
             int(one.get("snapshot_id"))
             for one in (batch.get("results") or [])
@@ -645,9 +755,23 @@ def run_aeo_phase1_execution_task(
         ]
         run.prompt_count_executed = int(batch.get("executed") or 0)
         run.prompt_count_failed = int(batch.get("failed") or 0)
-        run.status = AEOExecutionRun.STATUS_COMPLETED
+        successful_results = sum(1 for one in (batch.get("results") or []) if one.get("success"))
+        response_snapshot_count = len(response_snapshot_ids)
+        run.extraction_count = extraction_created
+        artifacts_ok = (
+            successful_results > 0
+            and successful_results == response_snapshot_count
+            and extraction_created == response_snapshot_count
+        )
+        run.extraction_status = (
+            AEOExecutionRun.STAGE_COMPLETED if artifacts_ok else AEOExecutionRun.STAGE_FAILED
+        )
+        run.phase1_completed_at = django_tz.now()
+        run.phase1_provider_calls = int(len(batch.get("results") or []))
+        run.background_status = AEOExecutionRun.STAGE_RUNNING if _is_onboarding_sample_size() else run.background_status
+        run.status = AEOExecutionRun.STATUS_COMPLETED if artifacts_ok else AEOExecutionRun.STATUS_FAILED
         run.finished_at = django_tz.now()
-        run.error_message = ""
+        run.error_message = "" if artifacts_ok else "phase1_artifact_mismatch_missing_response_or_extraction"
         run.save(
             update_fields=[
                 "prompt_count_executed",
@@ -655,6 +779,11 @@ def run_aeo_phase1_execution_task(
                 "status",
                 "finished_at",
                 "error_message",
+                "extraction_count",
+                "extraction_status",
+                "phase1_completed_at",
+                "phase1_provider_calls",
+                "background_status",
                 "updated_at",
             ]
         )
@@ -673,7 +802,22 @@ def run_aeo_phase1_execution_task(
             response_snapshot_ids,
             len(response_snapshot_ids),
         )
-        run_aeo_phase3_extraction_task.delay(run.id, response_snapshot_ids, extraction_platform)
+        if run.status != AEOExecutionRun.STATUS_COMPLETED:
+            logger.error(
+                "[AEO phase1] artifact mismatch run_id=%s profile_id=%s success=%s snapshots=%s extractions=%s",
+                run.id,
+                profile.id,
+                successful_results,
+                response_snapshot_count,
+                extraction_created,
+            )
+            _enqueue_seo_after_aeo(run.id)
+            return
+        if _is_onboarding_sample_size() and providers is None:
+            run_aeo_phase2_confidence_task.delay(run.id, selected)
+            run_aeo_phase4_scoring_task.delay(run.id)
+        else:
+            run_aeo_phase3_extraction_task.delay(run.id, response_snapshot_ids, extraction_platform)
     except Exception as e:
         run.status = AEOExecutionRun.STATUS_FAILED
         run.error_message = f"{type(e).__name__}: {e}"
@@ -687,6 +831,224 @@ def run_aeo_phase1_execution_task(
             run.status,
         )
         _enqueue_seo_after_aeo(run.id)
+
+
+def _aggregate_priority_bucket(agg: Any) -> int:
+    # legacy helper retained for compatibility
+    reasons = set(agg.stability_reasons or [])
+    if agg.stability_status == "unstable":
+        return 0
+    if "brand_mention_changed_across_provider" in reasons:
+        return 1
+    if "wrong_url_attribution_present" in reasons:
+        return 2
+    if "missing_second_provider_or_pass" in reasons:
+        return 3
+    return 4
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | None = None) -> None:
+    from .aeo.aeo_execution_utils import run_aeo_prompt_batch
+    from .aeo.aeo_extraction_utils import run_single_extraction
+    from .aeo.progressive_onboarding import (
+        PASSES_PER_PROVIDER_TARGET,
+        classify_prompt_category,
+        update_prompt_aggregate_from_extraction,
+    )
+    from .models import AEOExecutionRun, AEOPromptExecutionAggregate, AEOResponseSnapshot
+
+    run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
+    if not run:
+        return
+    profile = run.profile
+    saved_prompts = list(prompt_set or [])
+    if not saved_prompts:
+        saved_prompts = [{"prompt": p} for p in (profile.selected_aeo_prompts or []) if str(p).strip()]
+
+    saved_by_hash = {}
+    for p in saved_prompts:
+        cat = classify_prompt_category(p)
+        spec = dict(p)
+        spec["_aeo_category"] = cat
+        h = __import__("accounts.aeo.aeo_execution_utils", fromlist=["hash_prompt"]).hash_prompt(
+            str(spec.get("prompt") or "")
+        )
+        saved_by_hash[h] = spec
+
+    extraction_created = 0
+    extraction_failed = 0
+
+    def _process_result(one: dict[str, Any], meta: dict[str, Any]) -> None:
+        nonlocal extraction_created, extraction_failed
+        if not one.get("success"):
+            return
+        snapshot_id = one.get("snapshot_id")
+        if snapshot_id is None:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase2] success result missing snapshot_id run_id=%s profile_id=%s prompt_hash=%s",
+                run.id,
+                profile.id,
+                one.get("prompt_hash"),
+            )
+            return
+        snap = AEOResponseSnapshot.objects.select_related("profile").filter(id=snapshot_id).first()
+        if snap is None:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase2] snapshot missing for callback run_id=%s profile_id=%s snapshot_id=%s",
+                run.id,
+                profile.id,
+                snapshot_id,
+            )
+            return
+        if snap.profile_id != profile.id:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase2] snapshot profile mismatch run_id=%s profile_id=%s snapshot_profile_id=%s snapshot_id=%s",
+                run.id,
+                profile.id,
+                snap.profile_id,
+                snapshot_id,
+            )
+            return
+        ex = run_single_extraction(snap, save=True)
+        ex_id = ex.get("extraction_snapshot_id")
+        if not ex_id:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase2] extraction missing id run_id=%s profile_id=%s snapshot_id=%s",
+                run.id,
+                profile.id,
+                snapshot_id,
+            )
+            return
+        extraction_created += 1
+        extraction_row = snap.extraction_snapshots.filter(id=ex_id).first()
+        if extraction_row is None:
+            extraction_failed += 1
+            logger.error(
+                "[AEO phase2] extraction row missing run_id=%s profile_id=%s snapshot_id=%s extraction_id=%s",
+                run.id,
+                profile.id,
+                snapshot_id,
+                ex_id,
+            )
+            return
+        prompt_obj = meta.get("prompt_obj") if isinstance(meta, dict) else {}
+        update_prompt_aggregate_from_extraction(
+            profile=profile,
+            execution_run_id=run.id,
+            response_snapshot=snap,
+            extraction_snapshot=extraction_row,
+            prompt_category=str((prompt_obj or {}).get("_aeo_category") or classify_prompt_category(prompt_obj or {})),
+        )
+
+    from accounts.third_party_usage import usage_profile_context
+    # Iterate until each provider/prompt pair reaches done criteria:
+    # - pass_count >=2 and stable, or
+    # - pass_count ==3 after unstable-at-2 third pass.
+    for _round in range(4):
+        aggs = list(
+            AEOPromptExecutionAggregate.objects.filter(profile=profile, execution_run=run).order_by("id")
+        )
+        if not aggs:
+            if _round == 0:
+                run.background_status = AEOExecutionRun.STAGE_SKIPPED
+                run.save(update_fields=["background_status", "updated_at"])
+                return
+            break
+        aggs.sort(key=lambda a: (_aggregate_priority_bucket(a), str(a.prompt_hash)))
+
+        provider_batches: dict[str, list[dict[str, Any]]] = {"openai": [], "gemini": []}
+        provider_priority: dict[str, dict[str, int]] = {"openai": {}, "gemini": {}}
+
+        def _push(provider: str, spec: dict[str, Any], prio: int) -> None:
+            h = __import__("accounts.aeo.aeo_execution_utils", fromlist=["hash_prompt"]).hash_prompt(
+                str(spec.get("prompt") or "")
+            )
+            cur = provider_priority[provider].get(h)
+            if cur is None or prio < cur:
+                provider_priority[provider][h] = prio
+                if all(
+                    __import__("accounts.aeo.aeo_execution_utils", fromlist=["hash_prompt"]).hash_prompt(
+                        str(s.get("prompt") or "")
+                    )
+                    != h
+                    for s in provider_batches[provider]
+                ):
+                    provider_batches[provider].append(spec)
+
+        for agg in aggs:
+            spec = saved_by_hash.get(agg.prompt_hash)
+            if not spec:
+                continue
+            if int(agg.openai_pass_count or 0) < PASSES_PER_PROVIDER_TARGET:
+                _push("openai", spec, 0)
+            elif (
+                bool(agg.openai_third_pass_required)
+                and not bool(agg.openai_third_pass_ran)
+                and int(agg.openai_pass_count or 0) < 3
+            ):
+                _push("openai", spec, 1)
+            if int(agg.gemini_pass_count or 0) < PASSES_PER_PROVIDER_TARGET:
+                _push("gemini", spec, 0)
+            elif (
+                bool(agg.gemini_third_pass_required)
+                and not bool(agg.gemini_third_pass_ran)
+                and int(agg.gemini_pass_count or 0) < 3
+            ):
+                _push("gemini", spec, 1)
+
+        for provider in ("openai", "gemini"):
+            provider_batches[provider].sort(
+                key=lambda s: (
+                    provider_priority[provider].get(
+                        __import__("accounts.aeo.aeo_execution_utils", fromlist=["hash_prompt"]).hash_prompt(
+                            str(s.get("prompt") or "")
+                        ),
+                        9,
+                    ),
+                    __import__("accounts.aeo.aeo_execution_utils", fromlist=["hash_prompt"]).hash_prompt(
+                        str(s.get("prompt") or "")
+                    ),
+                )
+            )
+        if not provider_batches["openai"] and not provider_batches["gemini"]:
+            break
+
+        with usage_profile_context(profile):
+            if provider_batches["openai"]:
+                run_aeo_prompt_batch(
+                    provider_batches["openai"],
+                    profile,
+                    save=True,
+                    execution_run=run,
+                    providers=["openai"],
+                    on_result=_process_result,
+                )
+            if provider_batches["gemini"]:
+                run_aeo_prompt_batch(
+                    provider_batches["gemini"],
+                    profile,
+                    save=True,
+                    execution_run=run,
+                    providers=["gemini"],
+                    on_result=_process_result,
+                )
+
+    run.extraction_count = int(run.extraction_count or 0) + extraction_created
+    run.background_status = (
+        AEOExecutionRun.STAGE_COMPLETED if extraction_failed == 0 else AEOExecutionRun.STAGE_FAILED
+    )
+    if extraction_failed:
+        run.error_message = "phase2_artifact_mismatch_missing_response_or_extraction"
+    update_fields = ["extraction_count", "background_status", "updated_at"]
+    if extraction_failed:
+        update_fields.append("error_message")
+    run.save(update_fields=update_fields)
+    run_aeo_phase4_scoring_task.delay(run.id)
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
@@ -872,7 +1234,8 @@ def run_aeo_phase3_extraction_task(
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
     from .models import AEOExecutionRun
-    from .aeo.aeo_scoring_utils import calculate_aeo_scores_for_business
+    from .aeo.aeo_scoring_utils import calculate_aeo_scores_for_business, calculate_layered_scores_from_aggregates
+    from .models import AEOScoreSnapshot
 
     run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
     if not run:
@@ -897,7 +1260,21 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
     run.save(update_fields=["scoring_status", "updated_at"])
     logger.info("[AEO phase4] scoring start run_id=%s profile_id=%s", run.id, run.profile_id)
     try:
-        score_data = calculate_aeo_scores_for_business(run.profile, save=True)
+        if _is_onboarding_sample_size():
+            calculate_layered_scores_from_aggregates(
+                run.profile,
+                execution_run_id=run.id,
+                score_layer=AEOScoreSnapshot.LAYER_SAMPLE,
+                save=True,
+            )
+            score_data = calculate_layered_scores_from_aggregates(
+                run.profile,
+                execution_run_id=run.id,
+                score_layer=AEOScoreSnapshot.LAYER_CONFIDENCE,
+                save=True,
+            )
+        else:
+            score_data = calculate_aeo_scores_for_business(run.profile, save=True)
         run.score_snapshot_id = score_data.get("snapshot_id")
         run.scoring_status = AEOExecutionRun.STAGE_COMPLETED
         run.save(update_fields=["score_snapshot_id", "scoring_status", "updated_at"])
@@ -1084,3 +1461,254 @@ def onboarding_onpage_crawl_task(self, crawl_id: int) -> None:
     from .onboarding_onpage import execute_onboarding_onpage_crawl
 
     execute_onboarding_onpage_crawl(int(crawl_id))
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
+    """
+    Build onboarding prompt plan in background immediately after keyword pipeline.
+    Idempotent at crawl level (queued/running/completed states).
+    """
+    from .aeo.aeo_utils import (
+        aeo_business_input_from_onboarding_payload,
+        build_full_aeo_prompt_plan,
+    )
+    from datetime import timedelta
+
+    from .models import AEOExecutionRun, OnboardingOnPageCrawl
+    from .views import _serialize_aeo_prompt_items
+
+    crawl = (
+        OnboardingOnPageCrawl.objects.select_related("business_profile")
+        .filter(pk=crawl_id)
+        .first()
+    )
+    if not crawl:
+        logger.warning("[onboarding prompt-plan] crawl id=%s not found", crawl_id)
+        return
+    if crawl.prompt_plan_status == OnboardingOnPageCrawl.PROMPT_PLAN_COMPLETED:
+        return
+    if crawl.status != OnboardingOnPageCrawl.STATUS_COMPLETED:
+        return
+
+    profile = crawl.business_profile
+    ctx = crawl.context if isinstance(crawl.context, dict) else {}
+    selected_topics = [
+        str(r.get("keyword") or "").strip()
+        for r in (crawl.ranked_keywords or [])
+        if str(r.get("keyword") or "").strip()
+    ]
+    if not selected_topics:
+        crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_FAILED
+        crawl.prompt_plan_error = "no_ranked_keywords"
+        crawl.prompt_plan_finished_at = django_tz.now()
+        crawl.save(
+            update_fields=[
+                "prompt_plan_status",
+                "prompt_plan_error",
+                "prompt_plan_finished_at",
+                "updated_at",
+            ]
+        )
+        return
+
+    details = []
+    for row in crawl.ranked_keywords or []:
+        kw = str((row or {}).get("keyword") or "").strip()
+        if not kw:
+            continue
+        d = {"keyword": kw}
+        for key in ("search_volume", "rank", "rank_group", "aeo_score", "aeo_category", "aeo_reason"):
+            if key in row and row.get(key) not in (None, ""):
+                d[key] = row.get(key)
+        details.append(d)
+
+    crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING
+    crawl.prompt_plan_started_at = django_tz.now()
+    crawl.prompt_plan_error = ""
+    crawl.save(
+        update_fields=[
+            "prompt_plan_status",
+            "prompt_plan_started_at",
+            "prompt_plan_error",
+            "updated_at",
+        ]
+    )
+    try:
+        business_input = aeo_business_input_from_onboarding_payload(
+            business_name=str(ctx.get("business_name") or profile.business_name or ""),
+            website_url=str(profile.website_url or crawl.domain or ""),
+            location=str(ctx.get("location") or profile.business_address or ""),
+            language=str(ctx.get("language") or ""),
+            selected_topics=selected_topics,
+        )
+        target_prompt_count = _aeo_target_prompt_count()
+        plan = build_full_aeo_prompt_plan(
+            profile,
+            business_input=business_input,
+            onboarding_topic_details=details,
+            include_openai=True,
+            target_combined_count=target_prompt_count,
+        )
+        combined = list(plan.get("combined") or [])
+        meta = plan.get("meta") if isinstance(plan.get("meta"), dict) else {}
+        openai_status = str(meta.get("openai_status") or "").strip().lower()
+        if not combined or openai_status == "failed_empty":
+            crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_FAILED
+            crawl.prompt_plan_prompt_count = 0
+            crawl.prompt_plan_finished_at = django_tz.now()
+            crawl.prompt_plan_error = (
+                f"empty_prompt_plan_combined_count={len(combined)} openai_status={openai_status or 'unknown'}"
+            )[:2000]
+            crawl.save(
+                update_fields=[
+                    "prompt_plan_status",
+                    "prompt_plan_prompt_count",
+                    "prompt_plan_finished_at",
+                    "prompt_plan_error",
+                    "updated_at",
+                ]
+            )
+            logger.error(
+                "[onboarding prompt-plan] failed_empty crawl_id=%s profile_id=%s combined_count=%s openai_status=%s",
+                crawl.id,
+                profile.id,
+                len(combined),
+                openai_status or "unknown",
+            )
+            return
+
+        prompt_texts = [str(x.get("prompt") or "").strip() for x in combined if str(x.get("prompt") or "").strip()]
+        profile.selected_aeo_prompts = prompt_texts
+        profile.save(update_fields=["selected_aeo_prompts", "updated_at"])
+        verify_saved = [
+            str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()
+        ]
+        if len(verify_saved) != len(prompt_texts):
+            logger.error(
+                "[onboarding prompt-plan] selected_aeo_prompts_save_verify_failed crawl_id=%s profile_id=%s expected=%s got=%s",
+                crawl.id,
+                profile.id,
+                len(prompt_texts),
+                len(verify_saved),
+            )
+            crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_FAILED
+            crawl.prompt_plan_finished_at = django_tz.now()
+            crawl.prompt_plan_error = "selected_aeo_prompts_save_verify_failed"
+            crawl.save(
+                update_fields=[
+                    "prompt_plan_status",
+                    "prompt_plan_finished_at",
+                    "prompt_plan_error",
+                    "updated_at",
+                ]
+            )
+            return
+
+        crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_COMPLETED
+        crawl.prompt_plan_prompt_count = len(prompt_texts)
+        crawl.prompt_plan_finished_at = django_tz.now()
+        crawl.prompt_plan_error = ""
+        crawl.save(
+            update_fields=[
+                "prompt_plan_status",
+                "prompt_plan_prompt_count",
+                "prompt_plan_finished_at",
+                "prompt_plan_error",
+                "updated_at",
+            ]
+        )
+        logger.info(
+            "[onboarding prompt-plan] generated crawl_id=%s profile_id=%s combined_count=%s openai_status=%s",
+            crawl.id,
+            profile.id,
+            len(prompt_texts),
+            openai_status or "unknown",
+        )
+
+        # Guarantee execution enqueue for onboarding-generated prompts.
+        now = django_tz.now()
+        stale_cutoff = now - timedelta(minutes=20)
+        inflight = list(
+            AEOExecutionRun.objects.filter(
+                profile=profile,
+                status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+            ).order_by("created_at")
+        )
+        for r in inflight:
+            has_snapshots = r.response_snapshots.exists()
+            if not has_snapshots and (r.created_at and r.created_at < stale_cutoff):
+                r.status = AEOExecutionRun.STATUS_FAILED
+                r.error_message = "stale_inflight_no_snapshots_timeout"
+                r.finished_at = now
+                r.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+                logger.error(
+                    "[onboarding execute] stale_inflight_marked_failed run_id=%s profile_id=%s",
+                    r.id,
+                    profile.id,
+                )
+
+        inflight_after_recovery = AEOExecutionRun.objects.filter(
+            profile=profile,
+            status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+        ).exists()
+        if inflight_after_recovery:
+            logger.info(
+                "[onboarding execute] skipped_enqueue_inflight_exists crawl_id=%s profile_id=%s",
+                crawl.id,
+                profile.id,
+            )
+            return
+
+        run_payload = _serialize_aeo_prompt_items(combined)
+        run = AEOExecutionRun.objects.create(
+            profile=profile,
+            prompt_count_requested=len(run_payload),
+            status=AEOExecutionRun.STATUS_PENDING,
+            error_message=f"onboarding_crawl_id={crawl.id}",
+        )
+        try:
+            run_aeo_phase1_execution_task.delay(run.id, run_payload)
+            logger.info(
+                "[onboarding execute] phase1_enqueued crawl_id=%s profile_id=%s run_id=%s prompts=%s",
+                crawl.id,
+                profile.id,
+                run.id,
+                len(run_payload),
+            )
+        except Exception as exc:
+            run.status = AEOExecutionRun.STATUS_FAILED
+            run.error_message = f"phase1_enqueue_failed:{type(exc).__name__}: {exc}"[:2000]
+            run.finished_at = django_tz.now()
+            run.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+            crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_FAILED
+            crawl.prompt_plan_finished_at = django_tz.now()
+            crawl.prompt_plan_error = f"phase1_enqueue_failed:{type(exc).__name__}: {exc}"[:2000]
+            crawl.save(
+                update_fields=[
+                    "prompt_plan_status",
+                    "prompt_plan_finished_at",
+                    "prompt_plan_error",
+                    "updated_at",
+                ]
+            )
+            logger.exception(
+                "[onboarding execute] phase1 enqueue failed crawl_id=%s profile_id=%s run_id=%s",
+                crawl.id,
+                profile.id,
+                run.id,
+            )
+            return
+    except Exception as exc:
+        crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_FAILED
+        crawl.prompt_plan_finished_at = django_tz.now()
+        crawl.prompt_plan_error = f"{type(exc).__name__}: {exc}"[:2000]
+        crawl.save(
+            update_fields=[
+                "prompt_plan_status",
+                "prompt_plan_finished_at",
+                "prompt_plan_error",
+                "updated_at",
+            ]
+        )
+        logger.exception("[onboarding prompt-plan] failed crawl_id=%s", crawl_id)

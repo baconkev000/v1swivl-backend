@@ -18,7 +18,13 @@ from typing import Any, Protocol, Sequence
 
 from django.db.models import Prefetch
 
-from ..models import AEOExtractionSnapshot, AEOScoreSnapshot, AEOResponseSnapshot, BusinessProfile
+from ..models import (
+    AEOPromptExecutionAggregate,
+    AEOExtractionSnapshot,
+    AEOScoreSnapshot,
+    AEOResponseSnapshot,
+    BusinessProfile,
+)
 from .aeo_extraction_utils import (
     _normalize_for_brand_match,
     brand_effectively_cited,
@@ -608,10 +614,14 @@ def save_aeo_score_snapshot(
     competitor_dominance: dict[str, Any],
     total_prompts: int,
     total_mentions: int,
+    score_layer: str = AEOScoreSnapshot.LAYER_CONFIDENCE,
+    execution_run_id: int | None = None,
 ) -> AEOScoreSnapshot:
     """Append-only score row for trend tracking."""
     return AEOScoreSnapshot.objects.create(
         profile=business_profile,
+        score_layer=score_layer,
+        execution_run_id=execution_run_id,
         visibility_score=visibility_score,
         weighted_position_score=weighted_position_score,
         citation_share=citation_share,
@@ -619,6 +629,77 @@ def save_aeo_score_snapshot(
         total_prompts=max(0, int(total_prompts)),
         total_mentions=max(0, int(total_mentions)),
     )
+
+
+def calculate_layered_scores_from_aggregates(
+    business_profile: BusinessProfile,
+    *,
+    execution_run_id: int,
+    score_layer: str,
+    save: bool = True,
+) -> dict[str, Any]:
+    """
+    Lightweight layered score from canonical prompt aggregates.
+    - sample: phase-1 minimum coverage signal
+    - confidence: all passes/providers collected
+    """
+    aggs = AEOPromptExecutionAggregate.objects.filter(
+        profile=business_profile,
+        execution_run_id=execution_run_id,
+    )
+    if score_layer == AEOScoreSnapshot.LAYER_SAMPLE:
+        aggs = aggs.filter(total_pass_count__gte=2)  # one pass per provider in phase 1
+    else:
+        aggs = aggs.filter(openai_pass_count__gte=2, gemini_pass_count__gte=2)
+
+    rows = list(aggs)
+    total = len(rows)
+    if total == 0:
+        values = {
+            "visibility_score": 0.0,
+            "weighted_position_score": 0.0,
+            "citation_share": 0.0,
+            "competitor_dominance": {"ranked": [], "total_competitor_mentions": 0},
+            "total_prompts": 0,
+            "total_mentions": 0,
+            "snapshot_id": None,
+        }
+        return values
+
+    cited_prompts = sum(1 for a in rows if a.total_brand_cited_count > 0)
+    visibility = round(100.0 * cited_prompts / total, 4)
+    weighted = visibility
+    total_mentions = sum(int(a.total_brand_cited_count or 0) for a in rows)
+    total_passes = sum(int(a.total_pass_count or 0) for a in rows)
+    citation_share = round(100.0 * total_mentions / max(1, total_passes), 4)
+    comp_mentions = 0
+    for a in rows:
+        comp_mentions += len(a.last_openai_competitors_json or [])
+        comp_mentions += len(a.last_gemini_competitors_json or [])
+
+    snap_id = None
+    if save:
+        snap = save_aeo_score_snapshot(
+            business_profile,
+            visibility_score=visibility,
+            weighted_position_score=weighted,
+            citation_share=citation_share,
+            competitor_dominance={"ranked": [], "total_competitor_mentions": int(comp_mentions)},
+            total_prompts=total,
+            total_mentions=total_mentions,
+            score_layer=score_layer,
+            execution_run_id=execution_run_id,
+        )
+        snap_id = snap.id
+    return {
+        "snapshot_id": snap_id,
+        "visibility_score": visibility,
+        "weighted_position_score": weighted,
+        "citation_share": citation_share,
+        "competitor_dominance": {"ranked": [], "total_competitor_mentions": int(comp_mentions)},
+        "total_prompts": total,
+        "total_mentions": total_mentions,
+    }
 
 
 def calculate_aeo_scores_for_business(

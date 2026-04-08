@@ -375,6 +375,7 @@ def run_aeo_prompt_batch(
     api_key_env: str = DEFAULT_API_KEY_ENV,
     execution_run: AEOExecutionRun | None = None,
     providers: Sequence[str] | None = None,
+    on_result: Any | None = None,
 ) -> dict[str, Any]:
     """
     Run each prompt across enabled providers (OpenAI; plus Gemini and/or Perplexity when keys exist).
@@ -427,6 +428,7 @@ def run_aeo_prompt_batch(
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures: list[Any] = []
+        future_meta: dict[Any, dict[str, Any]] = {}
         for prompt_obj in prompt_set:
             pair_id = uuid.uuid4() if execution_run else None
 
@@ -447,7 +449,9 @@ def run_aeo_prompt_batch(
                         execution_pair_id=pid,
                     )
 
-                futures.append(pool.submit(openai_job))
+                fut = pool.submit(openai_job)
+                future_meta[fut] = {"provider": PLATFORM_OPENAI, "prompt_obj": dict(prompt_obj)}
+                futures.append(fut)
 
             if run_gemini:
 
@@ -463,7 +467,9 @@ def run_aeo_prompt_batch(
                         execution_pair_id=pid,
                     )
 
-                futures.append(pool.submit(gemini_job))
+                fut = pool.submit(gemini_job)
+                future_meta[fut] = {"provider": PLATFORM_GEMINI, "prompt_obj": dict(prompt_obj)}
+                futures.append(fut)
 
             if run_perplexity:
 
@@ -479,12 +485,20 @@ def run_aeo_prompt_batch(
                         execution_pair_id=pid,
                     )
 
-                futures.append(pool.submit(perplexity_job))
+                fut = pool.submit(perplexity_job)
+                future_meta[fut] = {"provider": PLATFORM_PERPLEXITY, "prompt_obj": dict(prompt_obj)}
+                futures.append(fut)
 
         for fut in futures:
             one = fut.result()
             results.append(one)
             _accumulate(one)
+            if on_result is not None:
+                meta = future_meta.get(fut, {}) or {}
+                try:
+                    on_result(one, meta)
+                except Exception:
+                    logger.exception("AEO run_aeo_prompt_batch on_result callback failed")
 
     return {
         "profile_id": business_profile.id,

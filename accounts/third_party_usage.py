@@ -28,6 +28,7 @@ from accounts.aeo.aeo_scoring_utils import (
     latest_extraction_per_response_in_window,
 )
 from accounts.models import (
+    AEOPromptExecutionAggregate,
     AEOResponseSnapshot,
     BusinessProfile,
     ThirdPartyApiErrorLog,
@@ -702,4 +703,86 @@ def build_monthly_aeo_visibility_chart_context(
         "aeo_visibility_labels": labels,
         "aeo_visibility_total": total_data,
         "aeo_visibility_by_platform": by_platform,
+    }
+
+
+def build_aeo_pass_count_analytics_context(
+    *,
+    execution_run_id: int | None = None,
+    profile_id: int | None = None,
+) -> dict[str, Any]:
+    qs = AEOPromptExecutionAggregate.objects.all()
+    if execution_run_id is not None:
+        qs = qs.filter(execution_run_id=execution_run_id)
+    if profile_id is not None:
+        qs = qs.filter(profile_id=profile_id)
+    rows = list(qs)
+    total_prompts = len(rows)
+
+    def _provider_breakdown(provider: str) -> dict[str, int]:
+        if provider == "openai":
+            pass_attr = "openai_pass_count"
+            stable_attr = "openai_stability_status"
+            need_attr = "openai_third_pass_required"
+            ran_attr = "openai_third_pass_ran"
+        else:
+            pass_attr = "gemini_pass_count"
+            stable_attr = "gemini_stability_status"
+            need_attr = "gemini_third_pass_required"
+            ran_attr = "gemini_third_pass_ran"
+        total = sum(1 for r in rows if int(getattr(r, pass_attr, 0) or 0) > 0)
+        stable_2 = sum(
+            1
+            for r in rows
+            if int(getattr(r, pass_attr, 0) or 0) >= 2 and str(getattr(r, stable_attr, "")) == "stable"
+        )
+        needed_third = sum(1 for r in rows if bool(getattr(r, need_attr, False)))
+        third_completed = sum(1 for r in rows if bool(getattr(r, ran_attr, False)))
+        return {
+            "total": total,
+            "stable_at_2": stable_2,
+            "needed_third": needed_third,
+            "third_completed": third_completed,
+        }
+
+    openai = _provider_breakdown("openai")
+    gemini = _provider_breakdown("gemini")
+    prompts_requiring_3rd = sum(
+        1 for r in rows if bool(r.openai_third_pass_required) or bool(r.gemini_third_pass_required)
+    )
+    prompts_ran_3rd = sum(
+        1 for r in rows if bool(r.openai_third_pass_ran) or bool(r.gemini_third_pass_ran)
+    )
+    prompts_stable_at_2 = sum(
+        1
+        for r in rows
+        if str(r.openai_stability_status) == "stable" and str(r.gemini_stability_status) == "stable"
+    )
+
+    by_run = defaultdict(lambda: {"total": 0, "stable_at_2": 0, "needed_third": 0, "third_completed": 0})
+    for r in rows:
+        key = str(r.execution_run_id or "none")
+        by_run[key]["total"] += 1
+        if str(r.openai_stability_status) == "stable" and str(r.gemini_stability_status) == "stable":
+            by_run[key]["stable_at_2"] += 1
+        if bool(r.openai_third_pass_required) or bool(r.gemini_third_pass_required):
+            by_run[key]["needed_third"] += 1
+        if bool(r.openai_third_pass_ran) or bool(r.gemini_third_pass_ran):
+            by_run[key]["third_completed"] += 1
+
+    run_labels = sorted(by_run.keys(), key=lambda x: (x == "none", x))
+    run_grouped = {
+        "labels": run_labels,
+        "total": [by_run[k]["total"] for k in run_labels],
+        "stable_at_2": [by_run[k]["stable_at_2"] for k in run_labels],
+        "needed_third": [by_run[k]["needed_third"] for k in run_labels],
+        "third_completed": [by_run[k]["third_completed"] for k in run_labels],
+    }
+    return {
+        "total_prompts": total_prompts,
+        "prompts_stable_at_2": prompts_stable_at_2,
+        "prompts_requiring_3rd": prompts_requiring_3rd,
+        "prompts_ran_3rd": prompts_ran_3rd,
+        "providers": {"openai": openai, "gemini": gemini},
+        "grouped_by_run": run_grouped,
     }

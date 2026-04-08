@@ -43,7 +43,6 @@ OPENAI_ONBOARDING_TYPE_RATIO: Final[dict[str, float]] = {
     AEOPromptType.COMPARISON.value: 0.25,
     AEOPromptType.AUTHORITY.value: 0.15,
 }
-OPENAI_ONBOARDING_MAX_ROUNDS: Final[int] = 6
 OPENAI_ONBOARDING_MAX_BATCH_SIZE: Final[int] = 24
 
 
@@ -890,9 +889,6 @@ def build_full_aeo_prompt_plan(
     combined: list[dict[str, Any]] = []
     openai_status = "attempted"
     openai_message = ""
-    max_rounds = int(
-        getattr(settings, "AEO_ONBOARDING_OPENAI_MAX_ROUNDS", OPENAI_ONBOARDING_MAX_ROUNDS)
-    )
     max_batch_size = int(
         getattr(
             settings,
@@ -902,62 +898,25 @@ def build_full_aeo_prompt_plan(
     )
     quotas = _allocate_type_quotas(target)
 
+    # Fast single-pass generation per type (no retry/top-up loops).
     for prompt_type in type_order:
-        need = quotas[prompt_type]
-        rounds = 0
-        while need > 0 and rounds < max_rounds:
-            if max_openai_prompts is not None and len(combined) >= max_openai_prompts:
-                break
-            req = min(max_batch_size, need)
-            batch = run_prompt_batch_via_openai(
-                ctx,
-                seed_prompts=combined,
-                max_additional=req,
-                system_prompt=type_prompts[prompt_type],
-                onboarding_topic_details=onboarding_topic_details,
-                business_profile=profile,
-            )
-            rounds += 1
-            typed = _typed_batch(batch, prompt_type)
-            if not typed:
-                break
-            before = len(combined)
-            combined = combine_prompt_set(combined, typed)
-            added = len(combined) - before
-            if added <= 0:
-                break
-            need -= added
-
-    topup_round = 0
-    while len(combined) < target and topup_round < max_rounds:
         if max_openai_prompts is not None and len(combined) >= max_openai_prompts:
             break
-        progress = False
-        remaining = target - len(combined)
-        for prompt_type in type_order:
-            if remaining <= 0:
-                break
-            req = min(max_batch_size, remaining)
-            batch = run_prompt_batch_via_openai(
-                ctx,
-                seed_prompts=combined,
-                max_additional=req,
-                system_prompt=type_prompts[prompt_type],
-                onboarding_topic_details=onboarding_topic_details,
-                business_profile=profile,
-            )
-            typed = _typed_batch(batch, prompt_type)
-            if not typed:
-                continue
-            before = len(combined)
-            combined = combine_prompt_set(combined, typed)
-            added = len(combined) - before
-            if added > 0:
-                progress = True
-                remaining = target - len(combined)
-        topup_round += 1
-        if not progress:
-            break
+        req = min(max_batch_size, max(0, quotas[prompt_type]))
+        if req <= 0:
+            continue
+        batch = run_prompt_batch_via_openai(
+            ctx,
+            seed_prompts=combined,
+            max_additional=req,
+            system_prompt=type_prompts[prompt_type],
+            onboarding_topic_details=onboarding_topic_details,
+            business_profile=profile,
+        )
+        typed = _typed_batch(batch, prompt_type)
+        if not typed:
+            continue
+        combined = combine_prompt_set(combined, typed)
 
     if len(combined) > target:
         combined = combined[:target]
