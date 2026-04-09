@@ -23,6 +23,7 @@ ALLOWED_HOSTS = env.list(
         "ripplerank.ai",
         "www.ripplerank.ai",
         "api.ripplerank.ai",
+        "app.ripplerank.ai",
     ],
 )
 # Always allow canonical production hosts even when DJANGO_ALLOWED_HOSTS is overridden in env.
@@ -33,6 +34,7 @@ _required_hosts = [
     "ripplerank.ai",
     "www.ripplerank.ai",
     "api.ripplerank.ai",
+    "app.ripplerank.ai",
 ]
 for _h in _required_hosts:
     if _h not in ALLOWED_HOSTS:
@@ -67,14 +69,15 @@ SECURE_SSL_REDIRECT = env.bool("DJANGO_SECURE_SSL_REDIRECT", default=True)
 SESSION_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#session-cookie-name
 SESSION_COOKIE_NAME = "__Secure-sessionid"
-# Share session cookie with frontend (getswivl.ai) so /app sees auth after Google login.
-# Use a leading dot so cookie is sent to both api.getswivl.ai and getswivl.ai.
+# Share session cookie with the web app origin (e.g. app.ripplerank.ai + api.ripplerank.ai).
+# Use a leading dot so the cookie is sent to all subdomains of that parent.
+# For Ripple Rank at app.ripplerank.ai, set SESSION_COOKIE_DOMAIN=.ripplerank.ai in env.
 SESSION_COOKIE_DOMAIN = env("SESSION_COOKIE_DOMAIN", default=".getswivl.ai")
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-secure
 CSRF_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-name
 CSRF_COOKIE_NAME = "__Secure-csrftoken"
-# Share CSRF cookie with frontend for API requests from getswivl.ai to api.getswivl.ai.
+# Share CSRF cookie with the web app for cross-subdomain API requests (e.g. app → api).
 CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN", default=".getswivl.ai")
 # https://docs.djangoproject.com/en/dev/topics/security/#ssl-https
 # https://docs.djangoproject.com/en/dev/ref/settings/#secure-hsts-seconds
@@ -113,6 +116,7 @@ CORS_ALLOWED_ORIGINS = [
     "https://www.getswivl.ai",
     "https://ripplerank.ai",
     "https://www.ripplerank.ai",
+    "https://app.ripplerank.ai",
     "http://localhost:3000",
 ]
 CSRF_TRUSTED_ORIGINS = [
@@ -122,6 +126,7 @@ CSRF_TRUSTED_ORIGINS = [
     "https://api.ripplerank.ai",
     "https://ripplerank.ai",
     "https://www.ripplerank.ai",
+    "https://app.ripplerank.ai",
     "http://localhost:3000",
 ]
 
@@ -216,7 +221,8 @@ LOGGING = {
 # -------------------------------------------------------------------------------
 # Tools that generate code samples can use SERVERS to point to the correct domain
 SPECTACULAR_SETTINGS["SERVERS"] = [
-    {"url": "https://api.getswivl.ai", "description": "Production API"},
+    {"url": "https://api.getswivl.ai", "description": "Production API (Swivl)"},
+    {"url": "https://api.ripplerank.ai", "description": "Production API (Ripple Rank)"},
 ]
 # Your stuff...
 # ------------------------------------------------------------------------------
