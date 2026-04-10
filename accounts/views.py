@@ -157,8 +157,10 @@ def stripe_webhook(request: HttpRequest) -> Response:
     except stripe.error.SignatureVerificationError:
         return Response({"error": "Invalid signature."}, status=400)
 
-    event_type = str(event.get("type") or "")
-    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    # Stripe SDK returns ``StripeObject`` (dict-like, but no ``.get``).
+    event_dict = event.to_dict_recursive() if hasattr(event, "to_dict_recursive") else dict(event)
+    event_type = str(event_dict.get("type") or "")
+    data = event_dict.get("data") if isinstance(event_dict.get("data"), dict) else {}
     handled = False
     try:
         if event_type == "checkout.session.completed":
