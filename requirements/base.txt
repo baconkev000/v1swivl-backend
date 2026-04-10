@@ -26,5 +26,5 @@ redis==5.2.1
 celery[redis]==5.4.0
 
 PyJWT
-openai
+openai==1.109.1
 google-generativeai==0.8.5
