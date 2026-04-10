@@ -157,10 +157,21 @@ def stripe_webhook(request: HttpRequest) -> Response:
     except stripe.error.SignatureVerificationError:
         return Response({"error": "Invalid signature."}, status=400)
 
-    # Stripe SDK returns ``StripeObject`` (dict-like, but no ``.get``).
-    event_dict = event.to_dict_recursive() if hasattr(event, "to_dict_recursive") else dict(event)
-    event_type = str(event_dict.get("type") or "")
-    data = event_dict.get("data") if isinstance(event_dict.get("data"), dict) else {}
+    # Stripe SDK objects are key-indexable but may not support ``.get`` / ``dict(...)`` consistently.
+    try:
+        event_type = str(event["type"] or "")
+    except Exception:
+        event_type = ""
+    try:
+        raw_data = event["data"]
+    except Exception:
+        raw_data = {}
+    if isinstance(raw_data, dict):
+        data = raw_data
+    elif hasattr(raw_data, "to_dict_recursive"):
+        data = raw_data.to_dict_recursive()  # StripeObject -> plain dict
+    else:
+        data = {}
     handled = False
     try:
         if event_type == "checkout.session.completed":
