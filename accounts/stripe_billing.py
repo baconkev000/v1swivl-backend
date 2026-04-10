@@ -116,7 +116,17 @@ def _plan_from_price(price_id: str) -> str | None:
     return None
 
 
-def _resolve_profile_for_event(data: dict) -> BusinessProfile | None:
+def _unique_profile_by_email(email: str) -> BusinessProfile | None:
+    qs = BusinessProfile.objects.filter(user__email__iexact=email).order_by("-is_main", "-updated_at")
+    rows = list(qs[:2])
+    if len(rows) == 1:
+        return rows[0]
+    if len(rows) > 1:
+        logger.warning("[stripe] email fallback is ambiguous for email=%s", email)
+    return None
+
+
+def _resolve_profile_for_event(data: dict) -> tuple[BusinessProfile | None, str]:
     d = _as_dict(data)
     obj = _as_dict(d.get("object"))
     customer_id = str(obj.get("customer") or "").strip()
@@ -127,7 +137,7 @@ def _resolve_profile_for_event(data: dict) -> BusinessProfile | None:
             .first()
         )
         if profile is not None:
-            return profile
+            return profile, "customer"
         # First-time webhook for a customer not yet linked in DB:
         # fetch customer email from Stripe and resolve profile by email.
         try:
@@ -135,31 +145,27 @@ def _resolve_profile_for_event(data: dict) -> BusinessProfile | None:
             customer_dict = _as_dict(customer)
             customer_email = str(customer_dict.get("email") or "").strip().lower()
             if customer_email:
-                profile_by_email = (
-                    BusinessProfile.objects.filter(user__email__iexact=customer_email)
-                    .order_by("-is_main", "-updated_at")
-                    .first()
-                )
+                profile_by_email = _unique_profile_by_email(customer_email)
                 if profile_by_email is not None:
-                    return profile_by_email
+                    return profile_by_email, "customer_email_lookup"
         except Exception:
             logger.exception("[stripe] failed retrieving customer %s for profile resolution", customer_id)
 
     client_ref = str(obj.get("client_reference_id") or "").strip()
     if client_ref.isdigit():
-        return BusinessProfile.objects.filter(id=int(client_ref)).first()
+        p = BusinessProfile.objects.filter(id=int(client_ref)).first()
+        if p is not None:
+            return p, "client_reference_id"
 
     details = _as_dict(obj.get("customer_details"))
     email = str(details.get("email") or "").strip().lower()
     if not email:
         email = str(obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
     if email:
-        return (
-            BusinessProfile.objects.filter(user__email__iexact=email)
-            .order_by("-is_main", "-updated_at")
-            .first()
-        )
-    return None
+        p = _unique_profile_by_email(email)
+        if p is not None:
+            return p, "email"
+    return None, "none"
 
 
 def apply_subscription_payload_to_profile(
@@ -204,7 +210,7 @@ def apply_subscription_payload_to_profile(
 
 
 def sync_from_checkout_session(payload: dict) -> bool:
-    profile = _resolve_profile_for_event(payload)
+    profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
         logger.error(
@@ -215,10 +221,28 @@ def sync_from_checkout_session(payload: dict) -> bool:
         )
         return False
     obj = _as_dict(_as_dict(payload).get("object"))
+    client_ref = str(obj.get("client_reference_id") or "").strip()
+    details = _as_dict(obj.get("customer_details"))
+    checkout_email = str(details.get("email") or obj.get("customer_email") or "").strip().lower()
+    if client_ref.isdigit():
+        ref_profile = BusinessProfile.objects.filter(id=int(client_ref)).first()
+        if ref_profile is not None and checkout_email and ref_profile.user.email:
+            if ref_profile.user.email.strip().lower() != checkout_email:
+                logger.warning(
+                    "[stripe] checkout session email mismatch for client_reference_id=%s profile_email=%s checkout_email=%s",
+                    client_ref,
+                    ref_profile.user.email.strip().lower(),
+                    checkout_email,
+                )
+    logger.info(
+        "[stripe] checkout session matched via %s profile_id=%s client_reference_id=%s",
+        resolver,
+        profile.id,
+        client_ref,
+    )
     subscription = str(obj.get("subscription") or "").strip()
     customer = str(obj.get("customer") or "").strip()
     payment_link = str(obj.get("payment_link") or "").strip()
-    details = _as_dict(obj.get("customer_details"))
     email = str(details.get("email") or "").strip()
     if not email:
         email = str(obj.get("customer_email") or "").strip()
@@ -235,7 +259,7 @@ def sync_from_checkout_session(payload: dict) -> bool:
 
 
 def sync_from_invoice_paid(payload: dict) -> bool:
-    profile = _resolve_profile_for_event(payload)
+    profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
         logger.error(
@@ -246,6 +270,12 @@ def sync_from_invoice_paid(payload: dict) -> bool:
         )
         return False
     obj = _as_dict(_as_dict(payload).get("object"))
+    logger.info(
+        "[stripe] invoice paid matched via %s profile_id=%s client_reference_id=%s",
+        resolver,
+        profile.id,
+        str(obj.get("client_reference_id") or "").strip(),
+    )
     customer = str(obj.get("customer") or "").strip()
     subscription = str(obj.get("subscription") or "").strip()
     lines = _as_dict(obj.get("lines"))
@@ -283,7 +313,9 @@ def sync_from_subscription(payload: dict) -> bool:
             .first()
         )
     if profile is None:
-        profile = _resolve_profile_for_event(payload)
+        profile, resolver = _resolve_profile_for_event(payload)
+    else:
+        resolver = "customer/subscription"
     if profile is None:
         dbg = extract_match_debug_fields(payload)
         logger.error(
@@ -293,15 +325,21 @@ def sync_from_subscription(payload: dict) -> bool:
             dbg["customer_details_email"],
         )
         return False
+    logger.info(
+        "[stripe] subscription event matched via %s profile_id=%s client_reference_id=%s",
+        resolver,
+        profile.id,
+        str(obj.get("client_reference_id") or "").strip(),
+    )
 
     status = str(obj.get("status") or "").strip()
     cancel_at_period_end = bool(obj.get("cancel_at_period_end"))
     current_period_end = obj.get("current_period_end")
-    items = obj.get("items") if isinstance(obj.get("items"), dict) else {}
+    items = _as_dict(obj.get("items"))
     first = None
     if isinstance(items.get("data"), list) and items.get("data"):
         first = items.get("data")[0]
-    price = first.get("price") if isinstance(first, dict) and isinstance(first.get("price"), dict) else {}
+    price = _as_dict(_as_dict(first).get("price"))
     price_id = str(price.get("id") or "").strip()
     apply_subscription_payload_to_profile(
         profile,

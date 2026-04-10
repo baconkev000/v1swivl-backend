@@ -203,6 +203,11 @@ def _onboarding_domain_claimed_by_other_user(domain: str, user) -> bool:
     return False
 
 
+def _resolve_main_business_profile_for_user(user):
+    profile_qs = BusinessProfile.objects.filter(user=user)
+    return profile_qs.filter(is_main=True).first() or profile_qs.first()
+
+
 def _onboarding_reusable_crawl_for_user(user, domain: str) -> OnboardingOnPageCrawl | None:
     """Latest completed onboarding crawl for this user/domain with keywords and/or review topics."""
     if not domain:
@@ -1115,14 +1120,9 @@ def business_profile(request: HttpRequest) -> Response:
     profile_qs = BusinessProfile.objects.filter(user=request.user).prefetch_related(
         "tracked_competitors",
     )
-    profile = profile_qs.filter(is_main=True).first()
+    profile = _resolve_main_business_profile_for_user(request.user)
     if profile is None:
-        # If the user has no profiles yet, create a main profile for them.
-        if not profile_qs.exists():
-            profile = BusinessProfile.objects.create(user=request.user, is_main=True)
-        else:
-            # Fallback: use the first existing profile as the main one.
-            profile = profile_qs.first()
+        profile = BusinessProfile.objects.create(user=request.user, is_main=True)
 
     if request.method == "GET":
         force_aeo_refresh = str(request.GET.get("refresh_aeo", "")).strip().lower() in {"1", "true", "yes"}
@@ -1169,6 +1169,24 @@ def business_profile(request: HttpRequest) -> Response:
         },
     )
     return Response(out.data)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def business_profile_checkout_identity(request: HttpRequest) -> Response:
+    profile = _resolve_main_business_profile_for_user(request.user)
+    if profile is None:
+        return Response({"error": "No active business profile."}, status=404)
+    return Response(
+        {
+            "profile_id": profile.id,
+            "user_id": request.user.id,
+            "email": request.user.email,
+            "is_main": bool(profile.is_main),
+        },
+    )
 
 
 @csrf_exempt

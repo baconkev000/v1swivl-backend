@@ -55,6 +55,11 @@ urlpatterns += [
     ),
     # Business profile for settings page (main profile) + list/create/update profiles
     path("api/business-profile/", accounts_views.business_profile, name="business-profile"),
+    path(
+        "api/business-profile/checkout-identity/",
+        accounts_views.business_profile_checkout_identity,
+        name="business-profile-checkout-identity",
+    ),
     path("api/business-profiles/", accounts_views.business_profile_list, name="business-profile-list"),
     path("api/business-profiles/<int:pk>/", accounts_views.business_profile_detail, name="business-profile-detail"),
     path("api/seo/refresh-next-steps/", accounts_views.refresh_seo_next_steps, name="seo-refresh-next-steps"),
