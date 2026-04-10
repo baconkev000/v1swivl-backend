@@ -63,14 +63,39 @@ def _safe_dt_from_unix(ts: int | None) -> datetime | None:
 
 
 def _as_dict(x) -> dict:
-    if isinstance(x, dict):
-        return x
-    if hasattr(x, "to_dict_recursive"):
+    n = normalize_stripe_payload(x)
+    return n if isinstance(n, dict) else {}
+
+
+def normalize_stripe_payload(value):
+    """
+    Recursively normalize Stripe payload objects to plain Python dict/list/scalars.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): normalize_stripe_payload(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [normalize_stripe_payload(v) for v in value]
+    if isinstance(value, tuple):
+        return [normalize_stripe_payload(v) for v in value]
+    if hasattr(value, "to_dict_recursive"):
         try:
-            return x.to_dict_recursive()
+            return normalize_stripe_payload(value.to_dict_recursive())
         except Exception:
             return {}
-    return {}
+    return value
+
+
+def extract_match_debug_fields(payload) -> dict[str, str]:
+    d = _as_dict(payload)
+    obj = _as_dict(d.get("object"))
+    details = _as_dict(obj.get("customer_details"))
+    return {
+        "client_reference_id": str(obj.get("client_reference_id") or "").strip(),
+        "customer": str(obj.get("customer") or "").strip(),
+        "customer_details_email": str(details.get("email") or "").strip().lower(),
+    }
 
 
 def _plan_from_price(price_id: str) -> str | None:
@@ -124,7 +149,7 @@ def _resolve_profile_for_event(data: dict) -> BusinessProfile | None:
     if client_ref.isdigit():
         return BusinessProfile.objects.filter(id=int(client_ref)).first()
 
-    details = obj.get("customer_details") if isinstance(obj.get("customer_details"), dict) else {}
+    details = _as_dict(obj.get("customer_details"))
     email = str(details.get("email") or "").strip().lower()
     if not email:
         email = str(obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
@@ -181,7 +206,13 @@ def apply_subscription_payload_to_profile(
 def sync_from_checkout_session(payload: dict) -> bool:
     profile = _resolve_profile_for_event(payload)
     if profile is None:
-        logger.error("[stripe] checkout session: no matching profile")
+        dbg = extract_match_debug_fields(payload)
+        logger.error(
+            "[stripe] checkout session: no matching profile client_reference_id=%s customer=%s customer_details.email=%s",
+            dbg["client_reference_id"],
+            dbg["customer"],
+            dbg["customer_details_email"],
+        )
         return False
     obj = _as_dict(_as_dict(payload).get("object"))
     subscription = str(obj.get("subscription") or "").strip()
@@ -206,7 +237,13 @@ def sync_from_checkout_session(payload: dict) -> bool:
 def sync_from_invoice_paid(payload: dict) -> bool:
     profile = _resolve_profile_for_event(payload)
     if profile is None:
-        logger.error("[stripe] invoice paid: no matching profile")
+        dbg = extract_match_debug_fields(payload)
+        logger.error(
+            "[stripe] invoice paid: no matching profile client_reference_id=%s customer=%s customer_details.email=%s",
+            dbg["client_reference_id"],
+            dbg["customer"],
+            dbg["customer_details_email"],
+        )
         return False
     obj = _as_dict(_as_dict(payload).get("object"))
     customer = str(obj.get("customer") or "").strip()
@@ -248,7 +285,13 @@ def sync_from_subscription(payload: dict) -> bool:
     if profile is None:
         profile = _resolve_profile_for_event(payload)
     if profile is None:
-        logger.error("[stripe] subscription event: no matching profile")
+        dbg = extract_match_debug_fields(payload)
+        logger.error(
+            "[stripe] subscription event: no matching profile client_reference_id=%s customer=%s customer_details.email=%s",
+            dbg["client_reference_id"],
+            dbg["customer"],
+            dbg["customer_details_email"],
+        )
         return False
 
     status = str(obj.get("status") or "").strip()

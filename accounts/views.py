@@ -63,6 +63,8 @@ from .domain_utils import normalize_tracked_competitor_domain
 from .stripe_billing import sync_from_checkout_session
 from .stripe_billing import sync_from_invoice_paid
 from .stripe_billing import sync_from_subscription
+from .stripe_billing import normalize_stripe_payload
+from .stripe_billing import extract_match_debug_fields
 
 logger = logging.getLogger(__name__)
 
@@ -157,20 +159,13 @@ def stripe_webhook(request: HttpRequest) -> Response:
     except stripe.error.SignatureVerificationError:
         return Response({"error": "Invalid signature."}, status=400)
 
-    # Stripe SDK objects are key-indexable but may not support ``.get`` / ``dict(...)`` consistently.
-    try:
-        event_type = str(event["type"] or "")
-    except Exception:
-        event_type = ""
-    try:
-        raw_data = event["data"]
-    except Exception:
-        raw_data = {}
-    if isinstance(raw_data, dict):
-        data = raw_data
-    elif hasattr(raw_data, "to_dict_recursive"):
-        data = raw_data.to_dict_recursive()  # StripeObject -> plain dict
-    else:
+    # Normalize recursively to plain dict/list before dispatch.
+    event_dict = normalize_stripe_payload(event)
+    if not isinstance(event_dict, dict):
+        event_dict = {}
+    event_type = str(event_dict.get("type") or "")
+    data = event_dict.get("data")
+    if not isinstance(data, dict):
         data = {}
     handled = False
     try:
@@ -187,7 +182,14 @@ def stripe_webhook(request: HttpRequest) -> Response:
         return Response({"error": "Webhook handler failed."}, status=500)
 
     if not handled:
-        logger.error("[stripe webhook] ignored event without profile match: %s", event_type)
+        dbg = extract_match_debug_fields(data)
+        logger.error(
+            "[stripe webhook] ignored event without profile match: event_type=%s client_reference_id=%s customer=%s customer_details.email=%s",
+            event_type,
+            dbg["client_reference_id"],
+            dbg["customer"],
+            dbg["customer_details_email"],
+        )
     return Response({"received": True})
 
 
