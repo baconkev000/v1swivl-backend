@@ -60,6 +60,11 @@ urlpatterns += [
         accounts_views.business_profile_checkout_identity,
         name="business-profile-checkout-identity",
     ),
+    path(
+        "api/onboarding/local-dev-billing-complete/",
+        accounts_views.onboarding_local_dev_billing_complete,
+        name="onboarding-local-dev-billing-complete",
+    ),
     path("api/business-profiles/", accounts_views.business_profile_list, name="business-profile-list"),
     path("api/business-profiles/<int:pk>/", accounts_views.business_profile_detail, name="business-profile-detail"),
     path("api/seo/refresh-next-steps/", accounts_views.refresh_seo_next_steps, name="seo-refresh-next-steps"),

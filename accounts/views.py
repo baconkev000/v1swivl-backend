@@ -1380,6 +1380,50 @@ def business_profile_checkout_identity(request: HttpRequest) -> Response:
 
 
 @csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
+    """
+    DEBUG only: set fake Stripe billing fields so onboarding_complete passes without Payment Links.
+
+    Returns 404 when DEBUG is False (production and typical staging).
+    """
+    if not settings.DEBUG:
+        return Response(status=404)
+
+    profile = _resolve_main_business_profile_for_user(request.user)
+    if profile is None:
+        return Response({"error": "No active business profile."}, status=404)
+
+    raw_plan = request.data.get("plan") if isinstance(request.data, dict) else None
+    plan = str(raw_plan or "").strip() or BusinessProfile.PLAN_PRO
+    if plan not in {
+        BusinessProfile.PLAN_STARTER,
+        BusinessProfile.PLAN_PRO,
+        BusinessProfile.PLAN_ADVANCED,
+    }:
+        plan = BusinessProfile.PLAN_PRO
+
+    profile.stripe_customer_id = "cus_local_dev"
+    profile.stripe_subscription_id = "sub_local_dev"
+    profile.stripe_price_id = "price_local_dev"
+    profile.stripe_subscription_status = "active"
+    profile.plan = plan
+    profile.save(
+        update_fields=[
+            "stripe_customer_id",
+            "stripe_subscription_id",
+            "stripe_price_id",
+            "stripe_subscription_status",
+            "plan",
+            "updated_at",
+        ],
+    )
+    return Response({"ok": True, "plan": plan})
+
+
+@csrf_exempt
 @api_view(["GET"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
