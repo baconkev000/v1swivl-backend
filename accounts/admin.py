@@ -1,11 +1,14 @@
 import csv
+import json
 from datetime import datetime
 
 from django.contrib import admin
 from django.http import HttpResponse
+from django.utils.html import format_html
 
 from .models import (
     AEOPromptExecutionAggregate,
+    AEOCompetitorSnapshot,
     AEOExtractionSnapshot,
     AEOResponseSnapshot,
     AEORecommendationRun,
@@ -62,6 +65,46 @@ class AEORecommendationRunAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_filter = ("created_at",)
     search_fields = ("profile__business_name",)
     raw_id_fields = ("profile", "score_snapshot")
+
+
+@admin.register(AEOCompetitorSnapshot)
+class AEOCompetitorSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "id",
+        "profile",
+        "platform_scope",
+        "total_slots",
+        "window_start",
+        "window_end",
+        "updated_at",
+        "created_at",
+    )
+    list_filter = ("platform_scope", "created_at", "updated_at")
+    search_fields = ("profile__business_name", "profile__user__email")
+    autocomplete_fields = ("profile",)
+    date_hierarchy = "updated_at"
+    ordering = ("-updated_at",)
+    exclude = ("rows_json",)
+    readonly_fields = ("created_at", "updated_at", "rows_json_preview")
+
+    @admin.display(description="rows_json (read-only preview)")
+    def rows_json_preview(self, obj: AEOCompetitorSnapshot) -> str:
+        if obj is None or not getattr(obj, "pk", None):
+            return "—"
+        data = obj.rows_json
+        if data in (None, [], {}):
+            return "—"
+        try:
+            text = json.dumps(data, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(data)
+        max_len = 12000
+        if len(text) > max_len:
+            text = text[:max_len] + "\n… (truncated)"
+        return format_html(
+            '<pre style="max-height:28rem;overflow:auto;font-size:11px;margin:0;">{}</pre>',
+            text,
+        )
 
 
 @admin.register(AEOScoreSnapshot)
@@ -217,7 +260,9 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 @admin.register(TrackedCompetitor)
 class TrackedCompetitorAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "name", "domain", "created_at", "updated_at")
+    list_filter = ("created_at",)
     search_fields = ("name", "domain")
+    date_hierarchy = "created_at"
     ordering = ("domain",)
 
 

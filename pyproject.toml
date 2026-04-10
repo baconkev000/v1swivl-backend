@@ -37,6 +37,7 @@ dependencies = [
   "redis==5.2.1",
   "openai==1.109.1",
   "google-generativeai==0.8.5",
+  "stripe>=15.0.1",
 ]
 
 [dependency-groups]

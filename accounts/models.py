@@ -85,6 +85,12 @@ class BusinessProfile(models.Model):
         choices=PLAN_CHOICES,
         default=PLAN_STARTER,
     )
+    stripe_customer_id = models.CharField(max_length=255, blank=True, default="")
+    stripe_subscription_id = models.CharField(max_length=255, blank=True, default="")
+    stripe_price_id = models.CharField(max_length=255, blank=True, default="")
+    stripe_subscription_status = models.CharField(max_length=64, blank=True, default="")
+    stripe_current_period_end = models.DateTimeField(null=True, blank=True)
+    stripe_cancel_at_period_end = models.BooleanField(default=False)
 
     phone = models.CharField(max_length=50, blank=True)
     description = models.TextField(blank=True)
@@ -255,6 +261,58 @@ class AEOOverviewSnapshot(models.Model):
         return (
             f"AEOOverviewSnapshot(profile_id={self.profile_id}, "
             f"domain={self.domain}, location_code={self.location_code})"
+        )
+
+
+class AEOCompetitorSnapshot(models.Model):
+    """
+    Cached competitor visibility distribution for a profile and scope.
+
+    ``rows_json`` shape:
+      [{domain, display_name, appearances, visibility_pct, rank, last_seen_at}, ...]
+    """
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_competitor_snapshots",
+    )
+    platform_scope = models.CharField(
+        max_length=32,
+        default="all",
+        help_text="all | openai | gemini | perplexity (matches AEOResponseSnapshot.platform).",
+    )
+    window_start = models.DateTimeField(null=True, blank=True)
+    window_end = models.DateTimeField(null=True, blank=True)
+    total_slots = models.IntegerField(default=0)
+    rows_json = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "AEO competitor snapshot"
+        verbose_name_plural = "AEO competitor snapshots"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["profile", "platform_scope", "window_start", "window_end"],
+                name="accounts_aeo_comp_snapshot_scope_uq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["profile", "-updated_at"],
+                name="aeo_comp_prof_upd_idx",
+            ),
+            models.Index(
+                fields=["profile", "platform_scope"],
+                name="aeo_comp_prof_plat_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"AEOCompetitorSnapshot(profile_id={self.profile_id}, platform={self.platform_scope}, "
+            f"slots={self.total_slots})"
         )
 
 

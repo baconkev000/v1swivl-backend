@@ -16,6 +16,16 @@ from .models import (
 )
 from .serializers import _aeo_prompt_target_count
 
+ACTIVE_SUBSCRIPTION_STATUSES = frozenset({"active", "trialing", "past_due"})
+
+
+def profile_has_active_subscription(profile: BusinessProfile) -> bool:
+    """
+    Stripe is source of truth for billing state.
+    """
+    status = str(profile.stripe_subscription_status or "").strip().lower()
+    return status in ACTIVE_SUBSCRIPTION_STATUSES
+
 
 def profile_has_ranked_keywords(profile: BusinessProfile) -> bool:
     """
@@ -94,6 +104,8 @@ def business_profile_fully_onboarded(profile: BusinessProfile | None) -> bool:
     prompts = profile.selected_aeo_prompts or []
     prompts = [str(x).strip() for x in prompts if str(x).strip()]
     if len(prompts) != target:
+        return False
+    if not profile_has_active_subscription(profile):
         return False
 
     domain = normalize_domain(profile.website_url or "")

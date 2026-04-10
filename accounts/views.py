@@ -4,6 +4,7 @@ from urllib.parse import urlencode, unquote, quote, urlparse
 from datetime import datetime, date, timedelta, timezone
 
 import requests
+import stripe
 from django.conf import settings
 from django.core.cache import cache
 from django.db import transaction
@@ -18,6 +19,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from .models import (
+    AEOCompetitorSnapshot,
     AgentActivityLog,
     BusinessProfile,
     SEOOverviewSnapshot,
@@ -57,6 +59,10 @@ from .aeo.aeo_utils import (
 )
 from .aeo.perplexity_execution_utils import perplexity_execution_enabled
 from .gemini_utils import gemini_execution_enabled
+from .domain_utils import normalize_tracked_competitor_domain
+from .stripe_billing import sync_from_checkout_session
+from .stripe_billing import sync_from_invoice_paid
+from .stripe_billing import sync_from_subscription
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +131,51 @@ def auth_status(request: HttpRequest) -> Response:
     return Response(
         {"authenticated": True, "onboarding_complete": onboarding_complete},
     )
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def stripe_webhook(request: HttpRequest) -> Response:
+    """
+    Stripe webhook endpoint. Stripe events are the billing source of truth.
+    """
+    secret = str(getattr(settings, "STRIPE_WEBHOOK_SECRET", "") or "").strip()
+    api_key = str(getattr(settings, "STRIPE_SECRET_KEY", "") or "").strip()
+    if not secret or not api_key:
+        logger.error("[stripe webhook] missing STRIPE_WEBHOOK_SECRET / STRIPE_SECRET_KEY")
+        return Response({"error": "Stripe webhook is not configured."}, status=503)
+
+    stripe.api_key = api_key
+    sig = request.META.get("HTTP_STRIPE_SIGNATURE", "")
+    payload = request.body
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, secret)
+    except ValueError:
+        return Response({"error": "Invalid payload."}, status=400)
+    except stripe.error.SignatureVerificationError:
+        return Response({"error": "Invalid signature."}, status=400)
+
+    event_type = str(event.get("type") or "")
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    handled = False
+    try:
+        if event_type == "checkout.session.completed":
+            handled = sync_from_checkout_session(data)
+        elif event_type == "invoice.paid":
+            handled = sync_from_invoice_paid(data)
+        elif event_type in {"customer.subscription.updated", "customer.subscription.deleted"}:
+            handled = sync_from_subscription(data)
+        else:
+            handled = True
+    except Exception:
+        logger.exception("[stripe webhook] handler failed for %s", event_type)
+        return Response({"error": "Webhook handler failed."}, status=500)
+
+    if not handled:
+        logger.error("[stripe webhook] ignored event without profile match: %s", event_type)
+    return Response({"received": True})
 
 
 def _onboarding_domain_claimed_by_other_user(domain: str, user) -> bool:
@@ -1700,6 +1751,135 @@ def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
     if not profile:
         return Response({"has_data": False, "total_prompts": 0, "rows": []})
     return Response(aeo_onboarding_competitors_visibility(profile))
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_competitors_data(request: HttpRequest) -> Response:
+    """
+    Competitors page payload (tracked + suggested) using cached competitor snapshots.
+    Lazy-computes the snapshot when absent for the requested scope.
+    """
+    from .aeo.competitor_snapshots import compute_and_save_competitor_snapshot
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True)
+        .prefetch_related("tracked_competitors")
+        .first()
+        or BusinessProfile.objects.filter(user=request.user)
+        .prefetch_related("tracked_competitors")
+        .first()
+    )
+    if not profile:
+        return Response(
+            {
+                "tracked_competitors": [],
+                "suggested_competitors": [],
+                "total_slots": 0,
+                "snapshot_updated_at": None,
+                "has_data": False,
+            },
+        )
+
+    platform_scope = str(request.GET.get("platform", "all") or "all").strip().lower() or "all"
+    window_days_raw = str(request.GET.get("window_days", "") or "").strip()
+    window_start = None
+    window_end = None
+    if window_days_raw:
+        try:
+            days = max(1, int(window_days_raw))
+            window_end = django_timezone.now()
+            window_start = window_end - timedelta(days=days)
+        except (TypeError, ValueError):
+            window_start = None
+            window_end = None
+
+    snapshot = (
+        AEOCompetitorSnapshot.objects.filter(
+            profile=profile,
+            platform_scope=platform_scope,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        .order_by("-updated_at")
+        .first()
+    )
+    if snapshot is None:
+        try:
+            snapshot = compute_and_save_competitor_snapshot(
+                profile,
+                platform_scope=platform_scope,
+                window_start=window_start,
+                window_end=window_end,
+            )
+        except Exception:
+            logger.exception(
+                "[aeo_competitors_data] lazy snapshot compute failed profile_id=%s",
+                profile.id,
+            )
+            snapshot = None
+
+    rows = list(getattr(snapshot, "rows_json", []) or []) if snapshot is not None else []
+    by_domain: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        dom = str(row.get("domain") or "").strip().lower()
+        if not dom:
+            continue
+        by_domain[dom] = row
+
+    tracked = []
+    tracked_domains: set[str] = set()
+    for c in profile.tracked_competitors.order_by("domain").all():
+        dom = normalize_tracked_competitor_domain(c.domain or "") or ""
+        if dom:
+            tracked_domains.add(dom)
+        stats = by_domain.get(dom, {})
+        tracked.append(
+            {
+                "id": c.id,
+                "name": c.name,
+                "domain": c.domain,
+                "appearances": int(stats.get("appearances") or 0) if stats else 0,
+                "visibility_pct": float(stats.get("visibility_pct") or 0.0) if stats else 0.0,
+                "rank": int(stats.get("rank") or 0) if stats else None,
+                "last_seen_at": stats.get("last_seen_at") if stats else None,
+            },
+        )
+
+    suggested = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        dom = str(row.get("domain") or "").strip().lower()
+        if not dom or dom in tracked_domains:
+            continue
+        suggested.append(
+            {
+                "domain": dom,
+                "display_name": str(row.get("display_name") or dom),
+                "appearances": int(row.get("appearances") or 0),
+                "visibility_pct": float(row.get("visibility_pct") or 0.0),
+                "rank": int(row.get("rank") or 0),
+                "last_seen_at": row.get("last_seen_at"),
+            },
+        )
+        if len(suggested) >= 5:
+            break
+
+    total_slots = int(getattr(snapshot, "total_slots", 0) or 0) if snapshot is not None else 0
+    return Response(
+        {
+            "tracked_competitors": tracked,
+            "suggested_competitors": suggested,
+            "total_slots": total_slots,
+            "snapshot_updated_at": snapshot.updated_at.isoformat() if snapshot else None,
+            "has_data": total_slots > 0,
+        },
+    )
 
 
 @csrf_exempt

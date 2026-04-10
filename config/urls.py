@@ -78,6 +78,7 @@ urlpatterns += [
         name="aeo-platform-visibility-data",
     ),
     path("api/aeo/share-of-voice/", accounts_views.aeo_share_of_voice_data, name="aeo-share-of-voice-data"),
+    path("api/aeo/competitors/", accounts_views.aeo_competitors_data, name="aeo-competitors-data"),
     path(
         "api/aeo/onboarding-competitors/",
         accounts_views.aeo_onboarding_competitors_data,
@@ -102,6 +103,7 @@ urlpatterns += [
         accounts_views.aeo_onboarding_prompt_plan,
         name="aeo-onboarding-prompt-plan",
     ),
+    path("api/stripe/webhook/", accounts_views.stripe_webhook, name="stripe-webhook"),
     # SEO agent chat
     path("api/seo/chat/", accounts_views.seo_chat, name="seo-chat"),
     # API logout to clear Django/Google SSO session

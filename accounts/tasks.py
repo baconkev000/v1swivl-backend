@@ -1223,12 +1223,30 @@ def run_aeo_phase3_extraction_task(
             created_count,
             failed_count,
         )
+        refresh_competitor_snapshot_for_profile_task.delay(run.profile_id)
         run_aeo_phase4_scoring_task.delay(run.id)
     except Exception as exc:
         run.extraction_status = AEOExecutionRun.STAGE_FAILED
         run.error_message = f"{run.error_message}\nphase3:{type(exc).__name__}: {exc}".strip()
         run.save(update_fields=["extraction_status", "error_message", "updated_at"])
         logger.exception("[AEO phase3] extraction failed run_id=%s", run.id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def refresh_competitor_snapshot_for_profile_task(self, profile_id: int) -> None:
+    from .aeo.competitor_snapshots import compute_and_save_competitor_snapshot
+    from .models import BusinessProfile
+
+    profile = BusinessProfile.objects.filter(id=profile_id).first()
+    if not profile:
+        return
+    try:
+        compute_and_save_competitor_snapshot(profile, platform_scope="all")
+    except Exception:
+        logger.exception(
+            "[AEO competitors] snapshot refresh failed profile_id=%s",
+            profile_id,
+        )
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)

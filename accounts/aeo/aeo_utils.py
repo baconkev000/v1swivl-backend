@@ -107,6 +107,10 @@ def assign_onboarding_prompts_to_selected_topics(
     Rule: total count matches len(combined); prompts are distributed in order so the first
     topic gets prompt[0], second gets prompt[1], …, then remaining prompts round-robin.
     This keeps AEO_ONBOARDING_PROMPT_COUNT (flat list) aligned with per-topic review in step 3.
+
+    If ``len(topic_order) > len(texts)``, only the first ``len(texts)`` topics receive at least one
+    prompt; later topics stay empty. The onboarding frontend therefore enforces
+    ``selected_topics <= aeo_onboarding_prompt_target_count`` so the UI never depends on empty pools.
     """
     texts = [str(p.get("prompt") or "").strip() for p in combined if str(p.get("prompt") or "").strip()]
     topics = [str(t).strip() for t in topic_order if str(t).strip()]

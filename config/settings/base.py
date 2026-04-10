@@ -377,6 +377,21 @@ GEMINI_REVIEW_TOPICS_MODEL = env("GEMINI_REVIEW_TOPICS_MODEL", default="").strip
 # Perplexity Sonar — optional Phase 2 AEO execution alongside OpenAI/Gemini (see accounts.aeo.perplexity_execution_utils).
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="").strip()
 PERPLEXITY_AEO_MODEL = env("PERPLEXITY_AEO_MODEL", default="sonar").strip() or "sonar"
+# Stripe billing / webhook configuration.
+STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY", default="").strip()
+STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET", default="").strip()
+STRIPE_PRICE_ID_STARTER_MONTHLY = env("STRIPE_PRICE_ID_STARTER_MONTHLY", default="").strip()
+STRIPE_PRICE_ID_STARTER_YEARLY = env("STRIPE_PRICE_ID_STARTER_YEARLY", default="").strip()
+STRIPE_PRICE_ID_PRO_MONTHLY = env("STRIPE_PRICE_ID_PRO_MONTHLY", default="").strip()
+STRIPE_PRICE_ID_PRO_YEARLY = env("STRIPE_PRICE_ID_PRO_YEARLY", default="").strip()
+STRIPE_PRICE_ID_ADVANCED_MONTHLY = env("STRIPE_PRICE_ID_ADVANCED_MONTHLY", default="").strip()
+STRIPE_PRICE_ID_ADVANCED_YEARLY = env("STRIPE_PRICE_ID_ADVANCED_YEARLY", default="").strip()
+STRIPE_PAYMENT_LINK_STARTER_MONTHLY = env("STRIPE_PAYMENT_LINK_STARTER_MONTHLY", default="").strip()
+STRIPE_PAYMENT_LINK_STARTER_YEARLY = env("STRIPE_PAYMENT_LINK_STARTER_YEARLY", default="").strip()
+STRIPE_PAYMENT_LINK_PRO_MONTHLY = env("STRIPE_PAYMENT_LINK_PRO_MONTHLY", default="").strip()
+STRIPE_PAYMENT_LINK_PRO_YEARLY = env("STRIPE_PAYMENT_LINK_PRO_YEARLY", default="").strip()
+STRIPE_PAYMENT_LINK_ADVANCED_MONTHLY = env("STRIPE_PAYMENT_LINK_ADVANCED_MONTHLY", default="").strip()
+STRIPE_PAYMENT_LINK_ADVANCED_YEARLY = env("STRIPE_PAYMENT_LINK_ADVANCED_YEARLY", default="").strip()
 # Meta (Facebook) – Ads app: OAuth login + Marketing API (connect button and ad campaigns)
 META_ADS_APP_ID = os.environ.get("META_ADS_APP_ID", "")
 META_ADS_APP_SECRET = os.environ.get("META_ADS_APP_SECRET", "")
