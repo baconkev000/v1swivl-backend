@@ -69,6 +69,7 @@ from .stripe_billing import infer_sync_failure_reason
 from .stripe_billing import mask_email
 
 logger = logging.getLogger(__name__)
+_STRIPE_EVENT_SHAPE_LOGGED = False
 
 # Prompt coverage + pending checks: stored AEOResponseSnapshot.platform values we surface in the UI.
 _AEO_COVERAGE_PLATFORM_SET = frozenset({"openai", "gemini", "perplexity"})
@@ -178,10 +179,39 @@ def stripe_webhook(request: HttpRequest) -> Response:
         )
         return Response({"error": "Invalid signature."}, status=400)
 
+    global _STRIPE_EVENT_SHAPE_LOGGED
+    if not _STRIPE_EVENT_SHAPE_LOGGED:
+        _STRIPE_EVENT_SHAPE_LOGGED = True
+        logger.info(
+            "stripe.webhook.event_shape type=%s has_to_dict_recursive=%s has_id=%s has_type=%s repr=%s",
+            str(type(event)),
+            hasattr(event, "to_dict_recursive"),
+            hasattr(event, "id"),
+            hasattr(event, "type"),
+            repr(event)[:500],
+        )
+
     # Normalize recursively to plain dict/list before dispatch.
     # Stripe SDK supports recursive conversion on event objects.
+    if hasattr(event, "to_dict_recursive"):
+        try:
+            raw_event_dict = event.to_dict_recursive()
+        except Exception:
+            logger.exception(
+                "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
+                "parse_failed",
+                "",
+                "",
+            )
+            return Response({"error": "Could not parse Stripe event."}, status=400)
+    elif isinstance(event, dict):
+        raw_event_dict = event
+    else:
+        raw_event_dict = {}
+
     try:
-        raw_event_dict = event.to_dict_recursive() if hasattr(event, "to_dict_recursive") else event
+        event_id_raw = getattr(event, "id", None) or (event.get("id") if isinstance(event, dict) else None)
+        event_type_raw = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
     except Exception:
         logger.exception(
             "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
@@ -193,8 +223,8 @@ def stripe_webhook(request: HttpRequest) -> Response:
     event_dict = normalize_stripe_payload(raw_event_dict)
     if not isinstance(event_dict, dict):
         event_dict = {}
-    event_id = str(event_dict.get("id") or "")
-    event_type = str(event_dict.get("type") or "")
+    event_id = str(event_id_raw or event_dict.get("id") or "")
+    event_type = str(event_type_raw or event_dict.get("type") or "")
     if not event_id or not event_type:
         logger.error(
             "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s top_level_keys=%s",
