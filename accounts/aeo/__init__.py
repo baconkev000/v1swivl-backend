@@ -53,8 +53,11 @@ from .aeo_execution_utils import (
     save_aeo_response,
 )
 from .aeo_recommendation_utils import (
+    AEO_RECOMMENDATION_VERBOSITY_COMPACT,
+    AEO_RECOMMENDATION_VERBOSITY_EXPANDED,
     analyze_citation_gaps,
     analyze_visibility_gaps,
+    build_recommendation_strategies_from_flat,
     generate_aeo_recommendations,
     generate_natural_language_recommendation,
     save_recommendation_run,
@@ -115,8 +118,11 @@ __all__ = [
     "AEO_STRUCTURED_EXTRACTION_USER_TEMPLATE",
     "GENERIC_COMPETITOR_TOKENS",
     "aeo_business_input_from_profile",
+    "AEO_RECOMMENDATION_VERBOSITY_COMPACT",
+    "AEO_RECOMMENDATION_VERBOSITY_EXPANDED",
     "analyze_citation_gaps",
     "analyze_visibility_gaps",
+    "build_recommendation_strategies_from_flat",
     "build_full_aeo_prompt_plan",
     "build_openai_batch_user_content",
     "calculate_aeo_scores_for_business",

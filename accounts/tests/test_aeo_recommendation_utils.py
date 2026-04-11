@@ -13,6 +13,7 @@ from accounts.aeo.aeo_recommendation_utils import (
     _region_label_for_profile,
     analyze_citation_gaps,
     analyze_visibility_gaps,
+    build_recommendation_strategies_from_flat,
 )
 from accounts.models import AEOExtractionSnapshot
 
@@ -247,6 +248,70 @@ def test_analyze_visibility_gaps_merges_url_identity():
     assert gaps[0]["cited_domain_in_answer"] == ["dead.example"]
     assert "dead.example" in gaps[0]["url_identity_summary"]
     assert gaps[0]["canonical_domain"] == "acme.com"
+
+
+def test_build_recommendation_strategies_groups_and_dedupes_actions():
+    gid = "aeo_grp_test123"
+    flat = [
+        {
+            "parent_group_id": gid,
+            "action_type": "create_content",
+            "angle": "schema",
+            "priority": "high",
+            "rec_id": "a1",
+            "applies_to": {
+                "prompt_count": 2,
+                "prompt_examples": ["best cookies nationwide", "cookie delivery options"],
+                "response_snapshot_ids": [1, 2],
+                "cluster_summary": "intent:comparison; focus:service offer",
+            },
+            "actions": [
+                {
+                    "title": "Add JSON-LD for this page type",
+                    "description": "First",
+                    "priority": "high",
+                },
+                {
+                    "title": "Tie work to an existing site page",
+                    "description": "Use crawl context as the anchor: Topic seeds: foo",
+                    "priority": "low",
+                },
+            ],
+        },
+        {
+            "parent_group_id": gid,
+            "action_type": "create_content",
+            "angle": "on_page",
+            "priority": "medium",
+            "rec_id": "a2",
+            "applies_to": {
+                "prompt_count": 2,
+                "prompt_examples": ["best cookies nationwide"],
+                "response_snapshot_ids": [1],
+                "cluster_summary": "intent:comparison; focus:service offer",
+            },
+            "actions": [
+                {
+                    "title": "Add JSON-LD for this page type",
+                    "description": "Second longer description for merge",
+                    "priority": "medium",
+                },
+            ],
+        },
+    ]
+    strategies = build_recommendation_strategies_from_flat(flat, monitored_prompt_count=10)
+    assert len(strategies) == 1
+    s0 = strategies[0]
+    assert s0["strategy_id"] == gid
+    assert "title" in s0 and len(s0["title"].split()) <= 10
+    assert "summary" in s0 and len(s0["summary"]) > 20
+    assert s0["applies_to"]["prompt_count"] >= 1
+    assert len(s0["applies_to"]["prompt_examples"]) <= 3
+    angle_labels = {b["angle"] for b in s0["angles"]}
+    all_titles = [a["title"] for b in s0["angles"] for a in b["actions"]]
+    assert all_titles.count("Add JSON-LD for this page type") == 1
+    assert not any("Tie work" in t for t in all_titles)
+    assert not any("crawl" in t.lower() for t in all_titles)
 
 
 def test_build_onpage_crawl_summary_from_namespace():

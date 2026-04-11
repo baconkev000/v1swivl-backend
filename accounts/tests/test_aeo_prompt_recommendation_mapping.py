@@ -42,6 +42,31 @@ def test_grouped_acquire_citation_matches_by_matched_response_snapshot_ids():
     assert out[0]["action_type"] == "acquire_citation"
 
 
+def test_rec_id_dedupes_instead_of_body_so_same_nl_can_appear_twice():
+    recs = [
+        {
+            "action_type": "create_content",
+            "rec_id": "create_content:1:-1::0",
+            "nl_explanation": "Identical NL line.",
+            "reason": "Reason one.",
+            "references": {"matched_prompt_texts": ["P"]},
+        },
+        {
+            "action_type": "create_content",
+            "rec_id": "create_content:2:-1::1",
+            "nl_explanation": "Identical NL line.",
+            "reason": "Reason two.",
+            "references": {"matched_prompt_texts": ["P"]},
+        },
+    ]
+    out = _improvement_recommendations_for_prompt("P", set(), recs)
+    assert len(out) == 2
+    assert out[0]["text"] == "Identical NL line."
+    assert out[1]["text"] == "Identical NL line."
+    assert out[0]["rec_id"] == "create_content:1:-1::0"
+    assert out[1]["reason"] == "Reason two."
+
+
 def test_legacy_mapping_still_works_and_dedupes_normalized_text():
     recs = [
         {
@@ -66,6 +91,69 @@ def test_legacy_mapping_still_works_and_dedupes_normalized_text():
     assert len(out) == 2
     assert any(i["text"].lower().startswith("add an faq section") for i in out)
     assert any(i["text"] == "Update your GBP listing." for i in out)
+
+
+@pytest.mark.django_db
+@pytest.mark.skipif(connection.vendor == "sqlite", reason="Local SQLite test DB migration incompatibility")
+def test_prompt_coverage_endpoint_maps_multiple_rec_ids_for_same_prompt():
+    user = User.objects.create_user(username="map2", email="map2@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        selected_aeo_prompts=["C"],
+    )
+
+    rsp = AEOResponseSnapshot.objects.create(
+        profile=profile,
+        prompt_text="C",
+        prompt_hash="h_c2",
+        raw_response="r",
+        platform="openai",
+    )
+
+    AEORecommendationRun.objects.create(
+        profile=profile,
+        recommendations_json=[
+            {
+                "action_type": "create_content",
+                "rec_id": "create_content:10:-1::0",
+                "prompt": "C",
+                "priority": "high",
+                "nl_explanation": "First gap action.",
+                "reason": "First structured reason.",
+                "references": {
+                    "matched_prompt_texts": ["C"],
+                    "matched_response_snapshot_ids": [rsp.id],
+                },
+            },
+            {
+                "action_type": "create_content",
+                "rec_id": "create_content:11:-1::1",
+                "prompt": "C",
+                "priority": "high",
+                "nl_explanation": "Second gap action.",
+                "reason": "Second structured reason.",
+                "references": {
+                    "matched_prompt_texts": ["C"],
+                    "matched_response_snapshot_ids": [rsp.id],
+                },
+            },
+        ],
+    )
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.get("/api/aeo/prompt-coverage/")
+    assert res.status_code == 200
+    data = res.json()
+    rows = data.get("prompts") or []
+    row_c = next((r for r in rows if r.get("prompt") == "C"), None)
+    assert row_c is not None
+    recs = row_c.get("improvement_recommendations") or []
+    assert len(recs) == 2
+    texts = {r.get("text") for r in recs}
+    assert texts == {"First gap action.", "Second gap action."}
 
 
 @pytest.mark.django_db

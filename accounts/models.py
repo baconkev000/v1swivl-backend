@@ -663,6 +663,11 @@ class AEORecommendationRun(models.Model):
         related_name="recommendation_runs",
     )
     recommendations_json = models.JSONField(default=list, blank=True)
+    strategies_json = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="UI-ready hierarchical strategies (grouped by parent_group_id, deduped actions).",
+    )
     visibility_score_at_run = models.FloatField(default=0.0)
     weighted_position_score_at_run = models.FloatField(default=0.0)
     citation_share_at_run = models.FloatField(default=0.0)

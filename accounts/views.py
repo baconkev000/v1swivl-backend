@@ -1558,6 +1558,46 @@ def aeo_profile_data(request: HttpRequest) -> Response:
     return Response(serializer.data)
 
 
+def _competitor_domains_from_references(refs: dict) -> list[str]:
+    """Top competitor domains from ``references.competitors`` for prompt-coverage / Actions UI."""
+    from urllib.parse import urlparse
+
+    comps = refs.get("competitors")
+    if not isinstance(comps, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for c in comps:
+        dom = ""
+        if isinstance(c, dict):
+            dom = str(c.get("domain") or "").strip().lower()
+            if not dom:
+                url = str(c.get("url") or "").strip()
+                if url:
+                    try:
+                        h = (urlparse(url).netloc or "").strip().lower()
+                        if h.startswith("www."):
+                            h = h[4:]
+                        dom = h
+                    except Exception:
+                        pass
+        elif isinstance(c, str):
+            s = c.strip().lower()
+            if s and "." in s:
+                dom = s.split("/")[0].split("?")[0]
+                if dom.startswith("www."):
+                    dom = dom[4:]
+        if not dom:
+            continue
+        if dom in seen:
+            continue
+        seen.add(dom)
+        out.append(dom[:200])
+        if len(out) >= 10:
+            break
+    return out
+
+
 def _improvement_recommendations_for_prompt(
     prompt_key: str,
     response_ids: set[int],
@@ -1566,8 +1606,12 @@ def _improvement_recommendations_for_prompt(
     """
     Map Phase-5 ``AEORecommendationRun.recommendations_json`` items to a single prompt row.
 
-    Matches ``create_content`` by ``prompt`` text; ``acquire_citation`` by ``references.response_snapshot_id``
-    belonging to this prompt's response snapshots.
+    Matches, in order: ``applies_to.prompt_examples`` / ``applies_to.response_snapshot_ids`` (v2 multi-angle),
+    then ``references.matched_prompt_texts`` / ``matched_response_snapshot_ids``, then legacy ``prompt`` /
+    ``references.response_snapshot_id`` for this prompt's response snapshots.
+
+    When recommendations include ``rec_id`` or ``id``, duplicates are deduped by that id; legacy rows without
+    ids still dedupe by normalized body text.
     """
     out: list = []
     key = (prompt_key or "").strip()
@@ -1577,6 +1621,7 @@ def _improvement_recommendations_for_prompt(
 
     key_norm = _norm_text(key)
     seen_text: set[str] = set()
+    seen_rec_ids: set[str] = set()
     for rec in recs:
         if not isinstance(rec, dict):
             continue
@@ -1585,14 +1630,32 @@ def _improvement_recommendations_for_prompt(
         refs = rec.get("references") if isinstance(rec.get("references"), dict) else {}
         matched_prompt_texts = refs.get("matched_prompt_texts")
         matched_response_snapshot_ids = refs.get("matched_response_snapshot_ids")
+        applies_to = rec.get("applies_to") if isinstance(rec.get("applies_to"), dict) else {}
+        applies_examples = applies_to.get("prompt_examples")
+        applies_resp = applies_to.get("response_snapshot_ids")
+
+        # Precedence 0: v2 applies_to block (survives multi-angle grouping).
+        if not matched and isinstance(applies_examples, list) and applies_examples:
+            norm_applies = {_norm_text(str(x)) for x in applies_examples if str(x).strip()}
+            if key_norm and key_norm in norm_applies:
+                matched = True
+        if not matched and isinstance(applies_resp, list) and applies_resp:
+            ids_a: set[int] = set()
+            for x in applies_resp:
+                try:
+                    ids_a.add(int(x))
+                except (TypeError, ValueError):
+                    continue
+            if ids_a.intersection(response_ids):
+                matched = True
 
         # Precedence 1: explicit matched prompt membership.
-        if isinstance(matched_prompt_texts, list) and matched_prompt_texts:
+        if not matched and isinstance(matched_prompt_texts, list) and matched_prompt_texts:
             norm_members = {_norm_text(str(x)) for x in matched_prompt_texts if str(x).strip()}
             if key_norm and key_norm in norm_members:
                 matched = True
         # Precedence 2: explicit grouped response id membership.
-        elif isinstance(matched_response_snapshot_ids, list) and matched_response_snapshot_ids:
+        elif not matched and isinstance(matched_response_snapshot_ids, list) and matched_response_snapshot_ids:
             ids: set[int] = set()
             for x in matched_response_snapshot_ids:
                 try:
@@ -1603,11 +1666,11 @@ def _improvement_recommendations_for_prompt(
             if ids.intersection(response_ids):
                 matched = True
         # Legacy behavior fallback.
-        elif at == "create_content":
+        elif not matched and at == "create_content":
             p = (rec.get("prompt") or "").strip()
             if _norm_text(p) == key_norm:
                 matched = True
-        elif at == "acquire_citation":
+        elif not matched and at == "acquire_citation":
             rid = refs.get("response_snapshot_id")
             try:
                 rid_int = int(rid) if rid is not None else None
@@ -1617,21 +1680,65 @@ def _improvement_recommendations_for_prompt(
                 matched = True
         if not matched:
             continue
-        body = (rec.get("nl_explanation") or rec.get("reason") or "").strip()
-        if not body:
+        summary = (rec.get("summary") or "").strip()
+        nl = (rec.get("nl_explanation") or "").strip()
+        reason = (rec.get("reason") or "").strip()
+        text_out = summary if summary else (nl if nl else reason)
+        if not text_out:
             continue
-        body_key = _norm_text(body)
-        if body_key in seen_text:
-            continue
-        seen_text.add(body_key)
+        rec_id_raw = rec.get("rec_id")
+        id_raw = rec.get("id")
+        rec_id = str(rec_id_raw).strip() if rec_id_raw is not None and str(rec_id_raw).strip() else ""
+        if not rec_id and id_raw is not None and str(id_raw).strip():
+            rec_id = str(id_raw).strip()
+        if rec_id:
+            if rec_id in seen_rec_ids:
+                continue
+            seen_rec_ids.add(rec_id)
+        else:
+            body_key = _norm_text(text_out)
+            if body_key in seen_text:
+                continue
+            seen_text.add(body_key)
         item = {
             "action_type": at,
             "priority": (rec.get("priority") or "medium"),
-            "text": body,
+            "text": text_out,
         }
+        if rec_id:
+            item["rec_id"] = rec_id
+        if reason and reason != text_out:
+            item["reason"] = reason
+        if summary and summary != text_out:
+            item["summary"] = summary
+        ang = rec.get("angle")
+        if isinstance(ang, str) and ang.strip():
+            item["angle"] = ang.strip()
+        acts = rec.get("actions")
+        if isinstance(acts, list) and acts:
+            item["actions"] = acts
+        if isinstance(applies_to, dict) and applies_to:
+            item["applies_to"] = {
+                k: v
+                for k, v in applies_to.items()
+                if k in ("prompt_count", "prompt_examples", "response_snapshot_ids", "cluster_summary")
+            }
         src = rec.get("source")
         if isinstance(src, str) and src.strip():
             item["source"] = src.strip()
+        snap_ids = refs.get("matched_response_snapshot_ids")
+        if isinstance(snap_ids, list) and snap_ids:
+            norm_ids: list[int] = []
+            for x in snap_ids:
+                try:
+                    norm_ids.append(int(x))
+                except (TypeError, ValueError):
+                    continue
+            if norm_ids:
+                item["matched_response_snapshot_ids"] = norm_ids
+        comp_domains = _competitor_domains_from_references(refs)
+        if comp_domains:
+            item["competitor_domains"] = comp_domains[:10]
         out.append(item)
     return out
 
@@ -1729,6 +1836,18 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         .first()
     )
     reco_items: list = list(latest_reco.recommendations_json or []) if latest_reco else []
+    recommendation_strategies: list = []
+    if latest_reco is not None:
+        raw_st = getattr(latest_reco, "strategies_json", None) or []
+        recommendation_strategies = list(raw_st) if isinstance(raw_st, list) else []
+    if not recommendation_strategies and reco_items:
+        from .aeo.aeo_recommendation_utils import build_recommendation_strategies_from_flat
+
+        recommendation_strategies = build_recommendation_strategies_from_flat(
+            reco_items,
+            business_profile=profile,
+            monitored_prompt_count=selected_prompt_count,
+        )
 
     ordered_keys: list[str] = []
     seen: set[str] = set()
@@ -1796,6 +1915,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         "prompts": prompts,
         "monitored_count": selected_prompt_count,
         "tracked_business_name": tracked_name,
+        "recommendation_strategies": recommendation_strategies,
     }
 
 
@@ -2244,6 +2364,7 @@ def aeo_pipeline_status_data(request: HttpRequest) -> Response:
                 "id": latest_reco.id,
                 "score_snapshot_id": latest_reco.score_snapshot_id,
                 "recommendation_count": len(latest_reco.recommendations_json or []),
+                "strategy_count": len(getattr(latest_reco, "strategies_json", None) or []),
                 "created_at": latest_reco.created_at.isoformat(),
             },
             "freshness": {
