@@ -245,34 +245,31 @@ class ThirdPartyApiRequestLogInline(admin.TabularInline):
     model = ThirdPartyApiRequestLog
     fk_name = "business_profile"
     extra = 0
-    max_num = 30
     can_delete = False
     show_change_link = True
     fields = ("created_at", "provider", "operation", "tokens_sent", "tokens_received", "cost_usd")
     readonly_fields = fields
     ordering = ("-created_at",)
-    verbose_name_plural = "Recent third-party API requests (this profile)"
+    verbose_name_plural = "Third-party API requests (this profile; newest first via model ordering)"
 
     def get_queryset(self, request):
-        qs = super().get_queryset(request)
-        return qs.order_by("-created_at")[:30]
+        # Must not slice here: the inline formset applies FK filters after get_queryset().
+        return super().get_queryset(request).order_by("-created_at")
 
 
 class ThirdPartyApiErrorLogInline(admin.TabularInline):
     model = ThirdPartyApiErrorLog
     fk_name = "business_profile"
     extra = 0
-    max_num = 30
     can_delete = False
     show_change_link = True
     fields = ("created_at", "provider", "operation", "error_kind", "http_status", "message")
     readonly_fields = fields
     ordering = ("-created_at",)
-    verbose_name_plural = "Recent third-party API errors (this profile)"
+    verbose_name_plural = "Third-party API errors (this profile; newest first via model ordering)"
 
     def get_queryset(self, request):
-        qs = super().get_queryset(request)
-        return qs.order_by("-created_at")[:30]
+        return super().get_queryset(request).order_by("-created_at")
 
 
 @admin.register(BusinessProfile)
