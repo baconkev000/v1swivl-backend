@@ -14,14 +14,18 @@ from .models import (
     OnboardingOnPageCrawl,
     SEOOverviewSnapshot,
 )
-from .serializers import _aeo_prompt_target_count
+from .aeo.aeo_plan_targets import (
+    aeo_effective_monitored_target_for_profile,
+    aeo_onboarding_complete_min_prompts,
+)
 
 ACTIVE_SUBSCRIPTION_STATUSES = frozenset({"active", "trialing", "past_due"})
 
 
 def profile_has_active_subscription(profile: BusinessProfile) -> bool:
     """
-    Stripe is source of truth for billing state.
+    Stripe is source of truth for billing state (not BusinessProfile.plan).
+    Plan may be PLAN_NONE while status is still active during edge cases; prefer this for access gates.
     """
     status = str(profile.stripe_subscription_status or "").strip().lower()
     return status in ACTIVE_SUBSCRIPTION_STATUSES
@@ -91,6 +95,13 @@ def profile_has_valid_aeo_run_artifacts(profile: BusinessProfile) -> bool:
 
 
 def business_profile_fully_onboarded(profile: BusinessProfile | None) -> bool:
+    """
+    Full onboarding: active subscription, profile fields, keywords, and AEO pipeline artifacts.
+
+    Monitored prompts: must be at least the onboarding baseline (10 in production) and at most
+    the plan cap. Pro/Advanced may still be expanding toward 50/100 in the background; users
+    with 10 prompts and an active paid plan still qualify once the rest of the gates pass.
+    """
     if profile is None:
         return False
     if not (
@@ -100,10 +111,12 @@ def business_profile_fully_onboarded(profile: BusinessProfile | None) -> bool:
     ):
         return False
 
-    target = _aeo_prompt_target_count()
+    cap = aeo_effective_monitored_target_for_profile(profile)
+    need_min = aeo_onboarding_complete_min_prompts(profile)
     prompts = profile.selected_aeo_prompts or []
     prompts = [str(x).strip() for x in prompts if str(x).strip()]
-    if len(prompts) != target:
+    n = len(prompts)
+    if n < need_min or n > cap:
         return False
     if not profile_has_active_subscription(profile):
         return False

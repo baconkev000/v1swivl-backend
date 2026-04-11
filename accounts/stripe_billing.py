@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+"""
+Stripe → BusinessProfile billing sync.
+
+Payment link → plan mapping uses Django settings STRIPE_PAYMENT_LINK_* (see config.settings.base).
+Each value must be the Payment Link ID (e.g. plink_…) or the full buy URL (last path segment is used).
+They must match the live Stripe Payment Links used in checkout, or checkout.session.completed may not
+resolve a tier when the session omits price IDs.
+
+Cancellation policy: when Stripe reports a terminal subscription status (canceled, unpaid,
+incomplete_expired), we set BusinessProfile.plan to PLAN_NONE (empty string). Onboarding and paid
+access remain gated on stripe_subscription_status (see accounts.onboarding_completion).
+"""
+
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,12 +21,15 @@ from urllib.parse import urlparse
 
 import stripe
 from django.conf import settings
+from django.db import transaction
 
 from .models import BusinessProfile
 
 logger = logging.getLogger(__name__)
 
 ACTIVE_STRIPE_STATUSES = frozenset({"active", "trialing", "past_due"})
+# Cleared to PLAN_NONE alongside stripe_subscription_status from Stripe (see module docstring).
+TERMINAL_PLAN_CLEAR_STATUSES = frozenset({"canceled", "unpaid", "incomplete_expired"})
 
 
 @dataclass(frozen=True)
@@ -115,6 +131,37 @@ def _first_price_id_from_items(obj: dict) -> str:
     return str(_get_nested(obj, "items", "data", 0, "price", "id", default="") or "").strip()
 
 
+def _subscription_id_and_dict(sub_raw) -> tuple[str, dict | None]:
+    if isinstance(sub_raw, dict):
+        return str(sub_raw.get("id") or "").strip(), sub_raw
+    return str(sub_raw or "").strip(), None
+
+
+def _price_id_from_session_scalar_price(obj: dict) -> str:
+    pr = _get_scalar(obj, "price")
+    if isinstance(pr, dict):
+        return str(pr.get("id") or "").strip()
+    s = str(pr or "").strip()
+    return s
+
+
+def _resolve_price_id_for_checkout_session(obj: dict) -> str:
+    line_data = _get_nested(obj, "line_items", "data", default=None)
+    if isinstance(line_data, list) and line_data:
+        pid = str(_get_nested(line_data[0], "price", "id", default="") or "").strip()
+        if pid:
+            return pid
+    pl = _first_price_id_from_lines(obj)
+    if pl:
+        return pl
+    sub_raw = _get_scalar(obj, "subscription")
+    if isinstance(sub_raw, dict):
+        ip = _first_price_id_from_items(sub_raw)
+        if ip:
+            return ip
+    return _price_id_from_session_scalar_price(obj)
+
+
 def normalize_stripe_payload(value):
     """
     Recursively normalize Stripe payload objects to plain Python dict/list/scalars.
@@ -167,11 +214,13 @@ def extract_sync_debug_fields(
     email = str(
         _get_scalar(details, "email") or _get_scalar(obj, "customer_email") or _get_scalar(obj, "receipt_email") or ""
     ).strip().lower()
+    sub_dbg, _ = _subscription_id_and_dict(_get_scalar(obj, "subscription"))
+    sub_dbg = sub_dbg or str(_get_scalar(obj, "id") or "").strip()
     out = {
         "event_type": event_type,
         "client_reference_id": str(_get_scalar(obj, "client_reference_id") or "").strip(),
         "customer": str(_get_scalar(obj, "customer") or "").strip(),
-        "subscription": str(_get_scalar(obj, "subscription") or _get_scalar(obj, "id") or "").strip(),
+        "subscription": sub_dbg,
         "email": email,
         "matched_profile_id": str(matched_profile_id or ""),
         "did_update": "true" if did_update else "false",
@@ -183,7 +232,9 @@ def infer_sync_failure_reason(event_type: str, payload) -> str:
     obj = _object_payload(payload)
     details = _as_dict(_get_scalar(obj, "customer_details"))
     customer = str(_get_scalar(obj, "customer") or "").strip()
-    subscription = str(_get_scalar(obj, "subscription") or _get_scalar(obj, "id") or "").strip()
+    sub_raw = _get_scalar(obj, "subscription")
+    sub_id, sub_dict_inf = _subscription_id_and_dict(sub_raw)
+    subscription = sub_id or str(_get_scalar(obj, "id") or "").strip()
     client_ref = str(_get_scalar(obj, "client_reference_id") or "").strip()
     email = str(
         _get_scalar(details, "email") or _get_scalar(obj, "customer_email") or _get_scalar(obj, "receipt_email") or ""
@@ -191,6 +242,8 @@ def infer_sync_failure_reason(event_type: str, payload) -> str:
     payment_link = str(_get_scalar(obj, "payment_link") or "").strip()
     price_id = _first_price_id_from_lines(obj)
     sub_price_id = _first_price_id_from_items(obj)
+    if not sub_price_id and sub_dict_inf:
+        sub_price_id = _first_price_id_from_items(sub_dict_inf)
     status = str(_get_scalar(obj, "status") or "").strip()
 
     if not (client_ref or customer or subscription or email):
@@ -285,14 +338,19 @@ def apply_subscription_payload_to_profile(
     current_period_end_unix: int | None = None,
     cancel_at_period_end: bool | None = None,
     payment_link_id: str = "",
+    subscription_dict: dict | None = None,
 ) -> tuple[bool, list[str]]:
+    effective_price = (price_id or "").strip()
+    if not effective_price and subscription_dict:
+        effective_price = _first_price_id_from_items(subscription_dict)
+
     updates: dict[str, object] = {}
     if customer_id:
         updates["stripe_customer_id"] = customer_id
     if subscription_id:
         updates["stripe_subscription_id"] = subscription_id
-    if price_id:
-        updates["stripe_price_id"] = price_id
+    if effective_price:
+        updates["stripe_price_id"] = effective_price
     if status:
         updates["stripe_subscription_status"] = status
     if current_period_end_unix is not None:
@@ -300,13 +358,35 @@ def apply_subscription_payload_to_profile(
     if cancel_at_period_end is not None:
         updates["stripe_cancel_at_period_end"] = bool(cancel_at_period_end)
 
-    plan = _plan_from_price(price_id)
-    if not plan and payment_link_id:
+    st_norm = (status or "").strip().lower()
+    resolved_slug = _plan_from_price(effective_price)
+    if not resolved_slug and payment_link_id:
         m = plan_mapping_by_payment_link_id().get(_normalize_link_id(payment_link_id))
         if m:
-            plan = m.plan_slug
-    if plan in {BusinessProfile.PLAN_STARTER, BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}:
-        updates["plan"] = plan
+            resolved_slug = m.plan_slug
+
+    if st_norm in TERMINAL_PLAN_CLEAR_STATUSES:
+        updates["plan"] = BusinessProfile.PLAN_NONE
+    elif resolved_slug in {
+        BusinessProfile.PLAN_STARTER,
+        BusinessProfile.PLAN_PRO,
+        BusinessProfile.PLAN_ADVANCED,
+    }:
+        updates["plan"] = resolved_slug
+
+    if st_norm in ACTIVE_STRIPE_STATUSES and resolved_slug not in {
+        BusinessProfile.PLAN_STARTER,
+        BusinessProfile.PLAN_PRO,
+        BusinessProfile.PLAN_ADVANCED,
+    }:
+        logger.warning(
+            "[stripe] could not resolve plan slug from Stripe payload profile_id=%s status=%s "
+            "effective_price_id=%s payment_link_id=%s (check STRIPE_PRICE_ID_* and STRIPE_PAYMENT_LINK_* settings)",
+            profile.id,
+            st_norm or "(empty)",
+            effective_price or "(empty)",
+            payment_link_id or "(empty)",
+        )
 
     if not updates:
         return False, []
@@ -314,6 +394,21 @@ def apply_subscription_payload_to_profile(
     for k, v in updates.items():
         setattr(profile, k, v)
     profile.save(update_fields=list(updates.keys()))
+    plan_after = str(getattr(profile, "plan", "") or "")
+    if plan_after in {BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}:
+
+        def _enqueue_aeo_expansion() -> None:
+            try:
+                from .tasks import schedule_aeo_prompt_plan_expansion
+
+                schedule_aeo_prompt_plan_expansion.delay(profile.id)
+            except Exception:
+                logger.exception(
+                    "[stripe] enqueue AEO prompt expansion failed profile_id=%s",
+                    profile.id,
+                )
+
+        transaction.on_commit(_enqueue_aeo_expansion)
     return True, list(updates.keys())
 
 
@@ -359,10 +454,12 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
         profile.id,
         client_ref,
     )
-    subscription = str(_get_scalar(obj, "subscription") or "").strip()
+    sub_raw = _get_scalar(obj, "subscription")
+    subscription_id, subscription_dict = _subscription_id_and_dict(sub_raw)
     customer = str(_get_scalar(obj, "customer") or "").strip()
     payment_link = str(_get_scalar(obj, "payment_link") or "").strip()
-    if not (customer or subscription or payment_link):
+    resolved_price = _resolve_price_id_for_checkout_session(obj)
+    if not (customer or subscription_id or payment_link):
         return StripeSyncResult(
             handled=False,
             did_update=False,
@@ -377,11 +474,20 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
     if email and not profile.user.email:
         profile.user.email = email
         profile.user.save(update_fields=["email"])
+    checkout_status = ""
+    if subscription_id:
+        if isinstance(sub_raw, dict):
+            checkout_status = str(sub_raw.get("status") or "").strip().lower()
+        if checkout_status not in ACTIVE_STRIPE_STATUSES:
+            checkout_status = "active"
     did_update, updated_fields = apply_subscription_payload_to_profile(
         profile,
         customer_id=customer,
-        subscription_id=subscription,
+        subscription_id=subscription_id,
+        price_id=resolved_price,
+        status=checkout_status,
         payment_link_id=payment_link,
+        subscription_dict=subscription_dict,
     )
     if not did_update:
         return StripeSyncResult(
@@ -426,9 +532,12 @@ def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncRe
         )
     obj = _object_payload(payload)
     customer = str(_get_scalar(obj, "customer") or "").strip()
-    subscription = str(_get_scalar(obj, "subscription") or "").strip()
+    sub_raw = _get_scalar(obj, "subscription")
+    subscription_id, subscription_dict = _subscription_id_and_dict(sub_raw)
     price_id = _first_price_id_from_lines(obj)
-    if not (customer or subscription or price_id):
+    if not price_id and subscription_dict:
+        price_id = _first_price_id_from_items(subscription_dict)
+    if not (customer or subscription_id or price_id):
         return StripeSyncResult(
             handled=False,
             did_update=False,
@@ -440,9 +549,10 @@ def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncRe
     did_update, updated_fields = apply_subscription_payload_to_profile(
         profile,
         customer_id=customer,
-        subscription_id=subscription,
+        subscription_id=subscription_id,
         price_id=price_id,
         status="active",
+        subscription_dict=subscription_dict,
     )
     if not did_update:
         return StripeSyncResult(

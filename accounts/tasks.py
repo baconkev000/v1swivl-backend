@@ -15,6 +15,13 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone as django_tz
 
+from .aeo.aeo_plan_targets import (
+    AEO_PLAN_CAP_STARTER,
+    aeo_effective_monitored_target_for_profile,
+    aeo_http_call_bounds_for_monitoring,
+    aeo_should_run_post_payment_expansion,
+)
+
 logger = logging.getLogger(__name__)
 
 # Duplicate prevention: skip keyword enrichment if already done within this TTL.
@@ -27,21 +34,8 @@ NEXT_STEPS_TTL = timedelta(days=7)
 KEYWORD_ACTION_TTL = timedelta(days=7)
 
 
-def _aeo_target_prompt_count() -> int:
-    testing_mode = bool(getattr(settings, "AEO_TESTING_MODE", False))
-    if testing_mode:
-        try:
-            return max(1, int(getattr(settings, "AEO_TEST_PROMPT_COUNT", 10)))
-        except (TypeError, ValueError):
-            return 10
-    try:
-        return max(1, int(getattr(settings, "AEO_PROD_PROMPT_COUNT", 50)))
-    except (TypeError, ValueError):
-        return 50
-
-
-def _is_onboarding_sample_size() -> bool:
-    return _aeo_target_prompt_count() == 10
+def _is_onboarding_sample_size_profile(profile) -> bool:
+    return aeo_effective_monitored_target_for_profile(profile) <= AEO_PLAN_CAP_STARTER
 
 
 def _aeo_recommendation_stage_enabled() -> bool:
@@ -631,7 +625,7 @@ def run_aeo_phase1_execution_task(
         return
 
     selected = list(prompt_set or [])
-    target = _aeo_target_prompt_count()
+    target = aeo_effective_monitored_target_for_profile(profile)
     selected = selected[:target]
     run.prompt_count_requested = len(selected)
     run.cache_hit = False
@@ -714,7 +708,7 @@ def run_aeo_phase1_execution_task(
 
     try:
         with usage_profile_context(profile):
-            if _is_onboarding_sample_size() and providers is None:
+            if _is_onboarding_sample_size_profile(profile) and providers is None:
                 p1_batches = build_phase1_provider_batches(selected)
                 openai_selected = p1_batches.get("openai", [])
                 gemini_selected = p1_batches.get("gemini", [])
@@ -768,7 +762,9 @@ def run_aeo_phase1_execution_task(
         )
         run.phase1_completed_at = django_tz.now()
         run.phase1_provider_calls = int(len(batch.get("results") or []))
-        run.background_status = AEOExecutionRun.STAGE_RUNNING if _is_onboarding_sample_size() else run.background_status
+        run.background_status = (
+            AEOExecutionRun.STAGE_RUNNING if _is_onboarding_sample_size_profile(profile) else run.background_status
+        )
         run.status = AEOExecutionRun.STATUS_COMPLETED if artifacts_ok else AEOExecutionRun.STATUS_FAILED
         run.finished_at = django_tz.now()
         run.error_message = "" if artifacts_ok else "phase1_artifact_mismatch_missing_response_or_extraction"
@@ -813,7 +809,7 @@ def run_aeo_phase1_execution_task(
             )
             _enqueue_seo_after_aeo(run.id)
             return
-        if _is_onboarding_sample_size() and providers is None:
+        if _is_onboarding_sample_size_profile(profile) and providers is None:
             run_aeo_phase2_confidence_task.delay(run.id, selected)
             run_aeo_phase4_scoring_task.delay(run.id)
         else:
@@ -1037,6 +1033,26 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
                     providers=["gemini"],
                     on_result=_process_result,
                 )
+
+    n_mon = len(saved_prompts)
+    bounds = aeo_http_call_bounds_for_monitoring(n_mon)
+    third_o = AEOPromptExecutionAggregate.objects.filter(
+        profile=profile, execution_run=run, openai_third_pass_ran=True
+    ).count()
+    third_g = AEOPromptExecutionAggregate.objects.filter(
+        profile=profile, execution_run=run, gemini_third_pass_ran=True
+    ).count()
+    logger.info(
+        "[AEO phase2] finished run_id=%s profile_id=%s monitored_prompts=%s http_call_bounds=%s "
+        "third_pass_openai=%s third_pass_gemini=%s extractions_created=%s",
+        run.id,
+        profile.id,
+        n_mon,
+        bounds,
+        third_o,
+        third_g,
+        extraction_created,
+    )
 
     run.extraction_count = int(run.extraction_count or 0) + extraction_created
     run.background_status = (
@@ -1278,7 +1294,7 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
     run.save(update_fields=["scoring_status", "updated_at"])
     logger.info("[AEO phase4] scoring start run_id=%s profile_id=%s", run.id, run.profile_id)
     try:
-        if _is_onboarding_sample_size():
+        if _is_onboarding_sample_size_profile(run.profile):
             calculate_layered_scores_from_aggregates(
                 run.profile,
                 execution_run_id=run.id,
@@ -1473,6 +1489,184 @@ def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
         )
 
 
+def _clean_profile_prompts_for_expansion(profile) -> list[str]:
+    return [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=30, ignore_result=True)
+def schedule_aeo_prompt_plan_expansion(self, profile_id: int) -> None:
+    """
+    After Pro/Advanced billing, grow selected_aeo_prompts toward the plan cap (idempotent).
+    """
+    from .aeo.aeo_utils import aeo_business_input_from_onboarding_payload, build_full_aeo_prompt_plan
+    from .dataforseo_utils import normalize_domain
+    from .models import BusinessProfile, OnboardingOnPageCrawl
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).select_related("user").first()
+    if profile is None:
+        return
+
+    cap = aeo_effective_monitored_target_for_profile(profile)
+    now = django_tz.now()
+
+    def touch(**kwargs: Any) -> None:
+        kwargs.setdefault("updated_at", django_tz.now())
+        BusinessProfile.objects.filter(pk=pid).update(**kwargs)
+
+    if not aeo_should_run_post_payment_expansion(profile):
+        touch(
+            aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
+            aeo_prompt_expansion_target=cap,
+            aeo_prompt_expansion_progress=len(_clean_profile_prompts_for_expansion(profile)),
+            aeo_prompt_expansion_last_error="",
+            aeo_prompt_expansion_updated_at=now,
+        )
+        return
+
+    existing = _clean_profile_prompts_for_expansion(profile)
+    if len(existing) >= cap:
+        touch(
+            aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
+            aeo_prompt_expansion_target=cap,
+            aeo_prompt_expansion_progress=len(existing),
+            aeo_prompt_expansion_last_error="",
+            aeo_prompt_expansion_updated_at=now,
+        )
+        return
+
+    profile.refresh_from_db()
+    if (
+        profile.aeo_prompt_expansion_status == BusinessProfile.AEO_PROMPT_EXPANSION_RUNNING
+        and profile.aeo_prompt_expansion_updated_at
+        and (now - profile.aeo_prompt_expansion_updated_at).total_seconds() < 120
+    ):
+        logger.info("[AEO expansion] skip concurrent profile_id=%s", pid)
+        return
+
+    touch(
+        aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_RUNNING,
+        aeo_prompt_expansion_target=cap,
+        aeo_prompt_expansion_progress=len(existing),
+        aeo_prompt_expansion_last_error="",
+        aeo_prompt_expansion_updated_at=now,
+    )
+
+    try:
+        domain = normalize_domain(profile.website_url or "")
+        crawl = None
+        if domain:
+            crawl = (
+                OnboardingOnPageCrawl.objects.filter(
+                    user=profile.user,
+                    domain=domain,
+                    status=OnboardingOnPageCrawl.STATUS_COMPLETED,
+                )
+                .order_by("-created_at")
+                .first()
+            )
+
+        ctx: dict[str, Any] = {}
+        if crawl and isinstance(crawl.context, dict):
+            ctx = dict(crawl.context)
+
+        review_rows: list[Any] = []
+        if crawl and isinstance(crawl.review_topics, list):
+            review_rows = list(crawl.review_topics)
+
+        selected_topics = [
+            str((row or {}).get("topic") or "").strip()
+            for row in review_rows
+            if str((row or {}).get("topic") or "").strip()
+        ]
+        details: list[dict[str, Any]] = []
+        for row in review_rows:
+            topic = str((row or {}).get("topic") or "").strip()
+            if not topic:
+                continue
+            item: dict[str, Any] = {"keyword": topic}
+            cat = (row or {}).get("category")
+            if isinstance(cat, str) and cat.strip():
+                item["aeo_category"] = cat.strip()
+            rat = (row or {}).get("rationale")
+            if isinstance(rat, str) and rat.strip():
+                item["aeo_reason"] = rat.strip()
+            details.append(item)
+
+        website_for_input = str(profile.website_url or "").strip()
+        if not website_for_input and crawl and getattr(crawl, "domain", None):
+            d = str(crawl.domain or "").strip()
+            if d:
+                website_for_input = f"https://{d}" if "://" not in d else d
+
+        business_input = aeo_business_input_from_onboarding_payload(
+            business_name=str(ctx.get("business_name") or profile.business_name or ""),
+            website_url=website_for_input,
+            location=str(ctx.get("location") or profile.business_address or ""),
+            language=str(ctx.get("language") or ""),
+            selected_topics=selected_topics,
+        )
+
+        logger.info(
+            "[AEO expansion] openai_generate profile_id=%s cap=%s have=%s http_bounds=%s",
+            pid,
+            cap,
+            len(existing),
+            aeo_http_call_bounds_for_monitoring(cap),
+        )
+
+        plan = build_full_aeo_prompt_plan(
+            profile,
+            business_input=business_input,
+            onboarding_topic_details=details if details else None,
+            include_openai=True,
+            target_combined_count=cap,
+        )
+        combined = list(plan.get("combined") or [])
+        seen = {x.casefold() for x in existing}
+        merged = list(existing)
+        for item in combined:
+            if len(merged) >= cap:
+                break
+            t = str(item.get("prompt") or "").strip()
+            if not t:
+                continue
+            k = t.casefold()
+            if k in seen:
+                continue
+            merged.append(t)
+            seen.add(k)
+
+        profile.refresh_from_db()
+        profile.selected_aeo_prompts = merged[:cap]
+        profile.save(update_fields=["selected_aeo_prompts", "updated_at"])
+        final_n = len(_clean_profile_prompts_for_expansion(profile))
+        meta = plan.get("meta") if isinstance(plan.get("meta"), dict) else {}
+        err_tail = ""
+        if final_n < cap:
+            err_tail = (
+                f"partial_expansion target={cap} got={final_n} openai_status={meta.get('openai_status')}"
+            )[:2000]
+        touch(
+            aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
+            aeo_prompt_expansion_target=cap,
+            aeo_prompt_expansion_progress=final_n,
+            aeo_prompt_expansion_last_error=err_tail,
+            aeo_prompt_expansion_updated_at=django_tz.now(),
+        )
+        logger.info("[AEO expansion] complete profile_id=%s final=%s target=%s", pid, final_n, cap)
+    except Exception as exc:
+        logger.exception("[AEO expansion] failed profile_id=%s", pid)
+        profile.refresh_from_db()
+        touch(
+            aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_ERROR,
+            aeo_prompt_expansion_target=cap,
+            aeo_prompt_expansion_progress=len(_clean_profile_prompts_for_expansion(profile)),
+            aeo_prompt_expansion_last_error=f"{type(exc).__name__}: {exc}"[:2000],
+            aeo_prompt_expansion_updated_at=django_tz.now(),
+        )
+
+
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def onboarding_onpage_crawl_task(self, crawl_id: int) -> None:
     """DataForSEO On-Page crawl for onboarding (10 pages, Celery)."""
@@ -1565,7 +1759,7 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
             language=str(ctx.get("language") or ""),
             selected_topics=selected_topics,
         )
-        target_prompt_count = _aeo_target_prompt_count()
+        target_prompt_count = aeo_effective_monitored_target_for_profile(profile)
         plan = build_full_aeo_prompt_plan(
             profile,
             business_input=business_input,

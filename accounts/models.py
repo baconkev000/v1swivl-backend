@@ -72,10 +72,12 @@ class BusinessProfile(models.Model):
     # Industry is intentionally a free-text field (no choices).
     industry = models.CharField(max_length=255, blank=True)
 
+    PLAN_NONE = ""
     PLAN_STARTER = "starter"
     PLAN_PRO = "pro"
     PLAN_ADVANCED = "advanced"
     PLAN_CHOICES = [
+        (PLAN_NONE, "No paid plan"),
         (PLAN_STARTER, "Starter"),
         (PLAN_PRO, "Pro"),
         (PLAN_ADVANCED, "Advanced"),
@@ -83,7 +85,8 @@ class BusinessProfile(models.Model):
     plan = models.CharField(
         max_length=16,
         choices=PLAN_CHOICES,
-        default=PLAN_STARTER,
+        default=PLAN_NONE,
+        blank=True,
     )
     stripe_customer_id = models.CharField(max_length=255, blank=True, default="")
     stripe_subscription_id = models.CharField(max_length=255, blank=True, default="")
@@ -131,6 +134,35 @@ class BusinessProfile(models.Model):
 
     # Onboarding / settings: ordered list of AEO visibility prompt strings the user chose to track.
     selected_aeo_prompts = models.JSONField(default=list, blank=True)
+
+    AEO_PROMPT_EXPANSION_IDLE = "idle"
+    AEO_PROMPT_EXPANSION_QUEUED = "queued"
+    AEO_PROMPT_EXPANSION_RUNNING = "running"
+    AEO_PROMPT_EXPANSION_COMPLETE = "complete"
+    AEO_PROMPT_EXPANSION_ERROR = "error"
+    AEO_PROMPT_EXPANSION_STATUS_CHOICES = [
+        (AEO_PROMPT_EXPANSION_IDLE, "Idle"),
+        (AEO_PROMPT_EXPANSION_QUEUED, "Queued"),
+        (AEO_PROMPT_EXPANSION_RUNNING, "Running"),
+        (AEO_PROMPT_EXPANSION_COMPLETE, "Complete"),
+        (AEO_PROMPT_EXPANSION_ERROR, "Error"),
+    ]
+    aeo_prompt_expansion_status = models.CharField(
+        max_length=16,
+        choices=AEO_PROMPT_EXPANSION_STATUS_CHOICES,
+        default=AEO_PROMPT_EXPANSION_IDLE,
+    )
+    aeo_prompt_expansion_target = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Monitored prompt cap when expansion last ran (plan-derived).",
+    )
+    aeo_prompt_expansion_progress = models.PositiveIntegerField(
+        default=0,
+        help_text="len(selected_aeo_prompts) snapshot after last expansion step.",
+    )
+    aeo_prompt_expansion_last_error = models.TextField(blank=True, default="")
+    aeo_prompt_expansion_updated_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

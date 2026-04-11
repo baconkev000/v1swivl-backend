@@ -50,8 +50,8 @@ from .constants import SEO_SNAPSHOT_TTL
 from .onboarding_completion import user_has_completed_full_onboarding
 from . import openai_utils
 from . import debug_log as _debug
+from .aeo.aeo_plan_targets import aeo_effective_monitored_target_for_profile
 from .aeo.aeo_utils import (
-    AEO_ONBOARDING_PROMPT_COUNT,
     aeo_business_input_from_onboarding_payload,
     aeo_business_input_from_profile,
     build_full_aeo_prompt_plan,
@@ -2447,7 +2447,7 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
     Does not regenerate the prompt list (onboarding / OpenAI prompt planning unchanged).
     """
     from .models import AEOExecutionRun
-    from .tasks import _aeo_target_prompt_count, run_aeo_phase1_execution_task
+    from .tasks import run_aeo_phase1_execution_task
 
     profile = (
         BusinessProfile.objects.filter(user=request.user, is_main=True).first()
@@ -2487,7 +2487,7 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
     if not raw_items:
         return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
 
-    target = _aeo_target_prompt_count()
+    target = aeo_effective_monitored_target_for_profile(profile)
     selected = raw_items[:target]
 
     inflight = AEOExecutionRun.objects.filter(
@@ -2574,7 +2574,7 @@ def refresh_aeo_gemini(request: HttpRequest) -> Response:
             status=400,
         )
 
-    target = _aeo_prompt_target_count()
+    target = aeo_effective_monitored_target_for_profile(profile)
     selected = plan_items_from_saved_prompt_strings(saved_nonempty)[:target]
     if not selected:
         return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
@@ -2650,7 +2650,7 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
             status=400,
         )
 
-    target = _aeo_prompt_target_count()
+    target = aeo_effective_monitored_target_for_profile(profile)
     selected = plan_items_from_saved_prompt_strings(saved_nonempty)[:target]
     if not selected:
         return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
@@ -2754,19 +2754,6 @@ def _onboarding_skip_execution(request: HttpRequest, body: dict) -> bool:
     return _truthy_openai_param(request.GET.get("skip_execution"))
 
 
-def _aeo_prompt_target_count() -> int:
-    testing_mode = bool(getattr(settings, "AEO_TESTING_MODE", False))
-    if testing_mode:
-        try:
-            return max(1, int(getattr(settings, "AEO_TEST_PROMPT_COUNT", 10)))
-        except (TypeError, ValueError):
-            return 10
-    try:
-        return max(1, int(getattr(settings, "AEO_PROD_PROMPT_COUNT", 50)))
-    except (TypeError, ValueError):
-        return 50
-
-
 def _first_nonempty_str(*vals) -> str | None:
     for v in vals:
         if v is None:
@@ -2850,7 +2837,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
       ``business_address`` on the profile so prompts use city/region, not street-level detail).
     - ``industry`` — explicit industry override for prompt context.
     - ``reuse_saved`` — when ``true`` and the profile already has ``selected_aeo_prompts`` of length
-      ``AEO_ONBOARDING_PROMPT_COUNT``, return that list without calling OpenAI or rebuilding templates.
+      the plan-derived monitored prompt target, return that list without calling OpenAI or rebuilding templates.
     - ``skip_execution`` — with ``reuse_saved``, do not enqueue AEO phase 1 (read-only for onboarding resume).
 
     **Onboarding step 2 → prompts** (POST JSON): set ``onboarding_step2_prompt_plan`` to ``true`` and send
@@ -2883,7 +2870,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     onboarding_step2 = bool(body.get("onboarding_step2_prompt_plan"))
     selected_topics_raw = body.get("selected_topics")
 
-    target_prompt_count = _aeo_prompt_target_count()
+    target_prompt_count = aeo_effective_monitored_target_for_profile(profile)
     saved_raw = list(profile.selected_aeo_prompts or [])
 
     selected_topics: list[str] = []

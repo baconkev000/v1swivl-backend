@@ -84,6 +84,8 @@ def test_complete_with_extractions():
         website_url="https://example.com",
         business_address="US",
         selected_aeo_prompts=[f"prompt-{i}" for i in range(n)],
+        stripe_subscription_id="sub_onb_test",
+        stripe_subscription_status="active",
     )
     OnboardingOnPageCrawl.objects.create(
         user=user,
@@ -105,6 +107,7 @@ def test_complete_with_extractions():
         platform="openai",
     )
     AEOExtractionSnapshot.objects.create(response_snapshot=rsp)
+    profile.refresh_from_db()
     assert business_profile_fully_onboarded(profile) is True
 
 

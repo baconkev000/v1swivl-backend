@@ -273,6 +273,11 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_BACKEND = None  # we don't need to store task results for SEO tasks
 CELERY_TASK_IGNORE_RESULT = True
 CELERY_TIMEZONE = TIME_ZONE
+# Optional split workers: celery -A config worker -Q celery,aeo_openai,aeo_gemini
+# Phase-2 still runs in-process today; dedicated provider tasks can use these via apply_async(queue=...).
+AEO_OPENAI_CELERY_QUEUE = env("AEO_OPENAI_CELERY_QUEUE", default="celery")
+AEO_GEMINI_CELERY_QUEUE = env("AEO_GEMINI_CELERY_QUEUE", default="celery")
+AEO_PROVIDER_HTTP_MAX_RETRIES = env.int("AEO_PROVIDER_HTTP_MAX_RETRIES", default=5)
 
 
 # django-allauth
@@ -380,12 +385,15 @@ PERPLEXITY_AEO_MODEL = env("PERPLEXITY_AEO_MODEL", default="sonar").strip() or "
 # Stripe billing / webhook configuration.
 STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY", default="").strip()
 STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET", default="").strip()
+# Price IDs on subscription/invoice line items → mapped to BusinessProfile.plan in accounts.stripe_billing.
 STRIPE_PRICE_ID_STARTER_MONTHLY = env("STRIPE_PRICE_ID_STARTER_MONTHLY", default="").strip()
 STRIPE_PRICE_ID_STARTER_YEARLY = env("STRIPE_PRICE_ID_STARTER_YEARLY", default="").strip()
 STRIPE_PRICE_ID_PRO_MONTHLY = env("STRIPE_PRICE_ID_PRO_MONTHLY", default="").strip()
 STRIPE_PRICE_ID_PRO_YEARLY = env("STRIPE_PRICE_ID_PRO_YEARLY", default="").strip()
 STRIPE_PRICE_ID_ADVANCED_MONTHLY = env("STRIPE_PRICE_ID_ADVANCED_MONTHLY", default="").strip()
 STRIPE_PRICE_ID_ADVANCED_YEARLY = env("STRIPE_PRICE_ID_ADVANCED_YEARLY", default="").strip()
+# Payment Link IDs or buy URLs — must match live links used at checkout so checkout.session.completed
+# can resolve tier when the session has no price/line_items (see plan_mapping_by_payment_link_id).
 STRIPE_PAYMENT_LINK_STARTER_MONTHLY = env("STRIPE_PAYMENT_LINK_STARTER_MONTHLY", default="").strip()
 STRIPE_PAYMENT_LINK_STARTER_YEARLY = env("STRIPE_PAYMENT_LINK_STARTER_YEARLY", default="").strip()
 STRIPE_PAYMENT_LINK_PRO_MONTHLY = env("STRIPE_PAYMENT_LINK_PRO_MONTHLY", default="").strip()

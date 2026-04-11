@@ -9,7 +9,12 @@ from rest_framework import serializers
 from .constants import AEO_RECOMMENDATIONS_TTL, AEO_SNAPSHOT_TTL, SEO_SNAPSHOT_TTL
 from .domain_utils import normalize_tracked_competitor_domain
 from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot, TrackedCompetitor
-from .aeo.aeo_utils import AEO_ONBOARDING_PROMPT_COUNT
+from .aeo.aeo_plan_targets import (
+    aeo_effective_cap_for_validation,
+    aeo_effective_monitored_target_for_profile,
+    aeo_fallback_global_target_count,
+    aeo_onboarding_min_for_validation,
+)
 from .dataforseo_utils import get_or_refresh_seo_score_for_user
 from .dataforseo_utils import (
     get_aeo_content_readiness_for_site,
@@ -85,16 +90,8 @@ def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> li
 
 
 def _aeo_prompt_target_count() -> int:
-    testing_mode = bool(getattr(settings, "AEO_TESTING_MODE", False))
-    if testing_mode:
-        try:
-            return max(1, int(getattr(settings, "AEO_TEST_PROMPT_COUNT", 10)))
-        except (TypeError, ValueError):
-            return 10
-    try:
-        return max(1, int(getattr(settings, "AEO_PROD_PROMPT_COUNT", AEO_ONBOARDING_PROMPT_COUNT)))
-    except (TypeError, ValueError):
-        return AEO_ONBOARDING_PROMPT_COUNT
+    """Backward-compatible global default when no profile is in context (tests, helpers)."""
+    return aeo_fallback_global_target_count()
 
 
 class BusinessProfileSerializer(serializers.ModelSerializer):
@@ -105,11 +102,13 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(source="user.email", required=False)
     plan = serializers.ChoiceField(
         choices=[
+            BusinessProfile.PLAN_NONE,
             BusinessProfile.PLAN_STARTER,
             BusinessProfile.PLAN_PRO,
             BusinessProfile.PLAN_ADVANCED,
         ],
         required=False,
+        allow_blank=True,
     )
     tracked_competitors = serializers.SerializerMethodField()
     seo_score = serializers.SerializerMethodField()
@@ -164,6 +163,11 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "website_url",
             "selected_aeo_prompts",
             "aeo_onboarding_prompt_target_count",
+            "aeo_prompt_expansion_status",
+            "aeo_prompt_expansion_target",
+            "aeo_prompt_expansion_progress",
+            "aeo_prompt_expansion_last_error",
+            "aeo_prompt_expansion_updated_at",
             "plan",
             "stripe_customer_id",
             "stripe_subscription_id",
@@ -209,6 +213,11 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "id",
             "email",
             "aeo_onboarding_prompt_target_count",
+            "aeo_prompt_expansion_status",
+            "aeo_prompt_expansion_target",
+            "aeo_prompt_expansion_progress",
+            "aeo_prompt_expansion_last_error",
+            "aeo_prompt_expansion_updated_at",
             "stripe_customer_id",
             "stripe_subscription_id",
             "stripe_price_id",
@@ -220,7 +229,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         ]
 
     def get_aeo_onboarding_prompt_target_count(self, obj: BusinessProfile) -> int:
-        return _aeo_prompt_target_count()
+        return aeo_effective_monitored_target_for_profile(obj)
 
     def get_tracked_competitors(self, obj: BusinessProfile) -> list[dict]:
         return [
@@ -281,7 +290,9 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if value is None:
             return []
         out = [str(x).strip() for x in value if str(x).strip()]
-        return out[:_aeo_prompt_target_count()]
+        attrs = getattr(self, "initial_data", None) if isinstance(getattr(self, "initial_data", None), dict) else {}
+        cap = aeo_effective_cap_for_validation(getattr(self, "instance", None), attrs or {})
+        return out[:cap]
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -299,12 +310,21 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             sp = attrs.get("selected_aeo_prompts")
             if sp is not None:
                 n = len(sp)
-                target_count = _aeo_prompt_target_count()
-                if n != 0 and n != target_count:
+                cap = aeo_effective_cap_for_validation(getattr(self, "instance", None), attrs)
+                need_min = aeo_onboarding_min_for_validation(getattr(self, "instance", None), attrs)
+                if n > cap:
                     raise serializers.ValidationError(
                         {
                             "selected_aeo_prompts": (
-                                f"Must be empty or exactly {target_count} prompts; got {n}."
+                                f"At most {cap} monitored prompts for your plan; got {n}."
+                            )
+                        }
+                    )
+                if n != 0 and n < need_min:
+                    raise serializers.ValidationError(
+                        {
+                            "selected_aeo_prompts": (
+                                f"Must be empty or at least {need_min} prompts (onboarding baseline); got {n}."
                             )
                         }
                     )
@@ -947,6 +967,12 @@ class BusinessProfileAEOSerializer(BusinessProfileSerializer):
             "description",
             "website_url",
             "selected_aeo_prompts",
+            "aeo_onboarding_prompt_target_count",
+            "aeo_prompt_expansion_status",
+            "aeo_prompt_expansion_target",
+            "aeo_prompt_expansion_progress",
+            "aeo_prompt_expansion_last_error",
+            "aeo_prompt_expansion_updated_at",
             "plan",
             "is_main",
             "tracked_competitors",
