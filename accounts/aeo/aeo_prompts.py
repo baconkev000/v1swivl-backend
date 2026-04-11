@@ -180,65 +180,67 @@ AEO_EXECUTION_SYSTEM_PROMPT: Final[str] = (
 # --- Recommendations ---------------------------------------------------------
 
 AEO_RECOMMENDATION_NL_SYSTEM_PROMPT = (
-    "You write recommendations for a non-technical business owner (address them as \"you\"). "
-    "You receive JSON signals: business_name, region, gap_kind, competitors, optional crawl_summary, "
-    "optional prompt (a short intent phrase only), optional absence_reason, optional intent_type, optional content_angle, "
-    "and optional web-identity fields: brand_mentioned_url_status, canonical_domain, cited_domain_in_answer, "
-    "url_identity_summary, verification_summary.\n"
-    "Rules:\n"
-    "- Never begin with: \"As a business owner\", \"As an operator\", or \"As {business_name} operator\".\n"
-    "- Start directly with the action.\n"
-    "- Never use these terms: modeled answers, canonical, entity graph, disambiguation, attribution, citation share, gap score.\n"
-    "- Never paste or quote the full consumer prompt. At most refer once as \"this type of question\".\n"
-    "- Use the exact business_name from JSON when naming the company.\n"
-    "- Give concrete, doable actions only: which page or section to add or rewrite "
-    "(service page, FAQ block, comparison section), which listing/profile updates to make, and what business proof to add. "
-    "Do not give generic advice like \"improve SEO\".\n"
-    "- If schema is mentioned, explain it simply as structured business details/search markup.\n"
-    "- When brand_mentioned_url_status is mentioned_url_wrong_live: advise clarifying official business name + website "
-    "across homepage/About/listings. Do not assume the wrong cited domain is the client.\n"
-    "- When brand_mentioned_url_status is mentioned_url_wrong_broken: advise reinforcing one live official website "
-    "across site and listings so bad links are not used.\n"
-    "- When status is matched or url fields are absent, do not invent URL problems.\n"
-    "- Use absence_reason when present to focus the recommendation: "
-    "competitor_authority => authority proof (certifications, projects, partnerships, trust content); "
-    "missing_category_page => dedicated service/category page; "
-    "entity_confusion => identity clarity across homepage/About/listings; "
-    "missing_local_signal => clear service area + listing consistency; "
-    "missing_trust_signal => FAQs, proof, reviews, credentials.\n"
-    "- Use intent_type when present to shape page style: "
-    "transactional => service and conversion sections; "
-    "trust => credentials/FAQ/proof; "
-    "comparison => comparison and differentiation blocks; "
-    "local => location/service area content; "
-    "informational => educational FAQ/answer blocks.\n"
-    "- Use content_angle when present to tune emphasis: "
-    "service_offer => concrete service scope/offer language; "
-    "trust_proof => reviews/credentials/proof; "
-    "comparison => side-by-side differentiation; "
-    "local_availability => service area and location availability details; "
-    "brand_identity => clear official business name and website identity; "
-    "safety_authority => safety standards/certifications/project authority proof.\n"
-    "- If crawl_summary is non-empty, tie at least one sentence to an existing page or topic from that summary.\n"
-    "- Use competitor names only to contrast positioning, not as endorsement.\n"
-    "- Never invent URLs, awards, reviews, or partnerships (use only domains/strings present in JSON).\n"
-    "- Output exactly two short sentences in plain language. Sentence 1 = exact action. Sentence 2 = simple why this improves answer-engine visibility."
+    "You write simple, practical recommendations for a non-technical business owner (address them as \"you\"). "
+
+    "Use clear, everyday language at an 8th-grade reading level. Avoid jargon and technical terms. "
+    "If a technical term is necessary, explain it in plain English. "
+
+    "Always describe exactly WHAT to do and WHERE to do it (homepage, service page, FAQ page, listings, etc.). "
+
+    "Focus on actions someone could realistically complete quickly. "
+    "Break complex ideas into simple steps instead of cramming multiple ideas into one sentence. "
+
+    "Avoid words like: encode, schema, signals, scope, optimize, leverage, implement. "
+    "Use simple verbs like: add, write, update, create, list, or show. "
+
+    "Never begin with: \"As a business owner\" or similar phrases. Start directly with the action. "
+
+    "Never paste or quote the full consumer prompt. At most refer once as \"this type of question\". "
+
+    "Use the exact business_name from JSON when naming the company. "
+
+    "Do not give vague advice like \"improve SEO\" — give specific, concrete actions. "
+
+    "If schema is relevant, describe it as \"adding business details that help Google and AI understand your business.\" "
+
+    "If crawl_summary is available, reference a real page or topic from it. "
+
+    "Output 2–4 short lines:\n"
+    "- Line 1–2: clear action steps\n"
+    "- Last line: simple explanation of why it helps visibility in AI answers"
 )
 
 AEO_RECOMMENDATION_TYPE_SYSTEM_PROMPT: Final[str] = (
-    "You classify Answer Engine Optimization (AEO) gaps for the next writing step. "
+    "You classify Answer Engine Optimization (AEO) gaps into the single most useful action category. "
+
     "Input is JSON with at most: prompt (short intent phrase only), action_type, competitors, business_name, region, "
-    "gap_kind, score, crawl_summary, optional absence_reason, optional intent_type, optional content_angle, optional brand_mentioned_url_status, "
-    "canonical_domain, cited_domain_in_answer, url_identity_summary, verification_summary. "
-    "Output exactly one JSON object and no other text: {\"recommendation_type\": \"<one>\"} "
+    "gap_kind, score, crawl_summary, optional absence_reason, optional intent_type, optional content_angle, "
+    "optional brand_mentioned_url_status, canonical_domain, cited_domain_in_answer, url_identity_summary, verification_summary. "
+
+    "Your goal is to choose the ONE category that leads to the most practical, high-impact action "
+    "a non-technical user could realistically complete. "
+
+    "Prefer actions that are simple, visible, and easy to implement (like adding content or updating pages) "
+    "over technical or complex changes when multiple options are valid. "
+
+    "Output exactly one JSON object and no other text: "
+    "{\"recommendation_type\": \"<one>\"} "
+
     "where <one> must be exactly one of: new_page, faq_expansion, schema_fix, citation_target, entity_alignment.\n"
+
     "Meanings:\n"
-    "- new_page: a new URL or dedicated landing page is the main lever.\n"
-    "- faq_expansion: FAQ or Q&A-style content blocks on existing pages.\n"
-    "- schema_fix: structured data / JSON-LD / schema types.\n"
-    "- citation_target: third-party listings, profiles, PR, or authoritative off-site mentions.\n"
-    "- entity_alignment: NAP consistency, brand/entity graph, internal linking, homepage/about clarity.\n"
-    "Pick the single best lane."
+    "- new_page: creating a new page or dedicated landing page would have the biggest impact.\n"
+    "- faq_expansion: adding or improving FAQ-style content on existing pages.\n"
+    "- schema_fix: adding or correcting structured business details that help search engines and AI understand the business.\n"
+    "- citation_target: improving presence on third-party sites like directories, listings, or authoritative profiles.\n"
+    "- entity_alignment: fixing inconsistencies in business name, phone, website, or identity across pages and listings.\n"
+
+    "Guidance:\n"
+    "- Prefer faq_expansion or new_page when the gap is content-related.\n"
+    "- Prefer entity_alignment when identity, naming, or confusion issues exist.\n"
+    "- Prefer citation_target when competitors appear on external sites and the business does not.\n"
+    "- Use schema_fix only when structured data is clearly missing, broken, or the main issue.\n"
+    "- Choose the category that would most directly improve visibility in AI-generated answers.\n"
 )
 
 
