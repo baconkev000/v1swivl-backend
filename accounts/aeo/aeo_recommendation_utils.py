@@ -97,6 +97,11 @@ ANGLE_SCHEMA = "schema"
 ANGLE_ENTITY_LOCATION = "entity_location"
 ANGLE_COMPETITIVE_PARITY = "competitive_parity"
 ANGLE_PRESENCE_LISTINGS = "presence_listings"
+# Single bucket for UI: no Schema / Content / Entity section headings.
+ANGLE_FLAT_TODO = "todo"
+
+# Maximum recommendation leaves per run (short prioritized to-do list).
+AEO_RECOMMENDATION_MAX_LEAVES = 3
 
 _TRUSTED_CITATION_DOMAIN_HINTS: tuple[str, ...] = (
     "yelp",
@@ -756,9 +761,11 @@ def _nl_template_no_gap(gap: dict[str, Any]) -> str:
         vis, cite = 0.0, 0.0
     location = (gap.get("region_label") or gap.get("city") or "").strip() or "your area"
     bn = (gap.get("business_name") or "").strip() or "your business"
+    _ = vis, cite
     return (
-        f"Update your homepage and top service page so {bn} is written the same way as your business listings, then add one short FAQ for buyers in {location}. "
-        f"This gives answer engines clearer details to trust, which helps your business appear more often in AI-generated answers."
+        f"Update your homepage and main service page so {bn} is spelled the same on your site as on your listings.\n"
+        f"Add one short FAQ with real buyer questions for people in {location}.\n"
+        f"This gives AI assistants simple facts to trust so they can mention you more often."
     )
 
 
@@ -783,83 +790,69 @@ def _nl_template(gap: dict[str, Any]) -> str:
     if isinstance(cited_raw, list) and cited_raw:
         cited = str(cited_raw[0] or "").strip()
     canonical = str(gap.get("canonical_domain") or "").strip()
+    why_common = (
+        "This helps AI assistants match real customer questions to your business and mention you more often."
+    )
 
     if status == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_LIVE:
-        action = (
-            f"Add a short About section that says {canonical or 'your website'} is your official website and keep the same business name on your site and listings"
+        return (
+            f"On your About page, state clearly that {canonical or 'your website'} is {bn}'s official website.\n"
+            f"Use the same business name on your site and on listings so you are not mixed up with {cited or 'another site'}.\n"
+            f"{why_common}"
         )
-        why = (
-            f"This helps answer engines stop confusing you with {cited or 'another business'} and mention {bn} more often in relevant answers."
-        )
-        return f"{action}. {why}"
     if status == AEOExtractionSnapshot.URL_STATUS_MENTIONED_URL_WRONG_BROKEN:
-        action = (
-            "Add an \"Official website\" line in your footer and contact page, then update your main listings to the same live URL"
+        return (
+            "Add a line in your footer and contact page with your one working official website link.\n"
+            "Update Google Business Profile and other main listings to that same live link.\n"
+            f"{why_common}"
         )
-        why = (
-            "This gives answer engines one trusted website to reference instead of broken links, so your business appears more consistently."
-        )
-        return f"{action}. {why}"
+
+    line1 = ""
+    line2 = ""
 
     if content_angle == "brand_identity":
-        action = (
-            "Clarify your business identity on the homepage and About page, including your exact business name and official website"
-        )
+        line1 = f"On your homepage and About page, show the exact name people should use for {bn} and your official website."
+        line2 = "Keep the same spelling everywhere buyers might look."
     elif content_angle == "local_availability":
-        action = (
-            f"Add service-area copy for {region} on your main service pages and match that same location wording across your business listings"
-        )
+        line1 = f"On your main service pages, say clearly which areas near {region} you serve."
+        line2 = "Use the same city and neighborhood names on your site as on your business listings."
     elif content_angle == "trust_proof":
-        action = (
-            "Add a short FAQ with proof points such as credentials, reviews, and project examples on the most relevant page"
-        )
+        line1 = "Add a short FAQ on the page that fits this topic with real proof—reviews, photos, or credentials."
+        line2 = "Answer the worries buyers voice for this type of question in plain words."
     elif content_angle == "comparison":
-        action = (
-            "Publish a comparison section that explains how your service differs and add concrete proof like certifications, partnerships, or project outcomes"
-        )
+        line1 = "Add a short section that states how your service differs and what a buyer gets."
+        line2 = "Include one or two facts you can prove, such as years in business or a guarantee."
     elif content_angle == "safety_authority":
-        action = (
-            "Add an authority section with certifications, safety standards, and real project examples on your key service page"
-        )
+        line1 = "On your main service page, list safety steps, licenses, or training you use."
+        line2 = "Add a simple example or outcome buyers can picture."
     elif absence_reason == "missing_category_page" or intent_type == "transactional":
-        action = (
-            f"Create a dedicated service page for this offer in {region} with clear pricing, scope, and a strong contact section"
-        )
+        line1 = f"Add or refresh a service page for {region} with what you offer, typical pricing or ranges, and how to contact you."
+        line2 = "Put the next step (call, book, or visit) near the top so busy buyers see it first."
     elif absence_reason == "missing_local_signal" or intent_type == "local":
-        action = (
-            f"Add service-area copy for {region} on your main service pages and match that same location wording across your business listings"
-        )
+        line1 = f"State your service area for {region} on the page that matches local questions."
+        line2 = "Repeat the same area wording on your main online listings."
     elif absence_reason == "missing_trust_signal" or intent_type == "trust":
-        action = (
-            "Add a short FAQ with proof points such as credentials, reviews, and project examples on the most relevant page"
-        )
+        line1 = "Add a short FAQ that answers trust questions for this topic—who you are, how you work, and what others say."
+        line2 = "Use real reviews or project notes buyers can verify."
     elif absence_reason == "competitor_authority" or intent_type == "comparison":
-        action = (
-            "Publish a comparison section that explains how your service differs and add concrete proof like certifications, partnerships, or project outcomes"
-        )
+        line1 = "Add a simple comparison-style section: what you include, how you price, and what makes you a safe choice."
+        line2 = "Back claims with facts you can show, not empty slogans."
     else:
-        action = (
-            "Add a concise Q&A section that answers common buyer questions on the page most related to this intent"
-        )
+        line1 = "Add a short Q&A on the page that best matches this type of question."
+        line2 = "Use the same words customers use when they ask for help."
 
     if kind in ("citation_share", "citation_share_generic"):
         dom = str(gap.get("source_domain") or "").strip()
         if dom:
-            action = (
-                f"Update your profile on {dom} and similar trusted directories with the same business name, services, and website you use on your own site"
-            )
+            line1 = f"Update your {dom} profile (and similar trusted sites) so your name, phone, services, and website match your own site."
         else:
-            action = (
-                "Update your top third-party listings so your business name, services, and website are consistent everywhere"
-            )
+            line1 = "Update your top online listings so your name, services, phone, and website match your website."
+        line2 = "Fill every section the site offers; add recent photos if you can."
 
     if services:
-        action += f", including services like {services}"
+        line2 = f"{line2} Mention services such as {services}.".strip()
 
-    why = (
-        "This gives answer engines clearer, verifiable business details they can trust when choosing who to mention for this type of question."
-    )
-    return f"{action}. {why}"
+    return f"{line1}\n{line2}\n{why_common}"
 
 
 def _infer_action_type_for_nl(g: dict[str, Any]) -> str:
@@ -1053,22 +1046,18 @@ def _nl_via_openai(
         f'recommendation_type: "{rec_type}"\n\n'
         "Gap signals (JSON only):\n"
         f"{payload}\n\n"
-        "Write for a non-technical business owner. Second person (\"you\").\n"
-        "Do not quote or repeat the consumer prompt text; say \"for this type of question\" only.\n"
-        "Use exactly two short sentences.\n"
-        "Sentence 1: exact action to take.\n"
-        "Sentence 2: simple reason this helps the business appear more often in AI-generated answers.\n"
-        "Never begin with: \"As a business owner\", \"As an operator\", or \"As {business_name} operator\".\n"
-        "Never use these terms: modeled answers, canonical, entity graph, disambiguation, attribution, citation share, gap score.\n"
-        "Prefer plain language; if schema is needed, explain it simply as structured business details/search markup.\n"
-        "Use content_angle and absence_reason to choose emphasis before writing.\n"
-        "If crawl_summary is non-empty, anchor at least one action to a page or topic from it.\n"
-        "If crawl_summary is empty, still be specific; do not apologize.\n"
-        "When brand_mentioned_url_status and domain fields are present: for mentioned_url_wrong_live, focus on making the "
-        "official business name and website clear across homepage/About/listings; do not treat the wrong domain as the client. "
-        "For mentioned_url_wrong_broken, focus on reinforcing one live official website across site and listings. For matched, "
-        "do not invent URL problems.\n"
-        "Avoid repeating the JSON wording verbatim."
+        "Write for a non-technical business owner. Use \"you\". "
+        "Do not quote the full consumer prompt; say \"this type of question\" at most once.\n"
+        "Output exactly 3 lines separated by newlines (no bullets, no numbers, no headings):\n"
+        "Line 1: what to do.\n"
+        "Line 2: where (page or listing) and what to write or add.\n"
+        "Line 3: one sentence on why this helps you show up in AI answers.\n"
+        "Never begin with: \"As a business owner\" or similar.\n"
+        "Never use: JSON-LD, schema, sameAs, entity, canonical, markup, competitive parity, leverage, optimize, signals, job-to-be-done.\n"
+        "Tie the advice to intent_type and this type of question (pricing, local, trust, comparison, etc.).\n"
+        "If crawl_summary is non-empty, mention one real page or topic from it on line 2.\n"
+        "If brand_mentioned_url_status is mentioned_url_wrong_live or wrong_broken, focus on one clear official website and matching listings.\n"
+        "Avoid copying JSON keys verbatim."
     )
     completion = chat_completion_create_logged(
         client,
@@ -1104,7 +1093,27 @@ def _root_issue_key(gap: dict[str, Any], action_type: str) -> str:
 
 
 def _action_count_for_verbosity(verbosity: str) -> int:
-    return 5 if verbosity == AEO_RECOMMENDATION_VERBOSITY_EXPANDED else 3
+    # One focused step per recommendation; detail lives in nl_explanation (3 short lines).
+    return 2 if verbosity == AEO_RECOMMENDATION_VERBOSITY_EXPANDED else 1
+
+
+def _primary_action_rows_from_nl(nl: str) -> list[dict[str, str]]:
+    """Map 3-line NL text into a single card row (title + body)."""
+    lines = [ln.strip() for ln in (nl or "").splitlines() if ln.strip()]
+    if not lines:
+        return []
+    title = lines[0]
+    body = "\n".join(lines[1:]).strip()
+    return [{"title": title, "description": body, "priority": "high"}]
+
+
+def _apply_nl_as_primary_actions(rec: dict[str, Any]) -> None:
+    nl = str(rec.get("nl_explanation") or "")
+    lines = [ln.strip() for ln in nl.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        rows = _primary_action_rows_from_nl(nl)
+        if rows:
+            rec["actions"] = rows
 
 
 def _angles_for_visibility_gap(gap: dict[str, Any], *, verbosity: str) -> list[str]:
@@ -1190,13 +1199,12 @@ def _competitor_names_phrase(gap: dict[str, Any], *, limit: int = 3) -> str:
 
 
 def _cluster_summary_line(gap: dict[str, Any]) -> str:
+    """Short, human phrase for applies_to (not internal taxonomy labels)."""
+    short = _prompt_short_label(str(gap.get("prompt_text") or gap.get("prompt") or ""))
     it = _derive_intent_type(gap)
-    ca = _derive_content_angle(gap)
-    ar = _derive_absence_reason(gap)
-    parts = [f"intent:{it}", f"focus:{ca.replace('_', ' ')}"]
-    if ar:
-        parts.append(f"signal:{ar.replace('_', ' ')}")
-    return "; ".join(parts)
+    if short and short != "this type of question":
+        return f'Questions like "{short}" ({it}).'
+    return f"Questions in the {it} category."
 
 
 def _build_angle_summary(
@@ -1224,11 +1232,11 @@ def _build_angle_summary(
                 )
             if angle == ANGLE_SCHEMA:
                 return (
-                    f"Add structured business details (JSON-LD) that match your {dom} listing—hours, categories, and official site—so models can reconcile {bn} across sources."
+                    f"Add the same clear business details on your site (hours, what you offer, official website) that you show on {dom}, so {bn} matches everywhere."
                 )
             if angle == ANGLE_COMPETITIVE_PARITY:
                 return (
-                    f"Compare how {comp_phr} appear on {dom} (categories, photos, attributes) and close obvious gaps for {bn} in {region}."
+                    f"See what {comp_phr} show on {dom} (photos, services, service area) and add the same kind of clear facts for {bn} in {region}."
                 )
             return (
                 f"Tie {region} service-area and contact facts on your site to the same wording used on {dom} for {bn}."
@@ -1245,7 +1253,7 @@ def _build_angle_summary(
         )
     if angle == ANGLE_SCHEMA:
         return (
-            f"Add FAQPage, LocalBusiness/Organization, or Service JSON-LD on that page so structured data mirrors the proof you show for «{intent_phrase}»."
+            f"Put clear business details on the page that fits «{intent_phrase}»—hours, contact, services, and service area—so it matches what you say elsewhere online."
         )
     if angle == ANGLE_ENTITY_LOCATION:
         return (
@@ -1253,7 +1261,7 @@ def _build_angle_summary(
         )
     if angle == ANGLE_COMPETITIVE_PARITY:
         return (
-            f"Mirror the credibility signals {comp_phr} show (certifications, scope statements, outcomes) with your own verifiable proof for the same intents."
+            f"Show the same kind of simple proof {comp_phr} show—certifications, years in business, or real outcomes—on your site for the same buyer questions."
         )
     return (
         f"Give answer engines clearer, verifiable details about {bn} for questions like «{intent_phrase}» in {region}."
@@ -1323,18 +1331,18 @@ def _build_structured_actions(
         elif angle == ANGLE_SCHEMA:
             actions = [
                 {
-                    "title": "Publish matching JSON-LD",
-                    "description": f"Use LocalBusiness/Organization schema with the same name, url, telephone, and areaServed as {dom or 'your listings'} show for {bn}.",
+                    "title": "Match business details to your listings",
+                    "description": f"On your site, list the same business name, phone, website, hours, and service area as on {dom or 'your main listings'} for {bn}.",
                     "priority": "high",
                 },
                 {
-                    "title": "Add FAQ structured data",
-                    "description": "Encode 3–5 FAQs that match how buyers ask questions in your category (pricing signals, scope, service area).",
+                    "title": "Add a short FAQ buyers would ask",
+                    "description": "Write 3–5 questions and answers about pricing, what you include, and where you work—use the same wording buyers use.",
                     "priority": "medium",
                 },
                 {
-                    "title": "Validate with Rich Results test",
-                    "description": "Fix parse errors and remove conflicting schema types on the same page.",
+                    "title": "Double-check one page for mistakes",
+                    "description": "Remove outdated phone numbers or old service names so every line matches your live listings.",
                     "priority": "low",
                 },
             ]
@@ -1392,8 +1400,8 @@ def _build_structured_actions(
         elif angle == ANGLE_ON_PAGE:
             actions = [
                 {
-                    "title": "Rewrite H1 and first screen for intent match",
-                    "description": f"Make the primary heading and intro explicitly cover the buyer job-to-be-done for this query type in {region}.",
+                    "title": "Rewrite the main heading and opening lines",
+                    "description": f"Make the first heading and intro say plainly what you offer and for whom in {region}.",
                     "priority": "high",
                 },
                 {
@@ -1410,18 +1418,18 @@ def _build_structured_actions(
         elif angle == ANGLE_SCHEMA:
             actions = [
                 {
-                    "title": "Add JSON-LD for this page type",
-                    "description": f"Use FAQPage and/or Service schema reflecting the on-page copy for {bn}; keep fields consistent with visible text.",
+                    "title": "Put clear business facts on the page",
+                    "description": f"Show name, phone, hours, services, and service area in plain text on the page that fits this topic for {bn}.",
                     "priority": "high",
                 },
                 {
-                    "title": "Include sameAs and contactPoint",
-                    "description": "Point to official profiles and a monitored phone/email to reinforce entity signals.",
+                    "title": "Link to your official profiles",
+                    "description": "From your footer or About page, link to the Google Business Profile or other profiles you keep updated.",
                     "priority": "medium",
                 },
                 {
-                    "title": "Avoid conflicting markup",
-                    "description": "Remove duplicate or contradictory schema blocks on the same URL.",
+                    "title": "Remove duplicate or old blocks",
+                    "description": "If the same business details appear twice with different info, keep one correct version.",
                     "priority": "low",
                 },
             ]
@@ -1511,8 +1519,8 @@ def _build_create_content_recommendation(
     prompt_display = gap.get("prompt_text") or ""
     reason = (
         f"{bn} did not appear in the captured model answer for this monitored query{ind_bit}. "
-        f"Add or tune a service-level page, FAQ block, and matching Organization/LocalBusiness schema for {region} "
-        f"so this intent can cite {bn}."
+        f"Add or refresh a clear service page and a short FAQ for {region} with matching business details "
+        f"so this type of question can mention {bn}."
     )
     uid = (gap.get("url_identity_summary") or "").strip()
     if uid:
@@ -1831,6 +1839,14 @@ def _collect_strategy_signals(
             cluster_lines.append(cs.strip())
     intents = _parse_cluster_kv(cluster_lines, "intent:")
     focuses = _parse_cluster_kv(cluster_lines, "focus:")
+    for r in members:
+        ap = r.get("applies_to") if isinstance(r.get("applies_to"), dict) else {}
+        for p in ap.get("prompt_examples") or []:
+            if not isinstance(p, str) or not p.strip():
+                continue
+            faux: dict[str, Any] = {"prompt_text": p.strip()}
+            intents.add(_derive_intent_type(faux))
+            focuses.add(_derive_content_angle(faux))
     return action_ctr, angle_ctr, intents, focuses
 
 
@@ -1894,14 +1910,14 @@ def _strategy_short_title(
 
     if ANGLE_SCHEMA in top_angles[:2] or angle_ctr.get(ANGLE_SCHEMA, 0) >= 2:
         if topic:
-            return _cap_words(f"Add Structured Data for {topic}", 10)
-        return _cap_words("Add Structured Data for Key Pages", 10)
+            return _cap_words(f"Clarify business details for {topic}", 10)
+        return _cap_words("Clarify business details on key pages", 10)
 
     if ANGLE_ENTITY_LOCATION in top_angles[:2]:
-        return _cap_words("Strengthen Local Business Signals Everywhere", 10)
+        return _cap_words("Match your business name and contact info everywhere", 10)
 
     if ANGLE_COMPETITIVE_PARITY in top_angles[:2]:
-        return _cap_words("Match Competitor Trust and Proof Signals", 10)
+        return _cap_words("Show proof like competitors do", 10)
 
     if ANGLE_ON_PAGE in top_angles[:2]:
         return _cap_words("Sharpen Headings and FAQs for Buyers", 10)
@@ -1952,7 +1968,7 @@ def _strategy_outcome_summary(
         )
     elif ANGLE_SCHEMA in angle_ctr:
         parts.append(
-            f"Clear structured details on your site help assistants match {bn} to the right services and questions."
+            f"When your pages spell out clear, matching details about {bn}, assistants can connect answers to the right business."
         )
     elif "local" in intents or ANGLE_ENTITY_LOCATION in angle_ctr:
         parts.append(
@@ -1960,16 +1976,14 @@ def _strategy_outcome_summary(
         )
     elif "comparison" in intents or ANGLE_COMPETITIVE_PARITY in angle_ctr:
         parts.append(
-            f"Concrete proof and differentiated copy give assistants reasons to include {bn} in side-by-side answers."
+            f"Simple proof and clear differences give assistants reasons to mention {bn} when people compare options."
         )
     else:
         parts.append(
             f"Focused pages and FAQs that mirror how people ask help assistants confidently mention {bn}."
         )
 
-    second = (
-        "Work through the steps below in order of priority; small consistent updates usually beat one-off tweaks."
-    )
+    second = "Do the steps below in order; small steady updates usually help more than one big rush."
     return f"{parts[0]} {second}"
 
 
@@ -2160,15 +2174,26 @@ def build_recommendation_strategies_from_flat(
             intents=intents,
         )
         angle_buckets = _dedupe_and_bucket_actions_for_strategy(members)
-        angles_out = [
-            {"angle": ang, "actions": acts}
-            for ang, acts in sorted(
-                angle_buckets.items(),
-                key=lambda kv: _ANGLE_PRECEDENCE_FOR_MERGE.get(kv[0], 0),
-                reverse=True,
-            )
-            if acts
-        ]
+        flat_actions: list[dict[str, str]] = []
+        seen_t: set[str] = set()
+        for ang, acts in sorted(
+            angle_buckets.items(),
+            key=lambda kv: _ANGLE_PRECEDENCE_FOR_MERGE.get(kv[0], 0),
+            reverse=True,
+        ):
+            for act in acts:
+                k = _action_title_norm_key(str(act.get("title") or ""))
+                if not k or k in seen_t:
+                    continue
+                seen_t.add(k)
+                flat_actions.append(dict(act))
+                if len(flat_actions) >= 12:
+                    break
+            if len(flat_actions) >= 12:
+                break
+        angles_out = (
+            [{"angle": ANGLE_FLAT_TODO, "actions": flat_actions}] if flat_actions else []
+        )
         applies = _aggregate_applies_to_for_strategy(members, monitored_prompt_count=monitored_prompt_count)
         leaf_ids = []
         for r in members:
@@ -2225,24 +2250,17 @@ def generate_aeo_recommendations(
     save: bool = True,
     enrich_with_nl: bool = True,
     group_gaps: bool = False,
-    verbosity: str = AEO_RECOMMENDATION_VERBOSITY_EXPANDED,
-    multi_angle: bool = True,
+    verbosity: str = AEO_RECOMMENDATION_VERBOSITY_COMPACT,
+    multi_angle: bool = False,
 ) -> dict[str, Any]:
     """
-    Build recommendations from the latest score snapshot and latest extraction per response.
+    Build a short prioritized to-do list (max :data:`AEO_RECOMMENDATION_MAX_LEAVES` items) from the
+    latest score snapshot and latest extraction per response.
 
-    When save=True, appends an AEORecommendationRun (historical, never overwrites prior runs).
+    Default output is one row per gap with plain-language copy (multi-angle fan-out is opt-in).
+    Strategies flatten actions into a single list for the UI (no Schema/Content section headings).
 
-    **Prompt-coverage / Actions:** ``group_gaps=False`` (default) keeps granular gap rows.
-    ``group_gaps=True`` merges by (absence_reason, content_angle, action_type) but still emits
-    multi-angle children when ``multi_angle`` is True.
-
-    ``verbosity`` — ``compact`` (fewer angles/actions) vs ``expanded`` (more directory targets,
-    per-response citation rows, wider angle fan-out).
-
-    ``multi_angle`` — when True (default), each gap becomes several recommendations distinguished
-    by ``angle`` and stable ``id``/``rec_id`` suffixes. When False, legacy one-row-per-gap output.
-    OpenAI NL enrichment runs only when ``enrich_with_nl`` and not ``multi_angle`` (cost control).
+    OpenAI NL runs when ``enrich_with_nl`` is True (capped by the max-leaves limit).
     """
     score = (
         business_profile.aeo_score_snapshots.order_by("-created_at").select_related("profile").first()
@@ -2299,7 +2317,7 @@ def generate_aeo_recommendations(
 
     recommendations: list[dict[str, Any]] = []
     nl_ctx = _recommendation_nl_enrichment(business_profile, score=score)
-    use_openai_nl = bool(enrich_with_nl and not multi_angle)
+    use_openai_nl = bool(enrich_with_nl)
     rec_seq = 0
 
     def _headline_score_dict(*, cite_gap: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2316,6 +2334,8 @@ def generate_aeo_recommendations(
         return sc
 
     for _vis_i, gap in enumerate(vis_gaps):
+        if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+            break
         base = _build_create_content_recommendation(
             gap,
             score=score,
@@ -2341,21 +2361,23 @@ def generate_aeo_recommendations(
                 rid = _make_rec_id("create_content", gap, rec_seq, angle=angle)
                 rec_seq += 1
                 nl_line = summary
-                recommendations.append(
-                    _finalize_angle_recommendation(
-                        base,
-                        gap=gap,
-                        angle=angle,
-                        rec_id=rid,
-                        parent_group_id=parent_id,
-                        summary=summary,
-                        actions=actions,
-                        applies_prompts=applies_prompts,
-                        applies_resp_ids=applies_resp_ids,
-                        verbosity=verb,
-                        nl_explanation=nl_line,
-                    )
+                fin = _finalize_angle_recommendation(
+                    base,
+                    gap=gap,
+                    angle=angle,
+                    rec_id=rid,
+                    parent_group_id=parent_id,
+                    summary=summary,
+                    actions=actions,
+                    applies_prompts=applies_prompts,
+                    applies_resp_ids=applies_resp_ids,
+                    verbosity=verb,
+                    nl_explanation=nl_line,
                 )
+                _apply_nl_as_primary_actions(fin)
+                recommendations.append(fin)
+                if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+                    break
         else:
             rid = _make_rec_id("create_content", gap, rec_seq)
             rec_seq += 1
@@ -2396,9 +2418,14 @@ def generate_aeo_recommendations(
                 )
             else:
                 rec["nl_explanation"] = rec["summary"]
+            _apply_nl_as_primary_actions(rec)
             recommendations.append(rec)
+            if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+                break
 
     for _cite_i, gap in enumerate(cite_gaps):
+        if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+            break
         base = _build_acquire_citation_recommendation(
             gap,
             score=score,
@@ -2423,21 +2450,23 @@ def generate_aeo_recommendations(
                 )
                 rid = _make_rec_id("acquire_citation", gap, rec_seq, angle=angle)
                 rec_seq += 1
-                recommendations.append(
-                    _finalize_angle_recommendation(
-                        base,
-                        gap=gap,
-                        angle=angle,
-                        rec_id=rid,
-                        parent_group_id=parent_id,
-                        summary=summary,
-                        actions=actions,
-                        applies_prompts=applies_prompts,
-                        applies_resp_ids=applies_resp_ids,
-                        verbosity=verb,
-                        nl_explanation=summary,
-                    )
+                fin = _finalize_angle_recommendation(
+                    base,
+                    gap=gap,
+                    angle=angle,
+                    rec_id=rid,
+                    parent_group_id=parent_id,
+                    summary=summary,
+                    actions=actions,
+                    applies_prompts=applies_prompts,
+                    applies_resp_ids=applies_resp_ids,
+                    verbosity=verb,
+                    nl_explanation=summary,
                 )
+                _apply_nl_as_primary_actions(fin)
+                recommendations.append(fin)
+                if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+                    break
         else:
             rid = _make_rec_id("acquire_citation", gap, rec_seq)
             rec_seq += 1
@@ -2480,14 +2509,18 @@ def generate_aeo_recommendations(
                 )
             else:
                 rec["nl_explanation"] = rec["summary"]
+            _apply_nl_as_primary_actions(rec)
             recommendations.append(rec)
+            if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+                break
+
+    recommendations = recommendations[:AEO_RECOMMENDATION_MAX_LEAVES]
 
     if not recommendations:
         bn = (business_profile.business_name or "").strip() or "This business"
         reason = (
             f"No single prompt gap fired for {bn} this run (visibility {visibility:.1f}%, citation-style "
-            f"{citation:.1f}%). Re-check after you update FAQs, schema, or key listings so the next snapshot can "
-            f"catch shifts."
+            f"{citation:.1f}%). After you update FAQs, business details on key pages, or main listings, run another check."
         )
         low_rec: dict[str, Any] = {
             "action_type": "review_visibility",
@@ -2515,6 +2548,7 @@ def generate_aeo_recommendations(
             )
         else:
             low_rec["nl_explanation"] = low_summary
+        _apply_nl_as_primary_actions(low_rec)
         low_id = "review_visibility:0"
         low_rec["rec_id"] = low_id
         low_rec["id"] = low_id
@@ -2530,13 +2564,13 @@ def generate_aeo_recommendations(
                 "priority": "high",
             },
             {
-                "title": "Validate structured business details",
-                "description": "Ensure JSON-LD or visible blocks list name, address, phone, and services consistently.",
+                "title": "Check your business details everywhere",
+                "description": "Make sure name, address, phone, and services read the same on your site and on major listings.",
                 "priority": "medium",
             },
             {
-                "title": "Re-run monitoring after updates",
-                "description": "Trigger a new AEO snapshot so improvements show up in the next model answers.",
+                "title": "Run another check after you update",
+                "description": "When your pages and listings are updated, run monitoring again to see new AI answers.",
                 "priority": "low",
             },
         ]

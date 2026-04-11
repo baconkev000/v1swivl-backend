@@ -44,9 +44,12 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT: Final[str] = (
     "Avoid listing features, categories, or detailed criteria like a product filter. "
 
     "Each prompt should reflect a real-life situation, need, or moment "
-    "(e.g., being in a rush, working remotely, meeting someone, trying something new). "
+    "(e.g., being in a rush, working, solving a problem, planning something). "
 
-    "Use simple, everyday language. Prompts can be slightly vague, imperfect, or conversational. "
+    "IMPORTANT: Prompts must be written as if asking a single AI assistant — not a group of people. "
+    "Do NOT use phrases like 'can anyone', 'does anyone know', 'what do others do', or similar group-directed language. "
+
+    "Use simple, everyday language. Prompts can be slightly informal or imperfect. "
 
     "Do NOT sound like research, analysis, or evaluation. "
     "Do NOT ask about certifications, standards, or formal qualifications unless absolutely necessary. "
@@ -62,6 +65,7 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT: Final[str] = (
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL: Final[str] = (
     "You generate natural, real-world prompts from people who are ready to take action. "
+    "Write as if asking a single AI assistant. Do NOT use group-directed phring like 'anyone', 'people', or 'others'. "
 
     "Prompts should feel like someone about to go somewhere, buy something, or make a quick decision. "
     "Use casual, everyday language — not structured or overly specific phrasing. "
@@ -79,6 +83,7 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL: Final[str] = (
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRUST: Final[str] = (
     "You generate natural prompts from people who feel unsure, skeptical, or want reassurance. "
+    "Write as if asking a single AI assistant. Do NOT use group-directed phring like 'anyone', 'people', or 'others'. "
 
     "Prompts should reflect real concerns like quality, cleanliness, consistency, or whether something is worth it. "
     "Use casual, human language — not formal, technical, or analytical phrasing. "
@@ -96,6 +101,7 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRUST: Final[str] = (
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_COMPARISON: Final[str] = (
     "You generate natural prompts from people who are deciding between options or unsure what to choose. "
+    "Write as if asking a single AI assistant. Do NOT use group-directed phring like 'anyone', 'people', or 'others'. "
 
     "Prompts should feel like casual indecision, not structured comparisons or detailed evaluations. "
     "Avoid phrases like 'compare', 'differences', or overly analytical wording. "
@@ -111,6 +117,7 @@ AEO_PROMPT_ENGINE_SYSTEM_PROMPT_COMPARISON: Final[str] = (
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_AUTHORITY: Final[str] = (
     "You generate natural prompts from people trying to understand what makes something good or worth choosing. "
+    "Write as if asking a single AI assistant. Do NOT use group-directed phring like 'anyone', 'people', or 'others'. "
 
     "Prompts should reflect curiosity about quality, experience, or what to look for — not formal expertise or credentials. "
     "Avoid sounding academic, technical, or like a checklist of qualifications. "
@@ -180,67 +187,55 @@ AEO_EXECUTION_SYSTEM_PROMPT: Final[str] = (
 # --- Recommendations ---------------------------------------------------------
 
 AEO_RECOMMENDATION_NL_SYSTEM_PROMPT = (
-    "You write simple, practical recommendations for a non-technical business owner (address them as \"you\"). "
+    "You write a tiny to-do item for a non-technical business owner (use \"you\"). "
+    "Reading level: about 8th grade. Short sentences. No jargon. "
 
-    "Use clear, everyday language at an 8th-grade reading level. Avoid jargon and technical terms. "
-    "If a technical term is necessary, explain it in plain English. "
+    "Never use these words or phrases: JSON-LD, schema, sameAs, entity, canonical, markup, "
+    "competitive parity, leverage, optimize (as buzzword), signals, job-to-be-done, SEO (as vague advice). "
+    "Use simple verbs: add, update, write, list, show, fix. "
 
-    "Always describe exactly WHAT to do and WHERE to do it (homepage, service page, FAQ page, listings, etc.). "
+    "If structured site details matter, say: \"add clear business details that help Google and AI understand your business\" "
+    "— and only when that is clearly the main issue. "
 
-    "Focus on actions someone could realistically complete quickly. "
-    "Break complex ideas into simple steps instead of cramming multiple ideas into one sentence. "
+    "Tie the advice to the kind of question in the JSON (pricing, local area, trust, comparison, etc.). "
+    "Do not give generic marketing advice. "
 
-    "Avoid words like: encode, schema, signals, scope, optimize, leverage, implement. "
-    "Use simple verbs like: add, write, update, create, list, or show. "
-
-    "Never begin with: \"As a business owner\" or similar phrases. Start directly with the action. "
-
-    "Never paste or quote the full consumer prompt. At most refer once as \"this type of question\". "
-
+    "Never quote the full consumer prompt; say \"this type of question\" or \"questions like this\" at most once. "
     "Use the exact business_name from JSON when naming the company. "
+    "If crawl_summary has a real page or topic, anchor one line to it. "
 
-    "Do not give vague advice like \"improve SEO\" — give specific, concrete actions. "
-
-    "If schema is relevant, describe it as \"adding business details that help Google and AI understand your business.\" "
-
-    "If crawl_summary is available, reference a real page or topic from it. "
-
-    "Output 2–4 short lines:\n"
-    "- Line 1–2: clear action steps\n"
-    "- Last line: simple explanation of why it helps visibility in AI answers"
+    "Output exactly 3 lines, plain text only, separated by a single newline each (no bullets, no numbers, no headings):\n"
+    "Line 1 — What to do (clear action).\n"
+    "Line 2 — How to do it (where on the site or which listing, and what to put there).\n"
+    "Line 3 — Why it helps (one simple sentence tied to showing up in AI answers).\n"
+    "Do not add a fourth line or any extra explanation."
 )
 
 AEO_RECOMMENDATION_TYPE_SYSTEM_PROMPT: Final[str] = (
-    "You classify Answer Engine Optimization (AEO) gaps into the single most useful action category. "
+    "You pick ONE action category for a small-business owner (not a developer). "
+    "Input JSON may include: prompt (short intent phrase only), action_type, competitors, business_name, region, "
+    "gap_kind, score, crawl_summary, absence_reason, intent_type, content_angle, "
+    "brand_mentioned_url_status, canonical_domain, cited_domain_in_answer, url_identity_summary, verification_summary. "
 
-    "Input is JSON with at most: prompt (short intent phrase only), action_type, competitors, business_name, region, "
-    "gap_kind, score, crawl_summary, optional absence_reason, optional intent_type, optional content_angle, "
-    "optional brand_mentioned_url_status, canonical_domain, cited_domain_in_answer, url_identity_summary, verification_summary. "
-
-    "Your goal is to choose the ONE category that leads to the most practical, high-impact action "
-    "a non-technical user could realistically complete. "
-
-    "Prefer actions that are simple, visible, and easy to implement (like adding content or updating pages) "
-    "over technical or complex changes when multiple options are valid. "
+    "Choose the single category that leads to the fastest, clearest fix they can do themselves or with a marketer. "
+    "Prefer updating copy, FAQs, contact info, or listings over heavy technical work. "
 
     "Output exactly one JSON object and no other text: "
     "{\"recommendation_type\": \"<one>\"} "
 
     "where <one> must be exactly one of: new_page, faq_expansion, schema_fix, citation_target, entity_alignment.\n"
 
-    "Meanings:\n"
-    "- new_page: creating a new page or dedicated landing page would have the biggest impact.\n"
-    "- faq_expansion: adding or improving FAQ-style content on existing pages.\n"
-    "- schema_fix: adding or correcting structured business details that help search engines and AI understand the business.\n"
-    "- citation_target: improving presence on third-party sites like directories, listings, or authoritative profiles.\n"
-    "- entity_alignment: fixing inconsistencies in business name, phone, website, or identity across pages and listings.\n"
+    "Internal labels (pick one; the user will never see these names):\n"
+    "- new_page: a new or clearer page on their site is the best fix.\n"
+    "- faq_expansion: add or improve a short FAQ on an existing page.\n"
+    "- schema_fix: missing or mismatched business facts on the site are the main problem "
+    "(treat as \"clear business details on the page,\" not code jargon).\n"
+    "- citation_target: they need a stronger profile on a trusted directory or third-party site.\n"
+    "- entity_alignment: business name, phone, or website is inconsistent and confusing.\n"
 
-    "Guidance:\n"
-    "- Prefer faq_expansion or new_page when the gap is content-related.\n"
-    "- Prefer entity_alignment when identity, naming, or confusion issues exist.\n"
-    "- Prefer citation_target when competitors appear on external sites and the business does not.\n"
-    "- Use schema_fix only when structured data is clearly missing, broken, or the main issue.\n"
-    "- Choose the category that would most directly improve visibility in AI-generated answers.\n"
+    "Prefer faq_expansion or new_page for content gaps; entity_alignment for mixed-up name/site/phone; "
+    "citation_target when competitors show up on outside sites; schema_fix only when wrong or missing "
+    "on-page business facts are clearly the core issue.\n"
 )
 
 
@@ -325,8 +320,7 @@ PROMPT_WEIGHTING_NOTES: Final[str] = (
 )
 
 
-# --- Fixed benchmark prompts -------------------------------------------------
-
+# Retained as an empty registry (no fixed industry prompts in use).
 FIXED_INDUSTRY_PROMPT_SPECS: Final[dict[str, tuple[AEOPromptTemplateSpec, ...]]] = {}
 
 

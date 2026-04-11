@@ -8,7 +8,6 @@ Example (inside a view or service):
         aeo_business_input_from_profile,
         combine_prompt_set,
         generate_dynamic_prompts,
-        generate_fixed_prompts,
         run_prompt_batch_via_openai,
     )
 
@@ -19,10 +18,7 @@ Example (inside a view or service):
         services=["same day crowns", "sedation dentistry"],
         niche_modifiers=["sedation"],
     )
-    prompts = combine_prompt_set(
-        generate_fixed_prompts(ctx.industry, ctx.city),
-        generate_dynamic_prompts(ctx),
-    )
+    prompts = generate_dynamic_prompts(ctx)
     # Optional LLM expansion:
     # more = run_prompt_batch_via_openai(ctx, seed_prompts=prompts)
     # prompts = combine_prompt_set(prompts, more)
@@ -85,7 +81,6 @@ from .aeo_utils import (
     build_openai_batch_user_content,
     combine_prompt_set,
     generate_dynamic_prompts,
-    generate_fixed_prompts,
     infer_city_from_address,
     normalize_aeo_prompt_dict,
     parse_aeo_prompt_json_array,
@@ -135,7 +130,6 @@ __all__ = [
     "generate_aeo_recommendations",
     "generate_natural_language_recommendation",
     "generate_dynamic_prompts",
-    "generate_fixed_prompts",
     "hash_prompt",
     "infer_city_from_address",
     "latest_extraction_per_response",

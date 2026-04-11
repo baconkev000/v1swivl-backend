@@ -482,28 +482,6 @@ def plan_items_from_saved_prompt_strings(texts: Sequence[str]) -> list[dict[str,
     return out
 
 
-def _split_combined_into_source_groups(
-    combined: list[dict[str, Any]],
-    fixed: list[dict[str, Any]],
-    dynamic: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Partition ``combined`` (in order) into fixed / dynamic / openai groups by prompt text."""
-    fixed_texts = {str(x.get("prompt", "")).strip() for x in fixed}
-    dynamic_texts = {str(x.get("prompt", "")).strip() for x in dynamic}
-    out_fixed: list[dict[str, Any]] = []
-    out_dynamic: list[dict[str, Any]] = []
-    out_openai: list[dict[str, Any]] = []
-    for item in combined:
-        t = str(item.get("prompt", "")).strip()
-        if t in fixed_texts:
-            out_fixed.append(item)
-        elif t in dynamic_texts:
-            out_dynamic.append(item)
-        else:
-            out_openai.append(item)
-    return out_fixed, out_dynamic, out_openai
-
-
 def prompt_record(
     text: str,
     *,
@@ -518,14 +496,6 @@ def prompt_record(
         "weight": float(weight),
         "dynamic": bool(dynamic),
     }
-
-
-def generate_fixed_prompts(industry: str, city: str) -> list[dict[str, Any]]:
-    """
-    Fixed prompt generation is disabled for current onboarding flow.
-    Keep function for API/backward compatibility.
-    """
-    return []
 
 
 def _clean_token(s: str) -> str:

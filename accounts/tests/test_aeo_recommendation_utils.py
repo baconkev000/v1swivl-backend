@@ -307,7 +307,8 @@ def test_build_recommendation_strategies_groups_and_dedupes_actions():
     assert "summary" in s0 and len(s0["summary"]) > 20
     assert s0["applies_to"]["prompt_count"] >= 1
     assert len(s0["applies_to"]["prompt_examples"]) <= 3
-    angle_labels = {b["angle"] for b in s0["angles"]}
+    assert len(s0["angles"]) == 1
+    assert s0["angles"][0]["angle"] == "todo"
     all_titles = [a["title"] for b in s0["angles"] for a in b["actions"]]
     assert all_titles.count("Add JSON-LD for this page type") == 1
     assert not any("Tie work" in t for t in all_titles)
