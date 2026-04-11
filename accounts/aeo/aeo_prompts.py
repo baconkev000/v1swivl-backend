@@ -38,59 +38,88 @@ class AEOPromptTemplateSpec:
 # --- System prompts (OpenAI layers) ------------------------------------------
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT: Final[str] = (
-    "You generate realistic consumer prompts for Answer Engine Optimization testing. "
-    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
-    "Prompts must sound like genuine human questions asked naturally in search or conversation. "
-    "Use business profile context only to infer likely services, category, and buying considerations. "
-    "Never include the business name, brand, domain, slogans, or unique marketing language. "
-    "Prompts must remain category-correct, location-aware when relevant, and commercially realistic. "
-    "At least 40 percent of prompts should naturally trigger named business recommendations or provider comparisons. "
-    "Prefer prompts that create realistic business selection behavior. "
-    "Avoid meta-prompts that ask what people ask; output the actual consumer question directly. "
-    "Keep prompts under 180 characters."
+    "You generate realistic prompts that real people would ask an AI assistant like ChatGPT. "
+
+    "Prompts must feel natural, casual, and human — not structured, formal, or optimized for search engines. "
+    "Avoid listing features, categories, or detailed criteria like a product filter. "
+
+    "Each prompt should reflect a real-life situation, need, or moment "
+    "(e.g., being in a rush, working remotely, meeting someone, trying something new). "
+
+    "Use simple, everyday language. Prompts can be slightly vague, imperfect, or conversational. "
+
+    "Do NOT sound like research, analysis, or evaluation. "
+    "Do NOT ask about certifications, standards, or formal qualifications unless absolutely necessary. "
+
+    "Never include business names, brand names, or domains. "
+
+    "Some prompts should naturally lead to business recommendations, "
+    "but this should happen organically — not by forcing criteria or structured comparisons. "
+
+    "Keep prompts under 120 characters when possible."
 )
 
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL: Final[str] = (
-    "You generate transactional consumer discovery prompts for Answer Engine Optimization testing. "
-    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
-    "Generate natural decision-stage questions that indicate a person is ready to choose where to go. "
-    "Use the provided business metadata (industry + location) for context and realism, "
-    "but never include the tracked business name or domain. "
-    "Prompts must be generic, category-correct, local-intent where relevant, and under 180 characters. "
+    "You generate natural, real-world prompts from people who are ready to take action. "
+
+    "Prompts should feel like someone about to go somewhere, buy something, or make a quick decision. "
+    "Use casual, everyday language — not structured or overly specific phrasing. "
+
+    "Focus on immediacy, convenience, or intent (e.g., nearby, open now, quick, easy). "
+    "Avoid listing detailed features or sounding like a filtered search query. "
+
+    "Prompts may include urgency, time constraints, or simple needs. "
+
+    "Never include business names, brand names, or domains. "
+
     "Return ONLY a JSON array with objects containing exactly: prompt, type, weight, dynamic. "
     'Set "type" to "transactional" for every item and "dynamic" to true.'
 )
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRUST: Final[str] = (
-    "You generate trust-focused consumer discovery prompts for Answer Engine Optimization testing. "
-    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
-    "Generate natural questions about reliability, credibility, safety, or confidence signals. "
-    "Use the provided business metadata (industry + location) for context and realism, "
-    "but never include the tracked business name or domain. "
-    "Prompts must be generic, category-correct, local-intent where relevant, and under 180 characters. "
+    "You generate natural prompts from people who feel unsure, skeptical, or want reassurance. "
+
+    "Prompts should reflect real concerns like quality, cleanliness, consistency, or whether something is worth it. "
+    "Use casual, human language — not formal, technical, or analytical phrasing. "
+
+    "Avoid asking about certifications, standards, or official credentials unless it would feel truly natural. "
+    "Instead, focus on how people actually express doubt or hesitation. "
+
+    "Keep prompts simple and conversational. "
+
+    "Never include business names, brand names, or domains. "
+
     "Return ONLY a JSON array with objects containing exactly: prompt, type, weight, dynamic. "
     'Set "type" to "trust" for every item and "dynamic" to true.'
 )
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_COMPARISON: Final[str] = (
-    "You generate comparison-style consumer discovery prompts for Answer Engine Optimization testing. "
-    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
-    "Generate natural questions that compare options, tradeoffs, or selection criteria. "
-    "Use the provided business metadata (industry + location) for context and realism, "
-    "but never include the tracked business name or domain. "
-    "Prompts must be generic, category-correct, local-intent where relevant, and under 180 characters. "
+    "You generate natural prompts from people who are deciding between options or unsure what to choose. "
+
+    "Prompts should feel like casual indecision, not structured comparisons or detailed evaluations. "
+    "Avoid phrases like 'compare', 'differences', or overly analytical wording. "
+
+    "Focus on real-world choices and tradeoffs people think about. "
+    "Keep language simple, conversational, and slightly informal. "
+
+    "Never include business names, brand names, or domains. "
+
     "Return ONLY a JSON array with objects containing exactly: prompt, type, weight, dynamic. "
     'Set "type" to "comparison" for every item and "dynamic" to true.'
 )
 
 AEO_PROMPT_ENGINE_SYSTEM_PROMPT_AUTHORITY: Final[str] = (
-    "You generate authority-style consumer discovery prompts for Answer Engine Optimization testing. "
-    "Keywords may contain branded or proprietary terms; interpret them only as category signals and never repeat them. "
-    "Generate natural questions about expertise, qualifications, standards, or evidence of competence. "
-    "Use the provided business metadata (industry + location) for context and realism, "
-    "but never include the tracked business name or domain. "
-    "Prompts must be generic, category-correct, local-intent where relevant, and under 180 characters. "
+    "You generate natural prompts from people trying to understand what makes something good or worth choosing. "
+
+    "Prompts should reflect curiosity about quality, experience, or what to look for — not formal expertise or credentials. "
+    "Avoid sounding academic, technical, or like a checklist of qualifications. "
+
+    "Use everyday language and keep it conversational. "
+    "Focus on how normal people think about quality or value. "
+
+    "Never include business names, brand names, or domains. "
+
     "Return ONLY a JSON array with objects containing exactly: prompt, type, weight, dynamic. "
     'Set "type" to "authority" for every item and "dynamic" to true.'
 )
