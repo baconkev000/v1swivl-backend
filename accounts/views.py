@@ -52,7 +52,12 @@ from .onboarding_completion import user_has_completed_full_onboarding
 from . import openai_utils
 from . import debug_log as _debug
 from .aeo.prompt_scan_progress import monitored_prompt_keys_in_order, prompt_scan_completed_count
-from .aeo.aeo_plan_targets import aeo_effective_monitored_target_for_profile
+from .aeo.aeo_plan_targets import (
+    aeo_effective_monitored_target_for_profile,
+    aeo_fallback_global_target_count,
+    aeo_monitored_prompt_cap_for_plan_slug,
+    aeo_should_run_post_payment_expansion,
+)
 from .aeo.aeo_utils import (
     aeo_business_input_from_onboarding_payload,
     aeo_business_input_from_profile,
@@ -1930,6 +1935,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         monitored_keys, by_prompt, latest_snapshot_per_platform
     )
     visibility_pending = _aeo_profile_visibility_pending(profile)
+    prompt_fill_target = aeo_effective_monitored_target_for_profile(profile)
 
     return {
         "prompts": prompts,
@@ -1939,6 +1945,10 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         "prompt_scan_total": prompt_scan_total,
         "prompt_scan_completed": prompt_scan_completed,
         "visibility_pending": visibility_pending,
+        "prompt_fill_completed": selected_prompt_count,
+        "prompt_fill_target": prompt_fill_target,
+        "aeo_prompt_expansion_status": getattr(profile, "aeo_prompt_expansion_status", "") or "",
+        "aeo_prompt_expansion_last_error": getattr(profile, "aeo_prompt_expansion_last_error", "") or "",
     }
 
 
@@ -2033,6 +2043,10 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
                 "prompt_scan_total": 0,
                 "prompt_scan_completed": 0,
                 "visibility_pending": False,
+                "prompt_fill_completed": 0,
+                "prompt_fill_target": aeo_fallback_global_target_count(),
+                "aeo_prompt_expansion_status": "",
+                "aeo_prompt_expansion_last_error": "",
             }
         )
     return Response(_build_aeo_prompt_coverage_payload(profile))
@@ -2727,6 +2741,56 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
     )
 
 
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_retry_prompt_expansion(request: HttpRequest) -> Response:
+    """
+    Enqueue ``schedule_aeo_prompt_plan_expansion`` toward the plan cap (same kwargs pattern as Stripe).
+    Pro/Advanced only; rate-limited per user to reduce abuse.
+    """
+    from .tasks import schedule_aeo_prompt_plan_expansion
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"detail": "No main business profile is configured."}, status=400)
+
+    if not aeo_should_run_post_payment_expansion(profile):
+        return Response(
+            {
+                "detail": "Finish getting prompts is available on Pro and Advanced plans.",
+            },
+            status=400,
+        )
+
+    rate_key = f"aeo:retry_prompt_expansion:{request.user.id}"
+    if not cache.add(rate_key, "1", 60):
+        return Response({"detail": "Please wait a minute before requesting again."}, status=429)
+
+    slug = str(getattr(profile, "plan", "") or "")
+    cap = int(aeo_monitored_prompt_cap_for_plan_slug(slug))
+
+    transaction.on_commit(
+        lambda: schedule_aeo_prompt_plan_expansion.delay(
+            profile.id,
+            expected_plan_slug=slug,
+            expansion_cap=cap,
+        )
+    )
+    logger.info(
+        "[AEO retry_prompt_expansion] profile_id=%s plan=%s cap=%s user_id=%s",
+        profile.id,
+        slug,
+        cap,
+        getattr(request.user, "id", None),
+    )
+    return Response({"enqueued": True}, status=200)
+
+
 def _serialize_aeo_prompt_items(items: list | None) -> list[dict]:
     out: list[dict] = []
     for p in items or []:
@@ -3303,6 +3367,14 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         if not domain:
             raise ValueError("Could not normalize domain for refresh_seo_snapshot")
 
+        force_domain_intersection = False
+        try:
+            body = getattr(request, "data", None)
+            if isinstance(body, dict):
+                force_domain_intersection = bool(body.get("force_domain_intersection"))
+        except Exception:
+            force_domain_intersection = False
+
         today = datetime.now(timezone.utc).date()
         start_current = today.replace(day=1)
         snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
@@ -3340,6 +3412,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                     language_code=language_code,
                     user=user,
                     top_keywords=top_keywords,
+                    force_refresh=force_domain_intersection,
                 )
                 external_api_called = True
                 enrich_with_llm_keywords(
@@ -3354,6 +3427,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                     top_keywords=top_keywords,
                     user=user,
                     business_profile=profile,
+                    force_refresh_domain_intersection=force_domain_intersection,
                 )
                 external_api_called = True
             total = int(rank_stats.get("total") or 0)

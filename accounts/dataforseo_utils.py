@@ -21,6 +21,7 @@ import re
 import random
 import time
 
+import hashlib
 import json
 import math
 import requests
@@ -39,6 +40,9 @@ from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
 COMPETITOR_LOOKUP_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+
+# domain_intersection/live: cache full merged gap list (stable key over sorted competitors + loc/lang/limit).
+DOMAIN_INTERSECTION_CACHE_VERSION = "v1"
 
 # Lazy import to avoid circular dependency (openai_utils imports get_or_refresh_seo_score_for_user)
 def _get_llm_keyword_candidates(profile: Optional[BusinessProfile], homepage_meta: Optional[str]) -> List[str]:
@@ -2411,6 +2415,7 @@ def get_keyword_gap_keywords(
     language_code: str = "en",
     limit: int = 100,
     business_profile: Optional[BusinessProfile] = None,
+    force_refresh: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Call domain_intersection/live to compute keyword gaps vs competitors.
@@ -2418,14 +2423,50 @@ def get_keyword_gap_keywords(
     For now we return a simplified list of items suitable for the frontend SEO keywords table:
     - keyword
     - search_volume
+
+    Successful merged results are cached (~30 days by default) so refresh / Celery re-enrichment
+    does not re-bill DataForSEO per competitor. Use ``force_refresh=True`` or settings
+    ``DATAFORSEO_DOMAIN_INTERSECTION_FORCE_REFRESH`` to bypass.
     """
-    cleaned_competitors = [c.strip().lower() for c in competitor_domains if c.strip()]
+    cleaned_competitors = sorted({c.strip().lower() for c in competitor_domains if c.strip()})
     if not cleaned_competitors:
         logger.info(
             "[DataForSEO] domain_intersection skipped for %s: no competitors configured",
             target_domain,
         )
         return []
+
+    norm_target = (target_domain or "").strip().lower()
+    intersections_flag = True
+    cache_ttl = int(getattr(settings, "DATAFORSEO_DOMAIN_INTERSECTION_CACHE_TTL", 30 * 24 * 3600))
+    key_raw = (
+        f"{DOMAIN_INTERSECTION_CACHE_VERSION}|{norm_target}|"
+        f"{'|'.join(cleaned_competitors)}|{int(location_code)}|{language_code}|"
+        f"{int(intersections_flag)}|{int(limit)}"
+    )
+    cache_key = "dfs:di:" + hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+    global_force = bool(getattr(settings, "DATAFORSEO_DOMAIN_INTERSECTION_FORCE_REFRESH", False))
+
+    if not force_refresh and not global_force:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.info(
+                "[DataForSEO] domain_intersection cache_hit key_suffix=%s target=%s competitors_n=%s limit=%s",
+                cache_key[-12:],
+                norm_target,
+                len(cleaned_competitors),
+                int(limit),
+            )
+            return list(cached)
+
+    logger.info(
+        "[DataForSEO] domain_intersection cache_miss key_suffix=%s target=%s competitors_n=%s limit=%s force_refresh=%s",
+        cache_key[-12:],
+        norm_target,
+        len(cleaned_competitors),
+        int(limit),
+        bool(force_refresh or global_force),
+    )
 
     # The domain_intersection endpoint expects target1/target2 rather than a
     # "targets" array. Call it once per competitor and merge the results.
@@ -2625,6 +2666,13 @@ def get_keyword_gap_keywords(
         ",".join(cleaned_competitors),
         len(gap_keywords),
     )
+    try:
+        cache.set(cache_key, gap_keywords, cache_ttl)
+    except Exception:
+        logger.exception(
+            "[DataForSEO] domain_intersection cache_set failed key_suffix=%s",
+            cache_key[-12:],
+        )
     return gap_keywords
 
 
@@ -3134,6 +3182,7 @@ def enrich_with_gap_keywords(
     language_code: str,
     user,
     top_keywords: List[Dict[str, Any]],
+    force_refresh: bool = False,
 ) -> None:
     """Append gap keywords (vs competitors) to top_keywords in place. Preserves logging on error."""
     rank_non_null_before = sum(1 for k in top_keywords if k.get("rank") is not None)
@@ -3189,6 +3238,7 @@ def enrich_with_gap_keywords(
             language_code=language_code,
             limit=50,
             business_profile=_profile,
+            force_refresh=force_refresh,
         )
         gap_items_processed = 0
         gap_items_with_rank = 0
@@ -3536,6 +3586,7 @@ def enrich_keyword_ranks_from_labs(
     top_keywords: List[Dict[str, Any]],
     user=None,
     business_profile: Optional[BusinessProfile] = None,
+    force_refresh_domain_intersection: bool = False,
 ) -> Dict[str, int]:
     """
     Enrich existing top_keywords rank values using Labs APIs:
@@ -3619,6 +3670,7 @@ def enrich_keyword_ranks_from_labs(
                 language_code=language_code,
                 limit=100,
                 business_profile=bp,
+                force_refresh=force_refresh_domain_intersection,
             )
             gap_rank_map: Dict[str, int] = {}
             for item in gap_items:

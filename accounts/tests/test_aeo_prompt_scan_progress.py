@@ -88,4 +88,9 @@ def test_prompt_coverage_api_includes_scan_fields():
     data = res.json()
     assert data["prompt_scan_total"] == 1
     assert data["prompt_scan_completed"] == 0
-    assert data["visibility_pending"] is True
+    # Only OpenAI has a snapshot and it already has an extraction — no in-flight work.
+    assert data["visibility_pending"] is False
+    assert data["prompt_fill_completed"] == 1
+    assert data["prompt_fill_target"] == 10
+    assert "aeo_prompt_expansion_status" in data
+    assert "aeo_prompt_expansion_last_error" in data

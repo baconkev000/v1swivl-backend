@@ -104,6 +104,11 @@ urlpatterns += [
         name="refresh-aeo-perplexity",
     ),
     path(
+        "api/aeo/retry-prompt-expansion/",
+        accounts_views.aeo_retry_prompt_expansion,
+        name="aeo-retry-prompt-expansion",
+    ),
+    path(
         "api/aeo/refresh-execution/",
         accounts_views.aeo_refresh_execution,
         name="aeo-refresh-execution",
