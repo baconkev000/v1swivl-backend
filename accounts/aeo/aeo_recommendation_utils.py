@@ -100,8 +100,22 @@ ANGLE_PRESENCE_LISTINGS = "presence_listings"
 # Single bucket for UI: no Schema / Content / Entity section headings.
 ANGLE_FLAT_TODO = "todo"
 
-# Maximum recommendation leaves per run (short prioritized to-do list).
-AEO_RECOMMENDATION_MAX_LEAVES = 3
+# Default cap when settings are unavailable (see ``AEO_RECOMMENDATION_MAX_LEAVES`` in Django settings).
+AEO_RECOMMENDATION_MAX_LEAVES = 5
+
+
+def _max_recommendation_leaves() -> int:
+    try:
+        n = int(getattr(settings, "AEO_RECOMMENDATION_MAX_LEAVES", AEO_RECOMMENDATION_MAX_LEAVES))
+    except (TypeError, ValueError):
+        n = AEO_RECOMMENDATION_MAX_LEAVES
+    return max(1, min(n, 12))
+
+
+def _effective_group_gaps(group_gaps: bool | None) -> bool:
+    if group_gaps is not None:
+        return bool(group_gaps)
+    return bool(getattr(settings, "AEO_RECOMMENDATION_GROUP_GAPS", True))
 
 _TRUSTED_CITATION_DOMAIN_HINTS: tuple[str, ...] = (
     "yelp",
@@ -852,7 +866,7 @@ def _nl_template(gap: dict[str, Any]) -> str:
     if services:
         line2 = f"{line2} Mention services such as {services}.".strip()
 
-    return f"{line1}\n{line2}\n{why_common}"
+    return f"{line1}\n{line2}\n{why_common}\nTakes about 15–30 minutes."
 
 
 def _infer_action_type_for_nl(g: dict[str, Any]) -> str:
@@ -1048,10 +1062,11 @@ def _nl_via_openai(
         f"{payload}\n\n"
         "Write for a non-technical business owner. Use \"you\". "
         "Do not quote the full consumer prompt; say \"this type of question\" at most once.\n"
-        "Output exactly 3 lines separated by newlines (no bullets, no numbers, no headings):\n"
+        "Output 3 or 4 lines separated by newlines (no bullets, no numbers, no headings):\n"
         "Line 1: what to do.\n"
         "Line 2: where (page or listing) and what to write or add.\n"
         "Line 3: one sentence on why this helps you show up in AI answers.\n"
+        "Optional line 4: rough time only (e.g. Takes about 10–15 minutes).\n"
         "Never begin with: \"As a business owner\" or similar.\n"
         "Never use: JSON-LD, schema, sameAs, entity, canonical, markup, competitive parity, leverage, optimize, signals, job-to-be-done.\n"
         "Tie the advice to intent_type and this type of question (pricing, local, trust, comparison, etc.).\n"
@@ -1199,12 +1214,15 @@ def _competitor_names_phrase(gap: dict[str, Any], *, limit: int = 3) -> str:
 
 
 def _cluster_summary_line(gap: dict[str, Any]) -> str:
-    """Short, human phrase for applies_to (not internal taxonomy labels)."""
-    short = _prompt_short_label(str(gap.get("prompt_text") or gap.get("prompt") or ""))
+    """Plain intent bucket for applies_to / admin — no prompt quotes (UI must not surface this as user copy)."""
     it = _derive_intent_type(gap)
-    if short and short != "this type of question":
-        return f'Questions like "{short}" ({it}).'
-    return f"Questions in the {it} category."
+    return {
+        "local": "intent:local_buyer_questions",
+        "comparison": "intent:comparison_questions",
+        "trust": "intent:trust_and_safety_questions",
+        "transactional": "intent:pricing_and_booking_questions",
+        "informational": "intent:general_category_questions",
+    }.get(it, "intent:similar_customer_questions")
 
 
 def _build_angle_summary(
@@ -1518,17 +1536,14 @@ def _build_create_content_recommendation(
     ind_bit = f" ({ind_snip})" if ind_snip else ""
     prompt_display = gap.get("prompt_text") or ""
     reason = (
-        f"{bn} did not appear in the captured model answer for this monitored query{ind_bit}. "
-        f"Add or refresh a clear service page and a short FAQ for {region} with matching business details "
-        f"so this type of question can mention {bn}."
+        f"{bn} did not appear in at least one AI answer we checked{ind_bit}. "
+        f"Add clear wording on your service pages and a short FAQ for {region} so more answers can include {bn}."
     )
     uid = (gap.get("url_identity_summary") or "").strip()
     if uid:
         reason += f" {uid}"
     if score is not None and score.visibility_score < 20:
-        reason += f" Overall visibility score for {bn} is {score.visibility_score:.1f}% (high priority)."
-    elif score is not None:
-        reason += f" Snapshot visibility score for {bn}: {score.visibility_score:.1f}%."
+        reason += " Treat this as a high-priority update."
     comps = gap.get("competitors_in_answer") or []
     mpt_top = gap.get("matched_prompt_texts")
     if isinstance(mpt_top, list) and mpt_top:
@@ -1587,24 +1602,18 @@ def _build_acquire_citation_recommendation(
     city = infer_city_from_address(business_profile.business_address or "")
     region = _region_label_for_profile(business_profile, city)
     dom = gap.get("source_domain")
-    try:
-        cite = float(gap.get("citation_share_at_check") or 0)
-    except (TypeError, ValueError):
-        cite = 0.0
     comp = gap.get("top_competitor_hint")
     bn = (business_profile.business_name or "").strip() or "This business"
     if dom:
         reason = (
-            f"Citation-style signal is weak ({cite:.1f}%); prioritize a verifiable listing or profile for {bn} on {dom} "
-            f"and peer domains in {region}."
+            f"Complete your profile on {dom} and similar trusted sites in {region} so {bn} is easier to verify in AI answers."
         )
     else:
         reason = (
-            f"Citation-style signal is weak ({cite:.1f}%); add consistent {bn} profiles on category-trusted sites and "
-            f"data sources models use in {region}."
+            f"Add consistent {bn} profiles on trusted directory sites in {region} that people and AI tools check often."
         )
     if comp:
-        reason += f" Answers often reference {comp}—match factual categories and proof patterns, not unverifiable claims."
+        reason += f" Answers often mention {comp}—use the same style of clear facts and categories they show."
     mpt_top = gap.get("matched_prompt_texts")
     if isinstance(mpt_top, list) and mpt_top:
         matched_prompt_texts = [str(p).strip() for p in mpt_top if str(p).strip()]
@@ -1659,10 +1668,10 @@ def _group_gap_objects_for_recommendations(
 ) -> list[dict[str, Any]]:
     """
     Consolidate repeated advice: group by (absence_reason, content_angle, action_type) so multiple
-    prompts with the same root issue produce one stronger client-facing recommendation.
+    prompts with the same root issue produce one stronger recommendation (``applies_to.prompt_count`` > 1).
 
-    Used only when ``generate_aeo_recommendations(..., group_gaps=True)`` (e.g. summary export).
-    Prompt-coverage and Actions use ungrouped gaps by default (``group_gaps=False``).
+    Used when ``generate_aeo_recommendations`` runs with grouping enabled (default: settings
+    ``AEO_RECOMMENDATION_GROUP_GAPS``).
     """
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
     for g in gaps:
@@ -1720,6 +1729,29 @@ def _group_gap_objects_for_recommendations(
         row.pop("_grouped_prompt_count", None)
         out.append(row)
     return out
+
+
+def _sort_gaps_by_cluster_impact(gaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Prefer broader clusters first (more matched prompts, then more response ids), then stable taxonomy keys.
+    """
+
+    def key(g: dict[str, Any]) -> tuple[int, int, str, str]:
+        mpt = g.get("matched_prompt_texts")
+        if isinstance(mpt, list) and mpt:
+            n_pt = len(mpt)
+        else:
+            pt = str(g.get("prompt_text") or "").strip()
+            n_pt = 1 if pt else 0
+        gr = g.get("_grouped_response_ids")
+        n_gr = len(gr) if isinstance(gr, list) else 0
+        if n_gr == 0 and g.get("response_snapshot_id") is not None:
+            n_gr = 1
+        ar = _derive_absence_reason(g)
+        ca = _derive_content_angle(g)
+        return (-n_pt, -n_gr, ar, ca)
+
+    return sorted(gaps, key=key)
 
 
 def _finalize_angle_recommendation(
@@ -1850,27 +1882,6 @@ def _collect_strategy_signals(
     return action_ctr, angle_ctr, intents, focuses
 
 
-def _buyer_topic_hints_from_members(members: list[dict[str, Any]], *, limit: int = 4) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for r in members:
-        ap = r.get("applies_to") if isinstance(r.get("applies_to"), dict) else {}
-        for p in ap.get("prompt_examples") or []:
-            if not isinstance(p, str) or not p.strip():
-                continue
-            short = _prompt_short_label(p.strip(), max_words=5)
-            if not short or short == "this type of question":
-                continue
-            k = short.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(short)
-            if len(out) >= limit:
-                return out
-    return out
-
-
 def _cap_words(title: str, max_words: int = 10) -> str:
     words = (title or "").strip().split()
     if len(words) <= max_words:
@@ -1888,8 +1899,6 @@ def _strategy_short_title(
     focuses: set[str],
 ) -> str:
     bn = (business_profile.business_name or "").strip() if business_profile else ""
-    hints = _buyer_topic_hints_from_members(members)
-    topic = hints[0] if hints else ""
 
     cite_n = int(action_ctr.get("acquire_citation", 0))
     create_n = int(action_ctr.get("create_content", 0))
@@ -1905,47 +1914,36 @@ def _strategy_short_title(
 
     if cite_n > 0 and cite_n >= create_n:
         if dom:
-            return _cap_words(f"Strengthen {dom} and Similar Listings", 10)
-        return _cap_words("Strengthen Trusted Directory Profiles", 10)
+            return _cap_words(f"Complete your {dom} profile and similar listings", 10)
+        return _cap_words("Update your business profiles on trusted sites", 10)
 
     if ANGLE_SCHEMA in top_angles[:2] or angle_ctr.get(ANGLE_SCHEMA, 0) >= 2:
-        if topic:
-            return _cap_words(f"Clarify business details for {topic}", 10)
-        return _cap_words("Clarify business details on key pages", 10)
+        return _cap_words("Put clear business details on your main pages", 10)
 
     if ANGLE_ENTITY_LOCATION in top_angles[:2]:
         return _cap_words("Match your business name and contact info everywhere", 10)
 
     if ANGLE_COMPETITIVE_PARITY in top_angles[:2]:
-        return _cap_words("Show proof like competitors do", 10)
+        return _cap_words("Add proof buyers can check, like competitors do", 10)
 
     if ANGLE_ON_PAGE in top_angles[:2]:
-        return _cap_words("Sharpen Headings and FAQs for Buyers", 10)
+        return _cap_words("Tighten headings and FAQs on your key pages", 10)
 
     if "local" in intents or "local_availability" in focuses:
-        if topic:
-            return _cap_words(f"Improve Local Content Around {topic}", 10)
-        return _cap_words("Improve Content for Local Buyer Searches", 10)
+        return _cap_words("Add your service areas to your website", 10)
 
     if "comparison" in intents or "comparison" in focuses:
-        if topic:
-            return _cap_words(f"Improve Comparison Content on {topic}", 10)
-        return _cap_words("Improve Comparison and Options Content", 10)
+        return _cap_words("Show how you compare and what buyers get", 10)
 
     if "trust" in intents or "trust_proof" in focuses:
-        return _cap_words("Add Trust and Credentials Buyers Can Verify", 10)
+        return _cap_words("Add trust details buyers can verify", 10)
 
     if "transactional" in intents:
-        if topic:
-            return _cap_words(f"Clarify Offers and Next Steps for {topic}", 10)
-        return _cap_words("Clarify Services Offers and Next Steps", 10)
-
-    if topic:
-        return _cap_words(f"Improve Content Covering {topic}", 10)
+        return _cap_words("Make services and next steps easy to find", 10)
 
     if bn:
-        return _cap_words(f"Help {bn} Show Up in More Answers", 10)
-    return _cap_words("Improve Key Pages Buyers Ask About", 10)
+        return _cap_words(f"Help more answers mention {bn}", 10)
+    return _cap_words("Improve the pages buyers ask about", 10)
 
 
 def _strategy_outcome_summary(
@@ -1960,31 +1958,18 @@ def _strategy_outcome_summary(
     bn = (business_profile.business_name or "").strip() if business_profile else "your business"
     if not bn:
         bn = "your business"
-    parts: list[str] = []
 
     if action_ctr.get("acquire_citation", 0) > 0 and action_ctr.get("create_content", 0) == 0:
-        parts.append(
-            f"When trusted directories list consistent facts about {bn}, assistants are more likely to mention you alongside competitors."
+        return (
+            f"Matching details on trusted sites help AI tools mention {bn} when people ask for options like yours."
         )
-    elif ANGLE_SCHEMA in angle_ctr:
-        parts.append(
-            f"When your pages spell out clear, matching details about {bn}, assistants can connect answers to the right business."
-        )
-    elif "local" in intents or ANGLE_ENTITY_LOCATION in angle_ctr:
-        parts.append(
-            f"Aligned name, area, and contact information make it easier for local questions to surface {bn}."
-        )
-    elif "comparison" in intents or ANGLE_COMPETITIVE_PARITY in angle_ctr:
-        parts.append(
-            f"Simple proof and clear differences give assistants reasons to mention {bn} when people compare options."
-        )
-    else:
-        parts.append(
-            f"Focused pages and FAQs that mirror how people ask help assistants confidently mention {bn}."
-        )
-
-    second = "Do the steps below in order; small steady updates usually help more than one big rush."
-    return f"{parts[0]} {second}"
+    if ANGLE_SCHEMA in angle_ctr:
+        return f"Clear facts on your pages help AI tools tie answers to the right business ({bn})."
+    if "local" in intents or ANGLE_ENTITY_LOCATION in angle_ctr:
+        return f"Same name, area, and contact info everywhere helps local questions surface {bn}."
+    if "comparison" in intents or ANGLE_COMPETITIVE_PARITY in angle_ctr:
+        return f"Simple proof and plain differences help AI tools include {bn} when people compare choices."
+    return f"Short updates to the pages below help AI tools mention {bn} more often."
 
 
 def _merge_action_rows(a: dict[str, str], b: dict[str, str], *, intent_note: str) -> dict[str, str]:
@@ -2108,15 +2093,11 @@ def _aggregate_applies_to_for_strategy(
     elif unique_prompt_n < max_pc:
         unique_prompt_n = max(unique_prompt_n, max_pc)
 
-    out: dict[str, Any] = {
+    return {
         "prompt_count": unique_prompt_n,
-        # Full deduped list for Actions UI (client shows first 3 + expand).
         "prompt_examples": prompts,
         "response_snapshot_ids": resp_ids[:40],
     }
-    if monitored_prompt_count and monitored_prompt_count > 0 and unique_prompt_n > 0:
-        out["coverage_fraction"] = round(min(1.0, unique_prompt_n / monitored_prompt_count), 3)
-    return out
 
 
 def _strategy_priority_label(members: list[dict[str, Any]]) -> str:
@@ -2177,6 +2158,7 @@ def build_recommendation_strategies_from_flat(
         angle_buckets = _dedupe_and_bucket_actions_for_strategy(members)
         flat_actions: list[dict[str, str]] = []
         seen_t: set[str] = set()
+        act_cap = _max_recommendation_leaves()
         for ang, acts in sorted(
             angle_buckets.items(),
             key=lambda kv: _ANGLE_PRECEDENCE_FOR_MERGE.get(kv[0], 0),
@@ -2188,9 +2170,9 @@ def build_recommendation_strategies_from_flat(
                     continue
                 seen_t.add(k)
                 flat_actions.append(dict(act))
-                if len(flat_actions) >= 12:
+                if len(flat_actions) >= act_cap:
                     break
-            if len(flat_actions) >= 12:
+            if len(flat_actions) >= act_cap:
                 break
         angles_out = (
             [{"angle": ANGLE_FLAT_TODO, "actions": flat_actions}] if flat_actions else []
@@ -2250,18 +2232,19 @@ def generate_aeo_recommendations(
     *,
     save: bool = True,
     enrich_with_nl: bool = True,
-    group_gaps: bool = False,
+    group_gaps: bool | None = None,
     verbosity: str = AEO_RECOMMENDATION_VERBOSITY_COMPACT,
     multi_angle: bool = False,
 ) -> dict[str, Any]:
     """
-    Build a short prioritized to-do list (max :data:`AEO_RECOMMENDATION_MAX_LEAVES` items) from the
+    Build a short prioritized to-do list (max leaves from ``AEO_RECOMMENDATION_MAX_LEAVES`` setting) from the
     latest score snapshot and latest extraction per response.
 
-    Default output is one row per gap with plain-language copy (multi-angle fan-out is opt-in).
-    Strategies flatten actions into a single list for the UI (no Schema/Content section headings).
+    Gap clustering defaults from ``AEO_RECOMMENDATION_GROUP_GAPS`` (override with ``group_gaps=True/False``).
+    Strategies flatten actions into a single flat to-do list for the Actions UI.
 
-    OpenAI NL runs when ``enrich_with_nl`` is True (capped by the max-leaves limit).
+    When ``enrich_with_nl`` is True, ``generate_natural_language_recommendation`` may call OpenAI if
+    ``AEO_RECOMMENDATION_USE_OPENAI`` is enabled; otherwise template copy is used.
     """
     score = (
         business_profile.aeo_score_snapshots.order_by("-created_at").select_related("profile").first()
@@ -2285,6 +2268,8 @@ def generate_aeo_recommendations(
         if verbosity in AEO_RECOMMENDATION_VERBOSITY_CHOICES
         else AEO_RECOMMENDATION_VERBOSITY_EXPANDED
     )
+    cap = _max_recommendation_leaves()
+    use_group = _effective_group_gaps(group_gaps)
 
     canonical_dom = canonical_registrable_domain(site)
     vis_gaps_raw = analyze_visibility_gaps(
@@ -2309,9 +2294,13 @@ def generate_aeo_recommendations(
         )
         cite_gaps_raw = _merge_citation_gaps_deduped(cite_gaps_raw, per_resp_cites)
 
-    if group_gaps:
-        vis_gaps = _group_gap_objects_for_recommendations(vis_gaps_raw, action_type="create_content")
-        cite_gaps = _group_gap_objects_for_recommendations(cite_gaps_raw, action_type="acquire_citation")
+    if use_group:
+        vis_gaps = _sort_gaps_by_cluster_impact(
+            _group_gap_objects_for_recommendations(vis_gaps_raw, action_type="create_content")
+        )
+        cite_gaps = _sort_gaps_by_cluster_impact(
+            _group_gap_objects_for_recommendations(cite_gaps_raw, action_type="acquire_citation")
+        )
     else:
         vis_gaps = vis_gaps_raw
         cite_gaps = cite_gaps_raw
@@ -2335,7 +2324,7 @@ def generate_aeo_recommendations(
         return sc
 
     for _vis_i, gap in enumerate(vis_gaps):
-        if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+        if len(recommendations) >= cap:
             break
         base = _build_create_content_recommendation(
             gap,
@@ -2377,7 +2366,7 @@ def generate_aeo_recommendations(
                 )
                 _apply_nl_as_primary_actions(fin)
                 recommendations.append(fin)
-                if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+                if len(recommendations) >= cap:
                     break
         else:
             rid = _make_rec_id("create_content", gap, rec_seq)
@@ -2392,7 +2381,7 @@ def generate_aeo_recommendations(
             rec["parent_group_id"] = parent_id
             rec["angle"] = ANGLE_CONTENT
             rec["verbosity"] = verb
-            rec["summary"] = _build_angle_summary(gap, ANGLE_CONTENT, "create_content", business_profile)
+            rec["summary"] = ""
             rec["actions"] = _build_structured_actions(
                 gap,
                 ANGLE_CONTENT,
@@ -2407,25 +2396,26 @@ def generate_aeo_recommendations(
                 "response_snapshot_ids": applies_resp_ids[:50],
                 "cluster_summary": _cluster_summary_line(gap),
             }
+            merged_nl = {
+                **gap,
+                **nl_ctx,
+                "action_type": "create_content",
+                "score": _headline_score_dict(),
+            }
             if use_openai_nl:
                 rec["nl_explanation"] = generate_natural_language_recommendation(
-                    {
-                        **gap,
-                        **nl_ctx,
-                        "action_type": "create_content",
-                        "score": _headline_score_dict(),
-                    },
+                    merged_nl,
                     business_profile=business_profile,
                 )
             else:
-                rec["nl_explanation"] = rec["summary"]
+                rec["nl_explanation"] = _nl_template_with_kinds(merged_nl)
             _apply_nl_as_primary_actions(rec)
             recommendations.append(rec)
-            if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+            if len(recommendations) >= cap:
                 break
 
     for _cite_i, gap in enumerate(cite_gaps):
-        if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+        if len(recommendations) >= cap:
             break
         base = _build_acquire_citation_recommendation(
             gap,
@@ -2466,7 +2456,7 @@ def generate_aeo_recommendations(
                 )
                 _apply_nl_as_primary_actions(fin)
                 recommendations.append(fin)
-                if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+                if len(recommendations) >= cap:
                     break
         else:
             rid = _make_rec_id("acquire_citation", gap, rec_seq)
@@ -2481,9 +2471,7 @@ def generate_aeo_recommendations(
             rec["parent_group_id"] = parent_id
             rec["angle"] = ANGLE_PRESENCE_LISTINGS
             rec["verbosity"] = verb
-            rec["summary"] = _build_angle_summary(
-                gap, ANGLE_PRESENCE_LISTINGS, "acquire_citation", business_profile
-            )
+            rec["summary"] = ""
             rec["actions"] = _build_structured_actions(
                 gap,
                 ANGLE_PRESENCE_LISTINGS,
@@ -2498,30 +2486,31 @@ def generate_aeo_recommendations(
                 "response_snapshot_ids": applies_resp_ids[:50],
                 "cluster_summary": _cluster_summary_line(gap),
             }
+            merged_nl_c = {
+                **gap,
+                **nl_ctx,
+                "action_type": "acquire_citation",
+                "score": _headline_score_dict(cite_gap=gap),
+            }
             if use_openai_nl:
                 rec["nl_explanation"] = generate_natural_language_recommendation(
-                    {
-                        **gap,
-                        **nl_ctx,
-                        "action_type": "acquire_citation",
-                        "score": _headline_score_dict(cite_gap=gap),
-                    },
+                    merged_nl_c,
                     business_profile=business_profile,
                 )
             else:
-                rec["nl_explanation"] = rec["summary"]
+                rec["nl_explanation"] = _nl_template_with_kinds(merged_nl_c)
             _apply_nl_as_primary_actions(rec)
             recommendations.append(rec)
-            if len(recommendations) >= AEO_RECOMMENDATION_MAX_LEAVES:
+            if len(recommendations) >= cap:
                 break
 
-    recommendations = recommendations[:AEO_RECOMMENDATION_MAX_LEAVES]
+    recommendations = recommendations[:cap]
 
     if not recommendations:
         bn = (business_profile.business_name or "").strip() or "This business"
         reason = (
-            f"No single prompt gap fired for {bn} this run (visibility {visibility:.1f}%, citation-style "
-            f"{citation:.1f}%). After you update FAQs, business details on key pages, or main listings, run another check."
+            f"We did not find one focused fix to highlight for {bn} this run. "
+            f"After you refresh FAQs, business details on key pages, and main listings, run another check."
         )
         low_rec: dict[str, Any] = {
             "action_type": "review_visibility",

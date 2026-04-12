@@ -204,11 +204,11 @@ AEO_RECOMMENDATION_NL_SYSTEM_PROMPT = (
     "Use the exact business_name from JSON when naming the company. "
     "If crawl_summary has a real page or topic, anchor one line to it. "
 
-    "Output exactly 3 lines, plain text only, separated by a single newline each (no bullets, no numbers, no headings):\n"
+    "Output 3 or 4 lines, plain text only, separated by a single newline each (no bullets, no numbers, no headings):\n"
     "Line 1 — What to do (clear action).\n"
     "Line 2 — How to do it (where on the site or which listing, and what to put there).\n"
     "Line 3 — Why it helps (one simple sentence tied to showing up in AI answers).\n"
-    "Do not add a fourth line or any extra explanation."
+    "Optional line 4 — Rough time only, e.g. \"Takes about 10–15 minutes.\" No other extra lines."
 )
 
 AEO_RECOMMENDATION_TYPE_SYSTEM_PROMPT: Final[str] = (

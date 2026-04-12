@@ -385,6 +385,10 @@ AEO_PROMPT_TOPUP_BUFFER = env.int("AEO_PROMPT_TOPUP_BUFFER", default=8)
 AEO_ENABLE_RECOMMENDATION_STAGE = env.bool("AEO_ENABLE_RECOMMENDATION_STAGE", default=False)
 # Phase 5 recommendation nl_explanation: False = template-only (no OpenAI); True = LLM (extra API calls).
 AEO_RECOMMENDATION_USE_OPENAI = env.bool("AEO_RECOMMENDATION_USE_OPENAI", default=False)
+# Max actionable recommendations per run (3–5 typical). Env override for ops rollback.
+AEO_RECOMMENDATION_MAX_LEAVES = env.int("AEO_RECOMMENDATION_MAX_LEAVES", default=5)
+# Cluster visibility/citation gaps by (absence_reason, content_angle, action_type) before capping.
+AEO_RECOMMENDATION_GROUP_GAPS = env.bool("AEO_RECOMMENDATION_GROUP_GAPS", default=True)
 # Google Gemini — optional Phase 2 AEO execution alongside OpenAI (see accounts.gemini_utils).
 # Also accepted: GOOGLE_GEMINI_API_KEY if this is empty (read in gemini_utils).
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="").strip()

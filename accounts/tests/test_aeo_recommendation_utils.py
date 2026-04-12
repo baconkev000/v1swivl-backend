@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from django.test import override_settings
 
 from accounts.aeo.aeo_recommendation_utils import (
     _build_onpage_crawl_summary,
@@ -8,9 +9,11 @@ from accounts.aeo.aeo_recommendation_utils import (
     _competitor_display_names,
     _group_gap_objects_for_recommendations,
     _industry_snippet_for_copy,
+    _max_recommendation_leaves,
     _nl_template,
     _prompt_short_label,
     _region_label_for_profile,
+    _sort_gaps_by_cluster_impact,
     analyze_citation_gaps,
     analyze_visibility_gaps,
     build_recommendation_strategies_from_flat,
@@ -198,6 +201,8 @@ def test_group_gaps_by_absence_reason_and_content_angle():
     assert len(grouped) == 2
     first = [g for g in grouped if g.get("absence_reason") == "missing_category_page"][0]
     assert "(+1 similar prompts)" in first.get("prompt_text", "")
+    mpt = first.get("matched_prompt_texts")
+    assert isinstance(mpt, list) and len(mpt) == 2
 
 
 def test_nl_template_wrong_live_vs_broken():
@@ -267,7 +272,7 @@ def test_build_recommendation_strategies_groups_and_dedupes_actions():
             },
             "actions": [
                 {
-                    "title": "Add JSON-LD for this page type",
+                    "title": "Add clear service details to your main pages",
                     "description": "First",
                     "priority": "high",
                 },
@@ -292,7 +297,7 @@ def test_build_recommendation_strategies_groups_and_dedupes_actions():
             },
             "actions": [
                 {
-                    "title": "Add JSON-LD for this page type",
+                    "title": "Add clear service details to your main pages",
                     "description": "Second longer description for merge",
                     "priority": "medium",
                 },
@@ -307,12 +312,76 @@ def test_build_recommendation_strategies_groups_and_dedupes_actions():
     assert "summary" in s0 and len(s0["summary"]) > 20
     assert s0["applies_to"]["prompt_count"] >= 1
     assert set(s0["applies_to"]["prompt_examples"]) == {"best cookies nationwide", "cookie delivery options"}
+    assert "coverage_fraction" not in s0["applies_to"]
     assert len(s0["angles"]) == 1
     assert s0["angles"][0]["angle"] == "todo"
     all_titles = [a["title"] for b in s0["angles"] for a in b["actions"]]
-    assert all_titles.count("Add JSON-LD for this page type") == 1
+    assert all_titles.count("Add clear service details to your main pages") == 1
     assert not any("Tie work" in t for t in all_titles)
     assert not any("crawl" in t.lower() for t in all_titles)
+    blob = " ".join(
+        [s0["title"], s0["summary"]]
+        + [f"{a['title']} {a.get('description', '')}" for b in s0["angles"] for a in b["actions"]]
+    ).lower()
+    for banned in ("schema", "json-ld", "signals", "optimize", "leverage", "canonical"):
+        assert banned not in blob
+
+
+def test_sort_gaps_by_cluster_impact_prefers_larger_clusters_and_more_responses():
+    gaps = [
+        {
+            "matched_prompt_texts": ["a", "b"],
+            "_grouped_response_ids": [1],
+            "gap_kind": "visibility_miss",
+            "prompt_text": "a",
+        },
+        {
+            "matched_prompt_texts": ["c", "d", "e"],
+            "_grouped_response_ids": [2],
+            "gap_kind": "visibility_miss",
+            "prompt_text": "c",
+        },
+    ]
+    ordered = _sort_gaps_by_cluster_impact(gaps)
+    assert len(ordered[0].get("matched_prompt_texts") or []) == 3
+
+    tie_pt = [
+        {
+            "matched_prompt_texts": ["a", "b"],
+            "_grouped_response_ids": [1],
+            "gap_kind": "visibility_miss",
+            "prompt_text": "a",
+        },
+        {
+            "matched_prompt_texts": ["c", "d"],
+            "_grouped_response_ids": [10, 11, 12],
+            "gap_kind": "visibility_miss",
+            "prompt_text": "c",
+        },
+    ]
+    ordered2 = _sort_gaps_by_cluster_impact(tie_pt)
+    assert len(ordered2[0].get("_grouped_response_ids") or []) == 3
+
+
+@override_settings(AEO_RECOMMENDATION_MAX_LEAVES=3)
+def test_max_recommendation_leaves_reads_setting():
+    assert _max_recommendation_leaves() == 3
+
+
+def test_nl_template_avoids_common_jargon():
+    text = _nl_template(
+        {
+            "gap_kind": "visibility_miss",
+            "business_name": "Acme",
+            "region_label": "Austin, TX",
+            "industry": "Plumbing",
+            "competitors_in_answer": [],
+            "absence_reason": "missing_category_page",
+            "content_angle": "service_offer",
+        }
+    ).lower()
+    for banned in ("schema", "json-ld", "signals", "optimize", "leverage", "entity", "canonical"):
+        assert banned not in text
 
 
 def test_build_onpage_crawl_summary_from_namespace():
