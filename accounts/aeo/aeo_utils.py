@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 from django.conf import settings
 
 from ..models import BusinessProfile
+from .aeo_plan_targets import AEO_PLAN_CAP_PRO, AEO_PLAN_CAP_STARTER
 
 # Onboarding / tracking: exactly this many prompts in combined output and saved profile lists.
 AEO_ONBOARDING_PROMPT_COUNT: Final[int] = 50
@@ -44,6 +45,25 @@ OPENAI_ONBOARDING_TYPE_RATIO: Final[dict[str, float]] = {
     AEOPromptType.AUTHORITY.value: 0.15,
 }
 OPENAI_ONBOARDING_MAX_BATCH_SIZE: Final[int] = 24
+
+
+def aeo_openai_max_output_tokens_for_target(target_combined_count: int) -> int:
+    """
+    Per-completion max_tokens for AEO prompt-batch OpenAI calls, scaled to the combined target size.
+
+    High max_tokens reduces truncated JSON when the model returns a large array of prompts
+    (failed_empty / partial expansion). TPM and RPM are account-level; this value only caps
+    each individual completion output.
+    """
+    t = max(1, int(target_combined_count))
+    starter = int(getattr(settings, "AEO_OPENAI_MAX_TOKENS_STARTER", 1024))
+    pro = int(getattr(settings, "AEO_OPENAI_MAX_TOKENS_PRO", 4096))
+    advanced = int(getattr(settings, "AEO_OPENAI_MAX_TOKENS_ADVANCED", 8192))
+    if t <= AEO_PLAN_CAP_STARTER:
+        return starter
+    if t <= AEO_PLAN_CAP_PRO:
+        return pro
+    return advanced
 
 
 @dataclass
@@ -696,6 +716,7 @@ def run_prompt_batch_via_openai(
     model: str | None = None,
     onboarding_topic_details: Sequence[Mapping[str, Any]] | None = None,
     business_profile: BusinessProfile | None = None,
+    max_output_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     """
     Ask OpenAI for additional prompts; returns normalized JSON-ready dicts.
@@ -710,6 +731,11 @@ def run_prompt_batch_via_openai(
     )
     sys_p = system_prompt or AEO_PROMPT_ENGINE_SYSTEM_PROMPT
     use_model = model or _get_model()
+    eff_max_tokens = (
+        int(max_output_tokens)
+        if max_output_tokens is not None
+        else aeo_openai_max_output_tokens_for_target(AEO_PLAN_CAP_STARTER)
+    )
 
     try:
         client = _get_client(api_key_env)
@@ -724,7 +750,7 @@ def run_prompt_batch_via_openai(
             ],
             temperature=0.2,
             top_p=0.9,
-            max_tokens=500,
+            max_tokens=eff_max_tokens,
         )
         raw = (completion.choices[0].message.content or "").strip()
     except Exception:
@@ -810,6 +836,7 @@ def build_full_aeo_prompt_plan(
     - prompts_by_topic: optional dict topic -> prompt strings (onboarding only)
     """
     target = int(target_combined_count or AEO_ONBOARDING_PROMPT_COUNT)
+    batch_max_output_tokens = aeo_openai_max_output_tokens_for_target(target)
 
     if business_input is not None:
         ctx = business_input
@@ -886,6 +913,7 @@ def build_full_aeo_prompt_plan(
             system_prompt=type_prompts[prompt_type],
             onboarding_topic_details=onboarding_topic_details,
             business_profile=profile,
+            max_output_tokens=batch_max_output_tokens,
         )
         typed = _typed_batch(batch, prompt_type)
         if not typed:

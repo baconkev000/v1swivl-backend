@@ -77,6 +77,7 @@ from .aeo_extraction_utils import (
 from .aeo_utils import (
     AEOPromptBusinessInput,
     aeo_business_input_from_profile,
+    aeo_openai_max_output_tokens_for_target,
     build_full_aeo_prompt_plan,
     build_openai_batch_user_content,
     combine_prompt_set,
@@ -113,6 +114,7 @@ __all__ = [
     "AEO_STRUCTURED_EXTRACTION_USER_TEMPLATE",
     "GENERIC_COMPETITOR_TOKENS",
     "aeo_business_input_from_profile",
+    "aeo_openai_max_output_tokens_for_target",
     "AEO_RECOMMENDATION_VERBOSITY_COMPACT",
     "AEO_RECOMMENDATION_VERBOSITY_EXPANDED",
     "analyze_citation_gaps",
