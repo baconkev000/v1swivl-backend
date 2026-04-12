@@ -1494,6 +1494,95 @@ def _clean_profile_prompts_for_expansion(profile) -> list[str]:
     return [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
 
 
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def aeo_backfill_monitored_prompt_execution_task(
+    self,
+    profile_id: int,
+    before_prompt_count: int | None = None,
+    after_prompt_count: int | None = None,
+) -> None:
+    """
+    Run Phase 1 for monitored prompts missing full OpenAI + Gemini + Perplexity extractions.
+
+    Enqueued after post-payment expansion when new prompt strings were merged. Uses
+    ``force_refresh=True`` on Phase 1 so the 30-day "skip cached" path does not block
+    execution for prompts that were not in the original onboarding run.
+
+    Pro/Advanced: Phase 1 → Phase 3 extraction → Phase 4 scoring → Phase 5 recommendations
+    (when ``AEO_ENABLE_RECOMMENDATION_STAGE``), same as the full pipeline. Starter-scale
+    profiles are skipped (expansion does not run for them).
+    """
+    from .aeo.aeo_utils import plan_items_from_saved_prompt_strings
+    from .aeo.prompt_scan_progress import monitored_prompt_keys_missing_full_coverage
+    from .models import AEOExecutionRun, BusinessProfile
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).select_related("user").first()
+    if profile is None:
+        logger.warning("[AEO backfill] profile not found profile_id=%s", pid)
+        return
+    if _is_onboarding_sample_size_profile(profile):
+        logger.info("[AEO backfill] skip starter-scale profile profile_id=%s", pid)
+        return
+    if not aeo_should_run_post_payment_expansion(profile):
+        logger.info("[AEO backfill] skip plan not expansion-eligible profile_id=%s", pid)
+        return
+
+    missing = monitored_prompt_keys_missing_full_coverage(profile)
+    if not missing:
+        logger.info(
+            "[AEO backfill] nothing_missing profile_id=%s before_count=%s after_count=%s",
+            pid,
+            before_prompt_count,
+            after_prompt_count,
+        )
+        return
+
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exists()
+    if inflight:
+        logger.info(
+            "[AEO backfill] skip_duplicate_inflight profile_id=%s missing_count=%s before_count=%s after_count=%s",
+            pid,
+            len(missing),
+            before_prompt_count,
+            after_prompt_count,
+        )
+        return
+
+    target_cap = aeo_effective_monitored_target_for_profile(profile)
+    payload = plan_items_from_saved_prompt_strings(missing, max_items=max(len(missing), target_cap))
+    if not payload:
+        return
+
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        prompt_count_requested=len(payload),
+        status=AEOExecutionRun.STATUS_PENDING,
+        error_message=f"expansion_backfill_profile_id={pid}",
+    )
+    try:
+        run_aeo_phase1_execution_task.delay(run.id, prompt_set=payload, force_refresh=True)
+        logger.info(
+            "[AEO backfill] phase1_enqueued profile_id=%s run_id=%s before_count=%s after_count=%s "
+            "backfill_prompts=%s missing_total=%s",
+            pid,
+            run.id,
+            before_prompt_count,
+            after_prompt_count,
+            len(payload),
+            len(missing),
+        )
+    except Exception as exc:
+        run.status = AEOExecutionRun.STATUS_FAILED
+        run.error_message = f"backfill_enqueue_failed:{type(exc).__name__}: {exc}"[:2000]
+        run.finished_at = django_tz.now()
+        run.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
+        logger.exception("[AEO backfill] phase1 enqueue failed profile_id=%s run_id=%s", pid, run.id)
+
+
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=30, ignore_result=True)
 def schedule_aeo_prompt_plan_expansion(
     self,
@@ -1696,6 +1785,32 @@ def schedule_aeo_prompt_plan_expansion(
             aeo_prompt_expansion_updated_at=django_tz.now(),
         )
         logger.info("[AEO expansion] complete profile_id=%s final=%s target=%s", pid, final_n, cap)
+
+        before_key_set = {x.casefold() for x in existing}
+        after_key_set = {x.casefold() for x in _clean_profile_prompts_for_expansion(profile)}
+        added_keys = after_key_set - before_key_set
+        if added_keys:
+            before_n = len(existing)
+            ac_after = final_n
+
+            def _enqueue_backfill() -> None:
+                try:
+                    aeo_backfill_monitored_prompt_execution_task.delay(
+                        pid,
+                        before_prompt_count=before_n,
+                        after_prompt_count=ac_after,
+                    )
+                except Exception:
+                    logger.exception("[AEO expansion] backfill enqueue failed profile_id=%s", pid)
+
+            transaction.on_commit(_enqueue_backfill)
+            logger.info(
+                "[AEO expansion] backfill_on_commit profile_id=%s new_prompt_keys=%s before_count=%s after_count=%s",
+                pid,
+                len(added_keys),
+                before_n,
+                ac_after,
+            )
     except Exception as exc:
         logger.exception("[AEO expansion] failed profile_id=%s", pid)
         profile.refresh_from_db()

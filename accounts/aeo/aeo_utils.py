@@ -482,11 +482,18 @@ def _format_template(
     return spec.template.format(**safe_values)
 
 
-def plan_items_from_saved_prompt_strings(texts: Sequence[str]) -> list[dict[str, Any]]:
+def plan_items_from_saved_prompt_strings(
+    texts: Sequence[str],
+    *,
+    max_items: int | None = None,
+) -> list[dict[str, Any]]:
     """
-    Normalize stored onboarding prompt strings into JSON-ready dicts (exactly up to
-    ``AEO_ONBOARDING_PROMPT_COUNT`` items).
+    Normalize stored prompt strings into JSON-ready dicts.
+
+    When ``max_items`` is None, caps at ``AEO_ONBOARDING_PROMPT_COUNT`` (onboarding / legacy).
+    Pass a larger ``max_items`` for Pro/Advanced execution payloads (e.g. expansion backfill).
     """
+    cap = AEO_ONBOARDING_PROMPT_COUNT if max_items is None else max(1, int(max_items))
     out: list[dict[str, Any]] = []
     for raw in texts:
         t = str(raw).strip()
@@ -500,7 +507,7 @@ def plan_items_from_saved_prompt_strings(texts: Sequence[str]) -> list[dict[str,
                 dynamic=True,
             )
         )
-        if len(out) >= AEO_ONBOARDING_PROMPT_COUNT:
+        if len(out) >= cap:
             break
     return out
 

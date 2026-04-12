@@ -7,6 +7,16 @@ from accounts.tasks import schedule_aeo_prompt_plan_expansion
 User = get_user_model()
 
 
+@pytest.fixture(autouse=True)
+def _expansion_tests_commit_and_noop_backfill(monkeypatch):
+    """on_commit runs inline; avoid real Celery backfill broker during expansion tests."""
+    monkeypatch.setattr("django.db.transaction.on_commit", lambda fn: fn())
+    monkeypatch.setattr(
+        "accounts.tasks.aeo_backfill_monitored_prompt_execution_task.delay",
+        lambda *a, **k: None,
+    )
+
+
 @pytest.mark.django_db
 def test_expansion_merges_delta(monkeypatch, settings):
     settings.AEO_TESTING_MODE = False
