@@ -604,6 +604,31 @@ class AEOPromptExecutionAggregate(models.Model):
     openai_third_pass_ran = models.BooleanField(default=False)
     gemini_third_pass_ran = models.BooleanField(default=False)
 
+    perplexity_pass_count = models.IntegerField(default=0)
+    perplexity_brand_cited_count = models.IntegerField(default=0)
+    perplexity_wrong_url_count = models.IntegerField(default=0)
+    last_perplexity_response_snapshot = models.ForeignKey(
+        AEOResponseSnapshot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    last_perplexity_competitors_json = models.JSONField(default=list, blank=True)
+    last_perplexity_citations_json = models.JSONField(default=list, blank=True)
+    last_perplexity_brand_mentioned = models.BooleanField(default=False)
+    perplexity_last_wrong_url_status = models.CharField(max_length=40, blank=True, default="")
+    perplexity_brand_mention_history = models.JSONField(default=list, blank=True)
+    perplexity_pass_history_json = models.JSONField(default=list, blank=True)
+    perplexity_stability_status = models.CharField(
+        max_length=28,
+        choices=STABILITY_CHOICES,
+        default=STABILITY_PENDING,
+        db_index=True,
+    )
+    perplexity_third_pass_required = models.BooleanField(default=False)
+    perplexity_third_pass_ran = models.BooleanField(default=False)
+
     stability_status = models.CharField(
         max_length=28,
         choices=STABILITY_CHOICES,

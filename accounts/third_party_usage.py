@@ -711,6 +711,10 @@ def build_aeo_pass_count_analytics_context(
     execution_run_id: int | None = None,
     profile_id: int | None = None,
 ) -> dict[str, Any]:
+    from accounts.aeo.perplexity_execution_utils import perplexity_execution_enabled
+
+    use_perplexity = perplexity_execution_enabled()
+
     qs = AEOPromptExecutionAggregate.objects.all()
     if execution_run_id is not None:
         qs = qs.filter(execution_run_id=execution_run_id)
@@ -725,11 +729,16 @@ def build_aeo_pass_count_analytics_context(
             stable_attr = "openai_stability_status"
             need_attr = "openai_third_pass_required"
             ran_attr = "openai_third_pass_ran"
-        else:
+        elif provider == "gemini":
             pass_attr = "gemini_pass_count"
             stable_attr = "gemini_stability_status"
             need_attr = "gemini_third_pass_required"
             ran_attr = "gemini_third_pass_ran"
+        else:
+            pass_attr = "perplexity_pass_count"
+            stable_attr = "perplexity_stability_status"
+            need_attr = "perplexity_third_pass_required"
+            ran_attr = "perplexity_third_pass_ran"
         total = sum(1 for r in rows if int(getattr(r, pass_attr, 0) or 0) > 0)
         stable_2 = sum(
             1
@@ -745,29 +754,45 @@ def build_aeo_pass_count_analytics_context(
             "third_completed": third_completed,
         }
 
+    def _prompt_stable_at_2_all_in_scope(r: AEOPromptExecutionAggregate) -> bool:
+        """
+        Prompt counts as stable-at-2 when every in-scope provider (OpenAI + Gemini always;
+        Perplexity too when PERPLEXITY_API_KEY is set) has stability_status == stable.
+        """
+        o_ok = str(r.openai_stability_status) == "stable"
+        g_ok = str(r.gemini_stability_status) == "stable"
+        if not use_perplexity:
+            return o_ok and g_ok
+        return o_ok and g_ok and str(r.perplexity_stability_status) == "stable"
+
+    def _prompt_needs_third(r: AEOPromptExecutionAggregate) -> bool:
+        b = bool(r.openai_third_pass_required) or bool(r.gemini_third_pass_required)
+        if use_perplexity:
+            b = b or bool(r.perplexity_third_pass_required)
+        return b
+
+    def _prompt_ran_third(r: AEOPromptExecutionAggregate) -> bool:
+        b = bool(r.openai_third_pass_ran) or bool(r.gemini_third_pass_ran)
+        if use_perplexity:
+            b = b or bool(r.perplexity_third_pass_ran)
+        return b
+
     openai = _provider_breakdown("openai")
     gemini = _provider_breakdown("gemini")
-    prompts_requiring_3rd = sum(
-        1 for r in rows if bool(r.openai_third_pass_required) or bool(r.gemini_third_pass_required)
-    )
-    prompts_ran_3rd = sum(
-        1 for r in rows if bool(r.openai_third_pass_ran) or bool(r.gemini_third_pass_ran)
-    )
-    prompts_stable_at_2 = sum(
-        1
-        for r in rows
-        if str(r.openai_stability_status) == "stable" and str(r.gemini_stability_status) == "stable"
-    )
+    perplexity = _provider_breakdown("perplexity")
+    prompts_requiring_3rd = sum(1 for r in rows if _prompt_needs_third(r))
+    prompts_ran_3rd = sum(1 for r in rows if _prompt_ran_third(r))
+    prompts_stable_at_2 = sum(1 for r in rows if _prompt_stable_at_2_all_in_scope(r))
 
     by_run = defaultdict(lambda: {"total": 0, "stable_at_2": 0, "needed_third": 0, "third_completed": 0})
     for r in rows:
         key = str(r.execution_run_id or "none")
         by_run[key]["total"] += 1
-        if str(r.openai_stability_status) == "stable" and str(r.gemini_stability_status) == "stable":
+        if _prompt_stable_at_2_all_in_scope(r):
             by_run[key]["stable_at_2"] += 1
-        if bool(r.openai_third_pass_required) or bool(r.gemini_third_pass_required):
+        if _prompt_needs_third(r):
             by_run[key]["needed_third"] += 1
-        if bool(r.openai_third_pass_ran) or bool(r.gemini_third_pass_ran):
+        if _prompt_ran_third(r):
             by_run[key]["third_completed"] += 1
 
     run_labels = sorted(by_run.keys(), key=lambda x: (x == "none", x))
@@ -798,7 +823,8 @@ def build_aeo_pass_count_analytics_context(
         "prompts_stable_at_2": prompts_stable_at_2,
         "prompts_requiring_3rd": prompts_requiring_3rd,
         "prompts_ran_3rd": prompts_ran_3rd,
-        "providers": {"openai": openai, "gemini": gemini},
+        "perplexity_analytics_in_scope": use_perplexity,
+        "providers": {"openai": openai, "gemini": gemini, "perplexity": perplexity},
         "grouped_by_run": run_grouped,
         "top_competitors": [{"key": k, "count": c} for k, c in top_competitors_sorted],
         "top_citations": [{"key": k, "count": c} for k, c in top_citations_sorted],

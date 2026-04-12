@@ -33,7 +33,10 @@
     <div class="col-md-6">
       <ul class="list-group mb-3">
         <li class="list-group-item d-flex justify-content-between"><span>Total prompts</span><strong>{{ analytics.total_prompts }}</strong></li>
-        <li class="list-group-item d-flex justify-content-between"><span>Prompts stable at 2 passes</span><strong>{{ analytics.prompts_stable_at_2 }}</strong></li>
+        <li class="list-group-item d-flex justify-content-between align-items-start gap-2">
+          <span>Prompts stable at 2 passes{% if analytics.perplexity_analytics_in_scope %} <small class="text-muted d-block fw-normal">(OpenAI, Gemini, Perplexity each stable@2)</small>{% endif %}</span>
+          <strong>{{ analytics.prompts_stable_at_2 }}</strong>
+        </li>
         <li class="list-group-item d-flex justify-content-between"><span>Prompts requiring 3rd pass</span><strong>{{ analytics.prompts_requiring_3rd }}</strong></li>
         <li class="list-group-item d-flex justify-content-between"><span>Prompts that ran 3rd pass</span><strong>{{ analytics.prompts_ran_3rd }}</strong></li>
       </ul>
@@ -44,6 +47,7 @@
         <tbody>
           <tr><td>OpenAI</td><td>{{ analytics.providers.openai.total }}</td><td>{{ analytics.providers.openai.stable_at_2 }}</td><td>{{ analytics.providers.openai.needed_third }}</td><td>{{ analytics.providers.openai.third_completed }}</td></tr>
           <tr><td>Gemini</td><td>{{ analytics.providers.gemini.total }}</td><td>{{ analytics.providers.gemini.stable_at_2 }}</td><td>{{ analytics.providers.gemini.needed_third }}</td><td>{{ analytics.providers.gemini.third_completed }}</td></tr>
+          <tr><td>Perplexity</td><td>{{ analytics.providers.perplexity.total }}</td><td>{{ analytics.providers.perplexity.stable_at_2 }}</td><td>{{ analytics.providers.perplexity.needed_third }}</td><td>{{ analytics.providers.perplexity.third_completed }}</td></tr>
         </tbody>
       </table>
     </div>

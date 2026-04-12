@@ -4,9 +4,8 @@ Fully-ready rules for AI Visibility prompt rows + ETA for the single progress ba
 ``fully_ready`` (per monitored prompt) requires all of:
 1) **Triple extraction** — same rule as ``prompt_scan_completed_count`` / latest snapshot per
    openai, gemini, perplexity each has ≥1 extraction snapshot.
-2) **Phase-2 passes complete** — mirrors ``accounts.tasks`` ``run_aeo_phase2_confidence_task`` loop:
-   no further ``_push`` would enqueue OpenAI or Gemini work for this prompt's aggregate
-   (see ``PASSES_PER_PROVIDER_TARGET``, third-pass flags, gemini-only / openai-only aggregates).
+2) **Phase-2 passes complete** — mirrors ``run_aeo_phase2_confidence_task`` (OpenAI, Gemini, and
+   Perplexity when ``perplexity_execution_enabled()``): no further ``_push`` for in-scope providers.
 3) **Recommendations slice** — aligned with ``_aeo_recommendations_pipeline_pending`` in
    ``accounts.views``: when ``AEO_ENABLE_RECOMMENDATION_STAGE`` is off, nothing blocks; when on,
    Phase 5 must not be pending on the latest ``AEOExecutionRun`` (persisted recommendations pass
@@ -28,6 +27,7 @@ from django.db.models import Min
 from django.utils import timezone as django_timezone
 
 from accounts.aeo.aeo_execution_utils import hash_prompt
+from accounts.aeo.perplexity_execution_utils import perplexity_execution_enabled
 from accounts.aeo.progressive_onboarding import PASSES_PER_PROVIDER_TARGET
 from accounts.aeo.prompt_scan_progress import prompt_scan_completed_count
 from accounts.models import (
@@ -40,41 +40,57 @@ from accounts.models import (
 
 def phase2_passes_complete(agg: AEOPromptExecutionAggregate | None) -> bool:
     """
-    True when OpenAI/Gemini pass scheduling in ``run_aeo_phase2_confidence_task`` would add no
-    more batches for this aggregate (mirrors the inner ``_push`` conditions).
+    True when Phase-2 scheduling in ``run_aeo_phase2_confidence_task`` would enqueue no further
+    work for this aggregate (mirrors ``_push`` for OpenAI, Gemini, and Perplexity when enabled).
     """
     if agg is None:
         return False
     o_count = int(agg.openai_pass_count or 0)
     g_count = int(agg.gemini_pass_count or 0)
+    p_count = int(agg.perplexity_pass_count or 0)
     gemini_only_aggregate = o_count == 0 and g_count > 0
     openai_only_aggregate = g_count == 0 and o_count > 0
+    perplexity_only_aggregate = p_count > 0 and o_count == 0 and g_count == 0
+    p2_on = perplexity_execution_enabled()
 
     openai_needed = False
     if o_count < PASSES_PER_PROVIDER_TARGET:
-        if not gemini_only_aggregate:
+        if not gemini_only_aggregate and not perplexity_only_aggregate:
             openai_needed = True
     elif (
         bool(agg.openai_third_pass_required)
         and not bool(agg.openai_third_pass_ran)
         and o_count < 3
     ):
-        if not gemini_only_aggregate:
+        if not gemini_only_aggregate and not perplexity_only_aggregate:
             openai_needed = True
 
     gemini_needed = False
     if g_count < PASSES_PER_PROVIDER_TARGET:
-        if not openai_only_aggregate:
+        if not openai_only_aggregate and not perplexity_only_aggregate:
             gemini_needed = True
     elif (
         bool(agg.gemini_third_pass_required)
         and not bool(agg.gemini_third_pass_ran)
         and g_count < 3
     ):
-        if not openai_only_aggregate:
+        if not openai_only_aggregate and not perplexity_only_aggregate:
             gemini_needed = True
 
-    return not openai_needed and not gemini_needed
+    perplexity_needed = False
+    if p2_on:
+        if p_count < PASSES_PER_PROVIDER_TARGET:
+            if not openai_only_aggregate and not gemini_only_aggregate:
+                perplexity_needed = True
+        elif (
+            bool(agg.perplexity_third_pass_required)
+            and not bool(agg.perplexity_third_pass_ran)
+            and p_count < 3
+        ):
+            if not openai_only_aggregate and not gemini_only_aggregate:
+                perplexity_needed = True
+
+    return not openai_needed and not gemini_needed and not perplexity_needed
 
 
 def get_latest_aggregate_for_prompt(profile_id: int, prompt_text: str) -> AEOPromptExecutionAggregate | None:

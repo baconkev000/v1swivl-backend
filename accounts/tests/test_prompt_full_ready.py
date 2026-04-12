@@ -4,6 +4,14 @@ import pytest
 from django.conf import settings
 from django.utils import timezone
 
+# Phase-2 completion helpers mirror ``run_aeo_phase2_confidence_task``; isolate from host env keys.
+pytestmark = pytest.mark.usefixtures("_clear_perplexity_key_for_phase2_tests")
+
+
+@pytest.fixture
+def _clear_perplexity_key_for_phase2_tests(settings):
+    settings.PERPLEXITY_API_KEY = ""
+
 from accounts.aeo.prompt_full_ready import (
     compute_full_phase_eta_seconds,
     full_phase_eta_cold_start,

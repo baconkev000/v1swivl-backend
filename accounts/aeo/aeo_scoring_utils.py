@@ -650,7 +650,16 @@ def calculate_layered_scores_from_aggregates(
     if score_layer == AEOScoreSnapshot.LAYER_SAMPLE:
         aggs = aggs.filter(total_pass_count__gte=2)  # one pass per provider in phase 1
     else:
-        aggs = aggs.filter(openai_pass_count__gte=2, gemini_pass_count__gte=2)
+        from accounts.aeo.perplexity_execution_utils import perplexity_execution_enabled
+
+        if perplexity_execution_enabled():
+            aggs = aggs.filter(
+                openai_pass_count__gte=2,
+                gemini_pass_count__gte=2,
+                perplexity_pass_count__gte=2,
+            )
+        else:
+            aggs = aggs.filter(openai_pass_count__gte=2, gemini_pass_count__gte=2)
 
     rows = list(aggs)
     total = len(rows)
@@ -676,6 +685,7 @@ def calculate_layered_scores_from_aggregates(
     for a in rows:
         comp_mentions += len(a.last_openai_competitors_json or [])
         comp_mentions += len(a.last_gemini_competitors_json or [])
+        comp_mentions += len(a.last_perplexity_competitors_json or [])
 
     snap_id = None
     if save:

@@ -964,7 +964,10 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
             prompt_category=str((prompt_obj or {}).get("_aeo_category") or classify_prompt_category(prompt_obj or {})),
         )
 
+    from accounts.aeo.perplexity_execution_utils import perplexity_execution_enabled
     from accounts.third_party_usage import usage_profile_context
+
+    p2_enabled = perplexity_execution_enabled()
     # Iterate until each provider/prompt pair reaches done criteria:
     # - pass_count >=2 and stable, or
     # - pass_count ==3 after unstable-at-2 third pass.
@@ -980,8 +983,8 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
             break
         aggs.sort(key=lambda a: (_aggregate_priority_bucket(a), str(a.prompt_hash)))
 
-        provider_batches: dict[str, list[dict[str, Any]]] = {"openai": [], "gemini": []}
-        provider_priority: dict[str, dict[str, int]] = {"openai": {}, "gemini": {}}
+        provider_batches: dict[str, list[dict[str, Any]]] = {"openai": [], "gemini": [], "perplexity": []}
+        provider_priority: dict[str, dict[str, int]] = {"openai": {}, "gemini": {}, "perplexity": {}}
 
         def _push(provider: str, spec: dict[str, Any], prio: int) -> None:
             h = __import__("accounts.aeo.aeo_execution_utils", fromlist=["hash_prompt"]).hash_prompt(
@@ -1005,31 +1008,44 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
                 continue
             o_count = int(agg.openai_pass_count or 0)
             g_count = int(agg.gemini_pass_count or 0)
-            # Single-provider refresh runs (e.g. Gemini-only) should not spawn the other provider here.
+            p_count = int(agg.perplexity_pass_count or 0)
+            # Single-provider refresh runs should not spawn other providers here.
             gemini_only_aggregate = o_count == 0 and g_count > 0
             openai_only_aggregate = g_count == 0 and o_count > 0
+            perplexity_only_aggregate = p_count > 0 and o_count == 0 and g_count == 0
             if o_count < PASSES_PER_PROVIDER_TARGET:
-                if not gemini_only_aggregate:
+                if not gemini_only_aggregate and not perplexity_only_aggregate:
                     _push("openai", spec, 0)
             elif (
                 bool(agg.openai_third_pass_required)
                 and not bool(agg.openai_third_pass_ran)
                 and o_count < 3
             ):
-                if not gemini_only_aggregate:
+                if not gemini_only_aggregate and not perplexity_only_aggregate:
                     _push("openai", spec, 1)
             if g_count < PASSES_PER_PROVIDER_TARGET:
-                if not openai_only_aggregate:
+                if not openai_only_aggregate and not perplexity_only_aggregate:
                     _push("gemini", spec, 0)
             elif (
                 bool(agg.gemini_third_pass_required)
                 and not bool(agg.gemini_third_pass_ran)
                 and g_count < 3
             ):
-                if not openai_only_aggregate:
+                if not openai_only_aggregate and not perplexity_only_aggregate:
                     _push("gemini", spec, 1)
+            if p2_enabled:
+                if p_count < PASSES_PER_PROVIDER_TARGET:
+                    if not openai_only_aggregate and not gemini_only_aggregate:
+                        _push("perplexity", spec, 0)
+                elif (
+                    bool(agg.perplexity_third_pass_required)
+                    and not bool(agg.perplexity_third_pass_ran)
+                    and p_count < 3
+                ):
+                    if not openai_only_aggregate and not gemini_only_aggregate:
+                        _push("perplexity", spec, 1)
 
-        for provider in ("openai", "gemini"):
+        for provider in ("openai", "gemini", "perplexity"):
             provider_batches[provider].sort(
                 key=lambda s: (
                     provider_priority[provider].get(
@@ -1043,7 +1059,11 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
                     ),
                 )
             )
-        if not provider_batches["openai"] and not provider_batches["gemini"]:
+        if (
+            not provider_batches["openai"]
+            and not provider_batches["gemini"]
+            and not provider_batches["perplexity"]
+        ):
             break
 
         with usage_profile_context(profile):
@@ -1065,6 +1085,15 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
                     providers=["gemini"],
                     on_result=_process_result,
                 )
+            if p2_enabled and provider_batches["perplexity"]:
+                run_aeo_prompt_batch(
+                    provider_batches["perplexity"],
+                    profile,
+                    save=True,
+                    execution_run=run,
+                    providers=["perplexity"],
+                    on_result=_process_result,
+                )
 
     n_mon = len(saved_prompts)
     bounds = aeo_http_call_bounds_for_monitoring(n_mon)
@@ -1074,15 +1103,19 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
     third_g = AEOPromptExecutionAggregate.objects.filter(
         profile=profile, execution_run=run, gemini_third_pass_ran=True
     ).count()
+    third_p = AEOPromptExecutionAggregate.objects.filter(
+        profile=profile, execution_run=run, perplexity_third_pass_ran=True
+    ).count()
     logger.info(
         "[AEO phase2] finished run_id=%s profile_id=%s monitored_prompts=%s http_call_bounds=%s "
-        "third_pass_openai=%s third_pass_gemini=%s extractions_created=%s",
+        "third_pass_openai=%s third_pass_gemini=%s third_pass_perplexity=%s extractions_created=%s",
         run.id,
         profile.id,
         n_mon,
         bounds,
         third_o,
         third_g,
+        third_p,
         extraction_created,
     )
 

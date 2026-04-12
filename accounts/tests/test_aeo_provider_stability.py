@@ -1,7 +1,8 @@
 import pytest
 from django.contrib.auth import get_user_model
+from django.test import override_settings
 
-from accounts.aeo.aeo_execution_utils import PLATFORM_GEMINI, PLATFORM_OPENAI, hash_prompt
+from accounts.aeo.aeo_execution_utils import PLATFORM_GEMINI, PLATFORM_OPENAI, PLATFORM_PERPLEXITY, hash_prompt
 from accounts.aeo.progressive_onboarding import update_prompt_aggregate_from_extraction
 from accounts.models import (
     AEOPromptExecutionAggregate,
@@ -168,6 +169,8 @@ def test_pass_count_reporting_aggregation():
     assert out["total_prompts"] == 2
     assert out["providers"]["openai"]["third_completed"] == 1
     assert out["providers"]["gemini"]["stable_at_2"] >= 1
+    assert "perplexity" in out["providers"]
+    assert out["providers"]["perplexity"]["total"] == 0
 
 
 @pytest.mark.django_db
@@ -305,7 +308,94 @@ def test_combined_rollups_dedupe_within_pass_and_provider_breakdown_deterministi
     assert agg.combined_citation_counts["example.com"] == 2
     assert agg.combined_provider_breakdown["openai"]["citations"]["example.com"] == 2
     assert agg.combined_provider_breakdown["gemini"]["citations"]["sample.org"] == 1
+    assert "perplexity" in agg.combined_provider_breakdown
     assert agg.combined_total_passes_observed == 3
     assert agg.combined_total_unique_competitors >= 2
     assert agg.combined_total_unique_citations >= 2
+
+
+@pytest.mark.django_db
+def test_perplexity_extraction_updates_aggregate_pass_counts_and_history():
+    user = User.objects.create_user(username="ps_p1", email="ps_p1@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile)
+    prompt = "best electric toothbrush"
+    rp = _mk_response(profile, run, prompt, PLATFORM_PERPLEXITY, 0)
+    ep = _mk_extraction(rp, True, competitors=[{"name": "P Co"}], citations=[{"url": "https://p.example/a"}])
+    agg = update_prompt_aggregate_from_extraction(
+        profile=profile,
+        execution_run_id=run.id,
+        response_snapshot=rp,
+        extraction_snapshot=ep,
+        prompt_category="comparison",
+    )
+    assert agg.perplexity_pass_count == 1
+    assert len(agg.perplexity_pass_history_json) == 1
+    assert agg.combined_total_passes_observed == 1
+    assert agg.combined_provider_breakdown["perplexity"]["competitors"]["p co"] == 1
+
+
+@pytest.mark.django_db
+@override_settings(PERPLEXITY_API_KEY="pk-p2")
+def test_phase2_enqueues_perplexity_when_openai_and_gemini_complete():
+    user = User.objects.create_user(username="ps_p2", email="ps_p2@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
+    prompt = "compare project tools"
+    profile.selected_aeo_prompts = [prompt]
+    profile.save(update_fields=["selected_aeo_prompts", "updated_at"])
+
+    for i in range(2):
+        ro = _mk_response(profile, run, prompt, PLATFORM_OPENAI, i)
+        ex = _mk_extraction(ro, True)
+        update_prompt_aggregate_from_extraction(
+            profile=profile, execution_run_id=run.id, response_snapshot=ro, extraction_snapshot=ex, prompt_category="comparison"
+        )
+    for i in range(2):
+        rg = _mk_response(profile, run, prompt, PLATFORM_GEMINI, i)
+        eg = _mk_extraction(rg, True)
+        update_prompt_aggregate_from_extraction(
+            profile=profile, execution_run_id=run.id, response_snapshot=rg, extraction_snapshot=eg, prompt_category="comparison"
+        )
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_batch(prompt_set, business_profile, **kwargs):
+        calls.append(tuple(kwargs.get("providers") or []))
+        return {"executed": 0, "failed": 0, "results": []}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda _rid: None)
+    monkeypatch.setattr("accounts.aeo.aeo_execution_utils.run_aeo_prompt_batch", fake_batch)
+    try:
+        run_aeo_phase2_confidence_task(
+            run.id, [{"prompt": prompt, "type": "transactional", "weight": 1.0, "dynamic": True}]
+        )
+    finally:
+        monkeypatch.undo()
+    assert ("perplexity",) in calls
+
+
+@pytest.mark.django_db
+@override_settings(PERPLEXITY_API_KEY="pk-an")
+def test_pass_count_analytics_includes_perplexity_when_rows_exist():
+    user = User.objects.create_user(username="ps_p3", email="ps_p3@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile)
+    AEOPromptExecutionAggregate.objects.create(
+        profile=profile,
+        execution_run=run,
+        prompt_hash="hx",
+        openai_pass_count=2,
+        gemini_pass_count=2,
+        perplexity_pass_count=2,
+        openai_stability_status="stable",
+        gemini_stability_status="stable",
+        perplexity_stability_status="stable",
+    )
+    out = build_aeo_pass_count_analytics_context(execution_run_id=run.id, profile_id=profile.id)
+    assert out["providers"]["perplexity"]["total"] == 1
+    assert out["providers"]["perplexity"]["stable_at_2"] == 1
+    assert out["perplexity_analytics_in_scope"] is True
+    assert out["prompts_stable_at_2"] == 1
 

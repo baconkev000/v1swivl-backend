@@ -83,6 +83,7 @@ def test_stability_unstable_when_sets_change():
 def test_score_layers_persist_queryable(monkeypatch, settings):
     settings.AEO_TESTING_MODE = True
     settings.AEO_TEST_PROMPT_COUNT = 10
+    settings.PERPLEXITY_API_KEY = ""
     user = User.objects.create_user(username="layer", email="layer@example.com", password="pw")
     profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
     run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)

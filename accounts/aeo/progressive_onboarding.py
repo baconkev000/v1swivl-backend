@@ -10,7 +10,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from ..models import AEOPromptExecutionAggregate, AEOExtractionSnapshot, AEOResponseSnapshot, BusinessProfile
-from .aeo_execution_utils import PLATFORM_GEMINI, PLATFORM_OPENAI, hash_prompt, normalize_aeo_prompt_dict
+from .aeo_execution_utils import PLATFORM_GEMINI, PLATFORM_OPENAI, PLATFORM_PERPLEXITY, hash_prompt, normalize_aeo_prompt_dict
 
 PHASE1_TOTAL_CALLS = 10
 PHASE1_CATEGORIES = ("authority", "comparison", "pricing", "trust", "service")
@@ -169,18 +169,20 @@ def _recompute_combined_rollups(agg: AEOPromptExecutionAggregate) -> None:
     Counting semantics:
     - normalize competitor/citation identities case-insensitively
     - dedupe within each pass (count max once/pass for a normalized key)
-    - sum occurrences across all passes/providers
+    - sum occurrences across all passes/providers (OpenAI, Gemini, Perplexity)
     """
     comp_counts: dict[str, int] = defaultdict(int)
     cit_counts: dict[str, int] = defaultdict(int)
     provider_breakdown: dict[str, dict[str, dict[str, int]]] = {
         PLATFORM_OPENAI: {"competitors": defaultdict(int), "citations": defaultdict(int)},
         PLATFORM_GEMINI: {"competitors": defaultdict(int), "citations": defaultdict(int)},
+        PLATFORM_PERPLEXITY: {"competitors": defaultdict(int), "citations": defaultdict(int)},
     }
 
     for provider, history in (
         (PLATFORM_OPENAI, list(agg.openai_pass_history_json or [])),
         (PLATFORM_GEMINI, list(agg.gemini_pass_history_json or [])),
+        (PLATFORM_PERPLEXITY, list(agg.perplexity_pass_history_json or [])),
     ):
         for row in history:
             if not isinstance(row, dict):
@@ -210,9 +212,13 @@ def _recompute_combined_rollups(agg: AEOPromptExecutionAggregate) -> None:
             "competitors": {k: provider_breakdown[provider]["competitors"][k] for k in sorted(provider_breakdown[provider]["competitors"].keys())},
             "citations": {k: provider_breakdown[provider]["citations"][k] for k in sorted(provider_breakdown[provider]["citations"].keys())},
         }
-        for provider in (PLATFORM_OPENAI, PLATFORM_GEMINI)
+        for provider in (PLATFORM_OPENAI, PLATFORM_GEMINI, PLATFORM_PERPLEXITY)
     }
-    agg.combined_total_passes_observed = int(agg.openai_pass_count or 0) + int(agg.gemini_pass_count or 0)
+    agg.combined_total_passes_observed = (
+        int(agg.openai_pass_count or 0)
+        + int(agg.gemini_pass_count or 0)
+        + int(agg.perplexity_pass_count or 0)
+    )
     agg.combined_total_unique_competitors = len(agg.combined_competitor_counts)
     agg.combined_total_unique_citations = len(agg.combined_citation_counts)
     agg.combined_last_recomputed_at = timezone.now()
@@ -242,31 +248,100 @@ def _provider_stability_from_history(history: list[bool]) -> tuple[str, bool]:
     return AEOPromptExecutionAggregate.STABILITY_UNSTABLE, False
 
 
+def _cross_provider_bool_mismatch(values: list[bool]) -> bool:
+    if len(values) < 2:
+        return False
+    return len(set(values)) > 1
+
+
+def _cross_provider_set_mismatch(sets: list[set[str]]) -> bool:
+    if len(sets) < 2:
+        return False
+    first = sets[0]
+    return any(s != first for s in sets[1:])
+
+
 def recompute_stability(agg: AEOPromptExecutionAggregate) -> tuple[str, list[str]]:
+    """
+    Combined stability across execution providers. When Perplexity AEO is disabled
+    (no API key), only OpenAI + Gemini participate — matching legacy behavior.
+    When enabled, Perplexity is included in pending/unstable/drift checks the same way.
+    """
+    from .perplexity_execution_utils import perplexity_execution_enabled
+
+    use_perplexity = perplexity_execution_enabled()
     openai_status, _ = _provider_stability_from_history(list(agg.openai_brand_mention_history or []))
     gemini_status, _ = _provider_stability_from_history(list(agg.gemini_brand_mention_history or []))
+    perplexity_status, _ = _provider_stability_from_history(list(agg.perplexity_brand_mention_history or []))
+
     reasons: list[str] = []
-    if openai_status == AEOPromptExecutionAggregate.STABILITY_PENDING or gemini_status == AEOPromptExecutionAggregate.STABILITY_PENDING:
+    pending_any = (
+        openai_status == AEOPromptExecutionAggregate.STABILITY_PENDING
+        or gemini_status == AEOPromptExecutionAggregate.STABILITY_PENDING
+        or (use_perplexity and perplexity_status == AEOPromptExecutionAggregate.STABILITY_PENDING)
+    )
+    if pending_any:
         reasons.append("missing_second_provider_or_pass")
-    if agg.openai_last_wrong_url_status in _WRONG_URL_STATUSES or agg.gemini_last_wrong_url_status in _WRONG_URL_STATUSES:
+
+    wrong_any = (
+        agg.openai_last_wrong_url_status in _WRONG_URL_STATUSES
+        or agg.gemini_last_wrong_url_status in _WRONG_URL_STATUSES
+        or (use_perplexity and agg.perplexity_last_wrong_url_status in _WRONG_URL_STATUSES)
+    )
+    if wrong_any:
         reasons.append("wrong_url_attribution_present")
-    if openai_status == AEOPromptExecutionAggregate.STABILITY_UNSTABLE or gemini_status == AEOPromptExecutionAggregate.STABILITY_UNSTABLE:
+
+    unstable_any = (
+        openai_status == AEOPromptExecutionAggregate.STABILITY_UNSTABLE
+        or gemini_status == AEOPromptExecutionAggregate.STABILITY_UNSTABLE
+        or (use_perplexity and perplexity_status == AEOPromptExecutionAggregate.STABILITY_UNSTABLE)
+    )
+    if unstable_any:
         reasons.append("provider_unstable")
-    if bool(agg.last_openai_brand_mentioned) != bool(agg.last_gemini_brand_mentioned):
+
+    brand_vals: list[bool] = []
+    if int(agg.openai_pass_count or 0) > 0:
+        brand_vals.append(bool(agg.last_openai_brand_mentioned))
+    if int(agg.gemini_pass_count or 0) > 0:
+        brand_vals.append(bool(agg.last_gemini_brand_mentioned))
+    if use_perplexity and int(agg.perplexity_pass_count or 0) > 0:
+        brand_vals.append(bool(agg.last_perplexity_brand_mentioned))
+    if _cross_provider_bool_mismatch(brand_vals):
         reasons.append("brand_mention_changed_across_provider")
-    if _material_set(agg.last_openai_citations_json) != _material_set(agg.last_gemini_citations_json):
+
+    cit_sets: list[set[str]] = []
+    if int(agg.openai_pass_count or 0) > 0:
+        cit_sets.append(_material_set(agg.last_openai_citations_json))
+    if int(agg.gemini_pass_count or 0) > 0:
+        cit_sets.append(_material_set(agg.last_gemini_citations_json))
+    if use_perplexity and int(agg.perplexity_pass_count or 0) > 0:
+        cit_sets.append(_material_set(agg.last_perplexity_citations_json))
+    if _cross_provider_set_mismatch(cit_sets):
         reasons.append("citation_set_changed")
-    if _material_set(agg.last_openai_competitors_json) != _material_set(agg.last_gemini_competitors_json):
+
+    comp_sets: list[set[str]] = []
+    if int(agg.openai_pass_count or 0) > 0:
+        comp_sets.append(_material_set(agg.last_openai_competitors_json))
+    if int(agg.gemini_pass_count or 0) > 0:
+        comp_sets.append(_material_set(agg.last_gemini_competitors_json))
+    if use_perplexity and int(agg.perplexity_pass_count or 0) > 0:
+        comp_sets.append(_material_set(agg.last_perplexity_competitors_json))
+    if _cross_provider_set_mismatch(comp_sets):
         reasons.append("competitor_set_changed")
+
     if not reasons:
         return AEOPromptExecutionAggregate.STABILITY_STABLE, []
     if "missing_second_provider_or_pass" in reasons and len(reasons) == 1:
         return AEOPromptExecutionAggregate.STABILITY_PENDING, reasons
-    if (
-        openai_status in {AEOPromptExecutionAggregate.STABILITY_STABLE, AEOPromptExecutionAggregate.STABILITY_STABILIZED_AFTER_THIRD}
-        and gemini_status in {AEOPromptExecutionAggregate.STABILITY_STABLE, AEOPromptExecutionAggregate.STABILITY_STABILIZED_AFTER_THIRD}
-        and "wrong_url_attribution_present" not in reasons
-    ):
+
+    stable_like = {
+        AEOPromptExecutionAggregate.STABILITY_STABLE,
+        AEOPromptExecutionAggregate.STABILITY_STABILIZED_AFTER_THIRD,
+    }
+    o_ok = openai_status in stable_like
+    g_ok = gemini_status in stable_like
+    p_ok = (not use_perplexity) or (perplexity_status in stable_like)
+    if o_ok and g_ok and p_ok and "wrong_url_attribution_present" not in reasons:
         return AEOPromptExecutionAggregate.STABILITY_STABLE, reasons
     return AEOPromptExecutionAggregate.STABILITY_UNSTABLE, reasons
 
@@ -350,9 +425,44 @@ def update_prompt_aggregate_from_extraction(
         agg.gemini_stability_status = gemini_status
         agg.gemini_third_pass_required = bool(gemini_need_third and agg.gemini_pass_count < 3)
         agg.gemini_third_pass_ran = agg.gemini_pass_count >= 3
+    elif response_snapshot.platform == PLATFORM_PERPLEXITY:
+        agg.perplexity_pass_count += 1
+        p_pass_idx = int(agg.perplexity_pass_count or 0)
+        agg.perplexity_brand_mention_history = list(agg.perplexity_brand_mention_history or []) + [
+            bool(extraction_snapshot.brand_mentioned)
+        ]
+        agg.perplexity_pass_history_json = list(agg.perplexity_pass_history_json or []) + [
+            {
+                "pass_index": p_pass_idx,
+                "provider": PLATFORM_PERPLEXITY,
+                "brand_mentioned": bool(extraction_snapshot.brand_mentioned),
+                "competitors": list(extraction_snapshot.competitors_json or []),
+                "citations": list(extraction_snapshot.citations_json or []),
+                "wrong_url_status": str(extraction_snapshot.brand_mentioned_url_status or ""),
+            }
+        ]
+        if extraction_snapshot.brand_mentioned:
+            agg.perplexity_brand_cited_count += 1
+        if extraction_snapshot.brand_mentioned_url_status in _WRONG_URL_STATUSES:
+            agg.perplexity_wrong_url_count += 1
+        agg.last_perplexity_response_snapshot = response_snapshot
+        agg.last_perplexity_competitors_json = extraction_snapshot.competitors_json or []
+        agg.last_perplexity_citations_json = extraction_snapshot.citations_json or []
+        agg.last_perplexity_brand_mentioned = bool(extraction_snapshot.brand_mentioned)
+        agg.perplexity_last_wrong_url_status = str(extraction_snapshot.brand_mentioned_url_status or "")
+        p_status, p_need_third = _provider_stability_from_history(list(agg.perplexity_brand_mention_history or []))
+        agg.perplexity_stability_status = p_status
+        agg.perplexity_third_pass_required = bool(p_need_third and agg.perplexity_pass_count < 3)
+        agg.perplexity_third_pass_ran = agg.perplexity_pass_count >= 3
 
-    agg.total_pass_count = agg.openai_pass_count + agg.gemini_pass_count
-    agg.total_brand_cited_count = agg.openai_brand_cited_count + agg.gemini_brand_cited_count
+    agg.total_pass_count = (
+        agg.openai_pass_count + agg.gemini_pass_count + agg.perplexity_pass_count
+    )
+    agg.total_brand_cited_count = (
+        agg.openai_brand_cited_count
+        + agg.gemini_brand_cited_count
+        + agg.perplexity_brand_cited_count
+    )
     _recompute_combined_rollups(agg)
     status, reasons = recompute_stability(agg)
     agg.stability_status = status
