@@ -293,3 +293,165 @@ def run_single_aeo_prompt_perplexity(
         executed_at=executed_at,
         prompt_hash=ph,
     )
+
+
+def perplexity_chat_completion_raw(
+    *,
+    messages: list[dict[str, Any]],
+    business_profile: BusinessProfile | None = None,
+    temperature: float = 0.35,
+    max_tokens: int = 4096,
+    model: str | None = None,
+    log_operation: str = "perplexity.chat.completions",
+) -> tuple[str, str]:
+    """
+    OpenAI-compatible Chat Completions against Perplexity (no AEO snapshot save).
+
+    Returns ``(assistant_text, error_message)``. ``error_message`` is empty on success.
+    """
+    resolved_model = (model or "").strip() or get_perplexity_aeo_model()
+    if not perplexity_execution_enabled():
+        return "", "skipped_no_api_key"
+
+    api_key = (getattr(settings, "PERPLEXITY_API_KEY", None) or "").strip()
+    timeout = _perplexity_timeout_seconds()
+    attempts = _perplexity_max_attempts()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "model": resolved_model,
+        "messages": messages,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+
+    raw = ""
+    err: str | None = None
+    last_http_status: int | None = None
+    failure_detail: str = ""
+
+    for attempt in range(attempts):
+        try:
+            resp = requests.post(
+                PERPLEXITY_CHAT_COMPLETIONS_URL,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+            op = log_operation or "perplexity.chat.completions"
+            parsed_json = None
+            if resp.content:
+                try:
+                    parsed_json = resp.json()
+                except ValueError:
+                    parsed_json = None
+
+            usage = (parsed_json or {}).get("usage") if isinstance(parsed_json, dict) else None
+            pt = ct = None
+            if isinstance(usage, dict):
+                try:
+                    pt = int(usage.get("prompt_tokens") or 0) or None
+                except (TypeError, ValueError):
+                    pt = None
+                try:
+                    ct = int(usage.get("completion_tokens") or 0) or None
+                except (TypeError, ValueError):
+                    ct = None
+            cost_val = None
+            if isinstance(parsed_json, dict):
+                c = parsed_json.get("cost")
+                if c is not None:
+                    try:
+                        from decimal import Decimal
+
+                        cost_val = Decimal(str(c))
+                    except Exception:
+                        cost_val = None
+
+            record_perplexity_request(
+                operation=f"{op} HTTP {resp.status_code}" if resp.status_code != 200 else op,
+                response_status=resp.status_code,
+                prompt_tokens=pt,
+                completion_tokens=ct,
+                cost_usd=cost_val,
+                business_profile=business_profile,
+            )
+
+            last_http_status = resp.status_code
+            if resp.status_code != 200:
+                failure_detail = (resp.text or "")[:4000]
+                err = f"HTTP {resp.status_code}: {(resp.text or '')[:500]}"
+                logger.warning(
+                    "Perplexity chat completion failed (attempt %s/%s): %s",
+                    attempt + 1,
+                    attempts,
+                    err,
+                )
+                if attempt + 1 < attempts and _is_retryable_perplexity_http(resp.status_code):
+                    time.sleep(1.0)
+                    continue
+                break
+
+            if not isinstance(parsed_json, dict):
+                failure_detail = (resp.text or "")[:4000] or "non-json body"
+                err = "invalid_json_response"
+                break
+
+            choices = parsed_json.get("choices") or []
+            if not choices:
+                failure_detail = (resp.text or "")[:4000] or "empty choices"
+                err = "no_choices"
+                break
+            msg = (choices[0] or {}).get("message") or {}
+            content = msg.get("content")
+            raw = (content or "").strip() if isinstance(content, str) else ""
+            err = None
+            break
+        except requests.Timeout as exc:
+            last_http_status = None
+            failure_detail = str(exc)
+            err = f"TimeoutError: {exc}"
+            logger.warning(
+                "Perplexity chat completion failed (attempt %s/%s): %s",
+                attempt + 1,
+                attempts,
+                err,
+            )
+            if attempt + 1 < attempts:
+                time.sleep(1.0)
+                continue
+            break
+        except Exception as exc:
+            last_http_status = None
+            failure_detail = str(exc)
+            err = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "Perplexity chat completion failed (attempt %s/%s): %s",
+                attempt + 1,
+                attempts,
+                err,
+            )
+            break
+
+    if err is not None and err != "skipped_no_api_key":
+        if err.startswith("TimeoutError"):
+            ek = ThirdPartyApiErrorLog.ErrorKind.TIMEOUT
+        elif last_http_status is not None and last_http_status != 200:
+            ek = ThirdPartyApiErrorLog.ErrorKind.HTTP_ERROR
+        elif err in ("invalid_json_response", "no_choices"):
+            ek = ThirdPartyApiErrorLog.ErrorKind.PARSE_ERROR
+        else:
+            ek = ThirdPartyApiErrorLog.ErrorKind.UNKNOWN_EXCEPTION
+        record_third_party_api_error(
+            provider=ThirdPartyApiProvider.PERPLEXITY,
+            operation=log_operation or "perplexity.chat.completions",
+            error_kind=ek,
+            message=(err or "")[:1024],
+            detail=failure_detail or None,
+            http_status=last_http_status,
+            business_profile=business_profile,
+        )
+
+    return raw, (err or "")

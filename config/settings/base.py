@@ -393,11 +393,18 @@ AEO_RECOMMENDATION_GROUP_GAPS = env.bool("AEO_RECOMMENDATION_GROUP_GAPS", defaul
 # Also accepted: GOOGLE_GEMINI_API_KEY if this is empty (read in gemini_utils).
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="").strip()
 AEO_GEMINI_EXECUTION_MODEL = env("AEO_GEMINI_EXECUTION_MODEL", default="gemini-2.5-flash")
-# Empty → use AEO_GEMINI_EXECUTION_MODEL (see accounts.gemini_utils.get_gemini_review_topics_model).
+# Gemini review topics: only used when ONBOARDING_REVIEW_TOPICS_USE_GEMINI_FALLBACK is True (default off).
+# Empty → use AEO_GEMINI_EXECUTION_MODEL (see accounts.onboarding_review_topics.get_gemini_review_topics_model).
 GEMINI_REVIEW_TOPICS_MODEL = env("GEMINI_REVIEW_TOPICS_MODEL", default="").strip()
 # Perplexity Sonar — optional Phase 2 AEO execution alongside OpenAI/Gemini (see accounts.aeo.perplexity_execution_utils).
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="").strip()
 PERPLEXITY_AEO_MODEL = env("PERPLEXITY_AEO_MODEL", default="sonar").strip() or "sonar"
+# Onboarding crawl ``review_topics`` (domain-only). Empty → same as PERPLEXITY_AEO_MODEL.
+PERPLEXITY_ONBOARDING_REVIEW_TOPICS_MODEL = env("PERPLEXITY_ONBOARDING_REVIEW_TOPICS_MODEL", default="").strip()
+# When False (default), onboarding review topics never call Gemini; set PERPLEXITY_API_KEY or enable fallback.
+ONBOARDING_REVIEW_TOPICS_USE_GEMINI_FALLBACK = env.bool(
+    "ONBOARDING_REVIEW_TOPICS_USE_GEMINI_FALLBACK", default=False
+)
 # Stripe billing / webhook configuration.
 STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY", default="").strip()
 STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET", default="").strip()

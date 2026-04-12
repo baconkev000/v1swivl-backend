@@ -1,9 +1,8 @@
 """
 Onboarding "review topics" — prompt text only (provider-agnostic).
 
-Today: Gemini is called from ``onboarding_review_topics`` with these strings.
-Later: Perplexity or another web-backed model can reuse the same templates;
-only the HTTP client and model id change; edit this file to tune wording.
+Used by ``accounts.onboarding_review_topics`` (Perplexity by default; optional Gemini fallback).
+Edit this file to tune wording; keep the JSON shape stable for ``onboarding_prompt_generation_task``.
 """
 
 # Placeholder: root domain only, e.g. "ramp.com" (no scheme, no path).

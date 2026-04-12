@@ -1,7 +1,10 @@
 """
-Gemini-backed onboarding review topics (domain-only input).
+Onboarding review topics (domain-only input).
 
-Templates live in ``accounts.prompts.review_topics`` so other providers can reuse them.
+Primary: Perplexity Chat Completions when ``PERPLEXITY_API_KEY`` is set.
+Optional: Gemini via ``ONBOARDING_REVIEW_TOPICS_USE_GEMINI_FALLBACK`` (default off).
+
+Templates live in ``accounts.prompts.review_topics`` (shared JSON schema).
 """
 
 from __future__ import annotations
@@ -13,6 +16,11 @@ from typing import Any
 
 from django.conf import settings
 
+from .aeo.perplexity_execution_utils import (
+    get_perplexity_aeo_model,
+    perplexity_chat_completion_raw,
+    perplexity_execution_enabled,
+)
 from .gemini_utils import generate_gemini_execution_text, get_gemini_execution_model
 from .models import BusinessProfile
 from .prompts.review_topics import (
@@ -55,6 +63,13 @@ def get_gemini_review_topics_model() -> str:
     if override:
         return override
     return get_gemini_execution_model()
+
+
+def get_perplexity_onboarding_review_topics_model() -> str:
+    v = (getattr(settings, "PERPLEXITY_ONBOARDING_REVIEW_TOPICS_MODEL", None) or "").strip()
+    if v:
+        return v
+    return get_perplexity_aeo_model()
 
 
 def parse_review_topics_json(raw_text: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -116,22 +131,41 @@ def dedupe_and_cap_topics(items: list[dict[str, Any]], cap: int = MAX_REVIEW_TOP
     return out
 
 
-def generate_review_topics_for_domain(
+def _fetch_review_topics_raw_perplexity(
     *,
-    domain: str,
+    user_text: str,
     business_profile: BusinessProfile | None,
-) -> tuple[list[dict[str, Any]], str]:
-    """
-    Call Gemini with domain-only prompt; return (review_topics, error_string).
+    host: str,
+) -> tuple[str, str]:
+    messages = [
+        {"role": "system", "content": REVIEW_TOPICS_SYSTEM_INSTRUCTION},
+        {"role": "user", "content": user_text},
+    ]
+    raw, err = perplexity_chat_completion_raw(
+        messages=messages,
+        business_profile=business_profile,
+        temperature=0.35,
+        max_tokens=4096,
+        model=get_perplexity_onboarding_review_topics_model(),
+        log_operation="perplexity.chat.completions.onboarding_review_topics",
+    )
+    if err == "skipped_no_api_key":
+        return "", "review_topics_perplexity_not_configured"
+    if err:
+        out_err = f"review_topics_perplexity_failed: {err}"
+        logger.warning("[onboarding review_topics] domain=%s %s", host, out_err)
+        return "", out_err
+    if not (raw or "").strip():
+        return "", "review_topics_empty_model_response"
+    return raw.strip(), ""
 
-    On success error_string is "".
-    """
-    host = normalize_root_domain(domain)
-    if not host or "." not in host:
-        return [], "review_topics_invalid_domain"
 
-    user_text = REVIEW_TOPICS_USER_TEMPLATE.replace(REVIEW_TOPICS_DOMAIN_PLACEHOLDER, host)
-
+def _fetch_review_topics_raw_gemini(
+    *,
+    user_text: str,
+    business_profile: BusinessProfile | None,
+    host: str,
+) -> tuple[str, str]:
     raw, gem_err = generate_gemini_execution_text(
         system_instruction=REVIEW_TOPICS_SYSTEM_INSTRUCTION,
         user_text=user_text,
@@ -144,9 +178,55 @@ def generate_review_topics_for_domain(
     if gem_err:
         err = f"review_topics_gemini_failed: {gem_err}"
         logger.warning("[onboarding review_topics] domain=%s %s", host, err)
-        return [], err
+        return "", err
     if not (raw or "").strip():
-        return [], "review_topics_empty_model_response"
+        return "", "review_topics_empty_model_response"
+    return raw.strip(), ""
+
+
+def generate_review_topics_for_domain(
+    *,
+    domain: str,
+    business_profile: BusinessProfile | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """
+    Produce ``review_topics`` for onboarding (same JSON shape as before).
+
+    Uses Perplexity when ``PERPLEXITY_API_KEY`` is set; otherwise returns an error unless
+    ``ONBOARDING_REVIEW_TOPICS_USE_GEMINI_FALLBACK`` is True (Gemini path).
+
+    On success the second return value is ``""``.
+    """
+    host = normalize_root_domain(domain)
+    if not host or "." not in host:
+        return [], "review_topics_invalid_domain"
+
+    user_text = REVIEW_TOPICS_USER_TEMPLATE.replace(REVIEW_TOPICS_DOMAIN_PLACEHOLDER, host)
+
+    raw: str
+    fetch_err: str
+
+    if perplexity_execution_enabled():
+        raw, fetch_err = _fetch_review_topics_raw_perplexity(
+            user_text=user_text,
+            business_profile=business_profile,
+            host=host,
+        )
+    elif bool(getattr(settings, "ONBOARDING_REVIEW_TOPICS_USE_GEMINI_FALLBACK", False)):
+        raw, fetch_err = _fetch_review_topics_raw_gemini(
+            user_text=user_text,
+            business_profile=business_profile,
+            host=host,
+        )
+    else:
+        logger.warning(
+            "[onboarding review_topics] domain=%s skipped (no PERPLEXITY_API_KEY; Gemini fallback off)",
+            host,
+        )
+        return [], "review_topics_perplexity_not_configured"
+
+    if fetch_err:
+        return [], fetch_err
 
     parsed, parse_err = parse_review_topics_json(raw)
     if parse_err:
