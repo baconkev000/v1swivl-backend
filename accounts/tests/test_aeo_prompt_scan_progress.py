@@ -95,6 +95,9 @@ def test_prompt_coverage_api_includes_scan_fields():
     assert data["prompt_fill_target"] == 10
     assert "aeo_prompt_expansion_status" in data
     assert "aeo_prompt_expansion_last_error" in data
+    assert "visibility_pending_reasons" in data
+    assert data["visibility_pending_reasons"]["execution_inflight"] is False
+    assert "visibility_repair" in data
 
 
 @pytest.mark.django_db

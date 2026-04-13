@@ -108,7 +108,6 @@ def _stripe_get_nested(obj, *path, default=None):
 
 # Prompt coverage + pending checks: stored AEOResponseSnapshot.platform values we surface in the UI.
 _AEO_COVERAGE_PLATFORM_SET = frozenset({"openai", "gemini", "perplexity"})
-_AEO_PENDING_PLATFORM_ORDER = ("openai", "perplexity", "gemini")
 User = get_user_model()
 
 
@@ -1951,7 +1950,10 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
     prompt_scan_completed = prompt_scan_completed_count(
         monitored_keys, by_prompt, latest_snapshot_per_platform
     )
-    visibility_pending = _aeo_profile_visibility_pending(profile)
+    from .aeo.visibility_pending import aeo_visibility_pending_breakdown
+
+    _vis_bd = aeo_visibility_pending_breakdown(profile)
+    visibility_pending = bool(_vis_bd["visibility_pending"])
     prompt_fill_target = aeo_effective_monitored_target_for_profile(profile)
     recommendations_pending = _aeo_recommendations_pipeline_pending(profile)
 
@@ -1988,6 +1990,11 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
         "prompt_scan_total": prompt_scan_total,
         "prompt_scan_completed": prompt_scan_completed,
         "visibility_pending": visibility_pending,
+        "visibility_pending_reasons": {
+            "execution_inflight": bool(_vis_bd["execution_inflight"]),
+            "latest_run_extractions_inflight": bool(_vis_bd["latest_run_extractions_inflight"]),
+            "snapshots_awaiting_extraction": bool(_vis_bd["snapshots_awaiting_extraction"]),
+        },
         "recommendations_pending": recommendations_pending,
         "prompt_fill_completed": selected_prompt_count,
         "prompt_fill_target": prompt_fill_target,
@@ -2127,68 +2134,53 @@ def _aeo_profile_visibility_pending(profile: BusinessProfile) -> bool:
     True while prompt LLM responses or extraction snapshots are still in flight for monitored
     prompts — dashboard should show a loading state instead of partial visibility %.
     """
-    from .models import AEOResponseSnapshot, AEOExecutionRun
+    from .aeo.visibility_pending import aeo_visibility_pending_breakdown
 
-    monitored = [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
-    if not monitored:
-        return False
+    return bool(aeo_visibility_pending_breakdown(profile)["visibility_pending"])
 
-    if AEOExecutionRun.objects.filter(
-        profile=profile,
-        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
-    ).exists():
-        return True
 
-    latest_run = (
-        AEOExecutionRun.objects.filter(profile=profile).order_by("-created_at", "-id").first()
-    )
-    if latest_run is not None and latest_run.status == AEOExecutionRun.STATUS_COMPLETED:
-        if latest_run.extraction_status in (
-            AEOExecutionRun.STAGE_PENDING,
-            AEOExecutionRun.STAGE_RUNNING,
-        ):
-            return True
+def _patch_prompt_coverage_response_live(profile: BusinessProfile, payload: dict) -> None:
+    """
+    Refresh visibility flags from DB (cheap) and optionally enqueue repair; mutates ``payload``.
+    Cached bundle payloads get up-to-date visibility + repair metadata on read.
+    """
+    from django.core.cache import cache
 
-    responses = list(
-        AEOResponseSnapshot.objects.filter(profile=profile)
-        .order_by("-created_at", "-id")
-        .prefetch_related("extraction_snapshots")
-    )
-    by_prompt: dict[str, list] = {}
-    for resp in responses:
-        key = (resp.prompt_text or "").strip()
-        if not key:
-            continue
-        by_prompt.setdefault(key, []).append(resp)
+    from .aeo.aeo_plan_targets import aeo_should_run_post_payment_expansion, aeo_testing_mode
+    from .aeo.visibility_pending import aeo_visibility_pending_breakdown
+    from .tasks import aeo_repair_stalled_visibility_pipeline_task
 
-    def _response_sort_key(x):
-        c = x.created_at
-        if c is None:
-            return (datetime.min.replace(tzinfo=timezone.utc), x.id)
-        if django_timezone.is_naive(c):
-            c = django_timezone.make_aware(c, timezone.utc)
-        return (c, x.id)
+    b = aeo_visibility_pending_breakdown(profile)
+    payload["visibility_pending"] = bool(b["visibility_pending"])
+    payload["visibility_pending_reasons"] = {
+        "execution_inflight": bool(b["execution_inflight"]),
+        "latest_run_extractions_inflight": bool(b["latest_run_extractions_inflight"]),
+        "snapshots_awaiting_extraction": bool(b["snapshots_awaiting_extraction"]),
+    }
 
-    def latest_snapshot_per_platform(rows: list) -> dict[str, object]:
-        best: dict[str, object] = {}
-        for r in sorted(rows, key=_response_sort_key, reverse=True):
-            plat = str(r.platform or "").strip().lower()
-            if plat not in _AEO_COVERAGE_PLATFORM_SET:
-                continue
-            if plat not in best:
-                best[plat] = r
-        return best
-
-    for key in monitored:
-        rows = by_prompt.get(key, [])
-        plat_latest = latest_snapshot_per_platform(rows)
-        for plat in _AEO_PENDING_PLATFORM_ORDER:
-            if plat not in plat_latest:
-                continue
-            resp = plat_latest[plat]
-            if len(resp.extraction_snapshots.all()) == 0:
-                return True
-    return False
+    repair_meta = {"eligible": False, "enqueued": False, "skipped_reason": None}
+    if aeo_testing_mode():
+        repair_meta["skipped_reason"] = "testing_mode"
+    elif not aeo_should_run_post_payment_expansion(profile):
+        repair_meta["skipped_reason"] = "plan_not_eligible"
+    else:
+        repair_meta["eligible"] = True
+        ckey = f"aeo_visibility_repair_tick:{profile.id}"
+        if cache.get(ckey):
+            repair_meta["skipped_reason"] = "throttled"
+        else:
+            cache.set(ckey, 1, timeout=300)
+            try:
+                aeo_repair_stalled_visibility_pipeline_task.delay(profile.id)
+                repair_meta["enqueued"] = True
+            except Exception:
+                logger.exception(
+                    "[aeo_prompt_coverage] repair enqueue failed profile_id=%s",
+                    profile.id,
+                )
+                repair_meta["skipped_reason"] = "enqueue_failed"
+                cache.delete(ckey)
+    payload["visibility_repair"] = repair_meta
 
 
 def _aeo_recommendations_pipeline_pending(profile: BusinessProfile) -> bool:
@@ -2236,6 +2228,16 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
                 "prompt_scan_total": 0,
                 "prompt_scan_completed": 0,
                 "visibility_pending": False,
+                "visibility_pending_reasons": {
+                    "execution_inflight": False,
+                    "latest_run_extractions_inflight": False,
+                    "snapshots_awaiting_extraction": False,
+                },
+                "visibility_repair": {
+                    "eligible": False,
+                    "enqueued": False,
+                    "skipped_reason": "no_profile",
+                },
                 "recommendations_pending": False,
                 "prompt_fill_completed": 0,
                 "prompt_fill_target": aeo_fallback_global_target_count(),
@@ -2252,6 +2254,7 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     payload = _aeo_prompt_coverage_payload_for_api(
         profile, ready_only=ready_only, force_refresh=force_refresh
     )
+    _patch_prompt_coverage_response_live(profile, payload)
     return Response(payload)
 
 

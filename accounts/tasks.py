@@ -1590,6 +1590,8 @@ def aeo_backfill_monitored_prompt_execution_task(
     profile_id: int,
     before_prompt_count: int | None = None,
     after_prompt_count: int | None = None,
+    *,
+    repair: bool = False,
 ) -> None:
     """
     Run Phase 1 for monitored prompts missing full OpenAI + Gemini + Perplexity extractions.
@@ -1614,7 +1616,7 @@ def aeo_backfill_monitored_prompt_execution_task(
     if _is_onboarding_sample_size_profile(profile):
         logger.info("[AEO backfill] skip starter-scale profile profile_id=%s", pid)
         return
-    if not aeo_should_run_post_payment_expansion(profile):
+    if not repair and not aeo_should_run_post_payment_expansion(profile):
         logger.info("[AEO backfill] skip plan not expansion-eligible profile_id=%s", pid)
         return
 
@@ -1671,6 +1673,142 @@ def aeo_backfill_monitored_prompt_execution_task(
         run.finished_at = django_tz.now()
         run.save(update_fields=["status", "error_message", "finished_at", "updated_at"])
         logger.exception("[AEO backfill] phase1 enqueue failed profile_id=%s run_id=%s", pid, run.id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def aeo_repair_stalled_visibility_pipeline_task(self, profile_id: int) -> None:
+    """
+    When the visibility queue is idle but monitored prompts lack triple coverage or Phase-2
+    completion, enqueue the same work as expansion backfill / Phase 2 (no duplicate Phase 1
+    while a run is already active).
+    """
+    from datetime import datetime, timezone as py_tz
+
+    from .aeo.aeo_utils import phase2_prompt_plan_items_for_execution_run
+    from .aeo.prompt_full_ready import (
+        get_latest_aggregate_for_prompt,
+        phase2_passes_complete,
+        recommendations_pipeline_settled_for_visibility,
+        triple_extraction_complete_for_key,
+    )
+    from .aeo.prompt_scan_progress import monitored_prompt_keys_missing_full_coverage
+    from .aeo.visibility_pending import aeo_visibility_pending_breakdown
+    from .models import AEOExecutionRun, AEOResponseSnapshot, BusinessProfile
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).first()
+    if profile is None:
+        return
+    if _is_onboarding_sample_size_profile(profile):
+        return
+    if not aeo_should_run_post_payment_expansion(profile):
+        return
+
+    bd = aeo_visibility_pending_breakdown(profile)
+    if bd["visibility_pending"]:
+        logger.info(
+            "[AEO repair] skip work_in_progress profile_id=%s breakdown=%s",
+            pid,
+            bd,
+        )
+        return
+
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exists()
+    if inflight:
+        logger.info("[AEO repair] skip execution_inflight profile_id=%s", pid)
+        return
+
+    missing = monitored_prompt_keys_missing_full_coverage(profile)
+    if missing:
+        aeo_backfill_monitored_prompt_execution_task.delay(pid, repair=True)
+        logger.info(
+            "[AEO repair] enqueued phase1_backfill profile_id=%s missing=%s",
+            pid,
+            len(missing),
+        )
+        return
+
+    if not recommendations_pipeline_settled_for_visibility(profile):
+        logger.info("[AEO repair] skip recommendations_not_settled profile_id=%s", pid)
+        return
+
+    monitored = [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
+    if not monitored:
+        return
+
+    responses = list(
+        AEOResponseSnapshot.objects.filter(profile=profile).order_by("-created_at", "-id")
+    )
+    by_prompt: dict[str, list] = {}
+    for resp in responses:
+        key = (resp.prompt_text or "").strip()
+        if not key:
+            continue
+        by_prompt.setdefault(key, []).append(resp)
+
+    def _response_sort_key(x) -> tuple:
+        c = x.created_at
+        if c is None:
+            return (datetime.min.replace(tzinfo=py_tz.utc), x.id)
+        if django_tz.is_naive(c):
+            c = django_tz.make_aware(c, py_tz.utc)
+        return (c, x.id)
+
+    def latest_snapshot_per_platform(rows: list) -> dict:
+        best: dict = {}
+        for r in sorted(rows, key=_response_sort_key, reverse=True):
+            plat = str(r.platform or "").strip().lower()
+            if plat not in {"openai", "gemini", "perplexity"}:
+                continue
+            if plat not in best:
+                best[plat] = r
+        return best
+
+    run_ids: set[int] = set()
+    for key in monitored:
+        if not triple_extraction_complete_for_key(key, by_prompt, latest_snapshot_per_platform):
+            continue
+        agg = get_latest_aggregate_for_prompt(profile.id, key)
+        if agg is None or phase2_passes_complete(agg):
+            continue
+        rid = getattr(agg, "execution_run_id", None)
+        if rid:
+            run_ids.add(int(rid))
+
+    if not run_ids:
+        return
+
+    run_id = max(run_ids)
+    run = AEOExecutionRun.objects.filter(pk=run_id, profile=profile).first()
+    if run is None:
+        return
+    if run.status != AEOExecutionRun.STATUS_COMPLETED:
+        return
+    if run.extraction_status != AEOExecutionRun.STAGE_COMPLETED:
+        return
+    if run.scoring_status == AEOExecutionRun.STAGE_COMPLETED:
+        logger.info(
+            "[AEO repair] skip phase2 scoring_already_completed run_id=%s profile_id=%s",
+            run.id,
+            pid,
+        )
+        return
+
+    payload = phase2_prompt_plan_items_for_execution_run(run)
+    if not payload:
+        logger.info("[AEO repair] skip phase2 empty_payload run_id=%s profile_id=%s", run.id, pid)
+        return
+
+    run_aeo_phase2_confidence_task.delay(run.id, payload)
+    logger.info(
+        "[AEO repair] enqueued phase2 run_id=%s profile_id=%s prompts=%s",
+        run.id,
+        pid,
+        len(payload),
+    )
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=30, ignore_result=True)
