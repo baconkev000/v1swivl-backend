@@ -143,7 +143,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         allow_blank=True,
     )
     selected_aeo_prompts = serializers.ListField(
-        child=serializers.CharField(allow_blank=True, max_length=2000),
+        child=serializers.JSONField(required=False),
         required=False,
         allow_empty=True,
     )
@@ -341,7 +341,12 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     def validate_selected_aeo_prompts(self, value):
         if value is None:
             return []
-        out = [str(x).strip() for x in value if str(x).strip()]
+        from accounts.aeo.prompt_storage import normalize_selected_aeo_prompts_payload
+
+        try:
+            out = normalize_selected_aeo_prompts_payload(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
         attrs = getattr(self, "initial_data", None) if isinstance(getattr(self, "initial_data", None), dict) else {}
         cap = aeo_effective_cap_for_validation(getattr(self, "instance", None), attrs or {})
         return out[:cap]

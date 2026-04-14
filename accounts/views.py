@@ -2108,9 +2108,15 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
     )
     from .models import AEOResponseSnapshot, AEORecommendationRun
 
-    selected_prompt_count = len(
-        [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
+    from .aeo.prompt_storage import (
+        custom_prompt_flags_by_text,
+        monitored_prompt_keys_in_order,
+        prompt_text_from_storage_row,
     )
+
+    monitored_keys = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
+    selected_prompt_count = len(monitored_keys)
+    custom_by_cf = custom_prompt_flags_by_text(profile.selected_aeo_prompts)
     profile_site = (getattr(profile, "website_url", None) or "").strip()
     profile_business_name = (getattr(profile, "business_name", None) or "").strip()
 
@@ -2209,7 +2215,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
     ordered_keys: list[str] = []
     seen: set[str] = set()
     for raw in profile.selected_aeo_prompts or []:
-        k = str(raw).strip()
+        k = prompt_text_from_storage_row(raw)
         if not k or k in seen:
             continue
         seen.add(k)
@@ -2220,7 +2226,6 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
 
     from .aeo import prompt_full_ready as aeo_full_ready
 
-    monitored_keys = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
     monitored_set = set(monitored_keys)
     recs_settled = aeo_full_ready.recommendations_pipeline_settled_for_visibility(profile)
 
@@ -2270,6 +2275,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
             {
                 "prompt": key,
                 "prompt_type": prompt_type,
+                "is_custom": bool(custom_by_cf.get(key.casefold())),
                 "competitors_cited": comp_other_businesses,
                 "platforms": platforms,
                 "target_url_position": combined_target,
@@ -2609,6 +2615,113 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     )
     _patch_prompt_coverage_response_live(profile, payload)
     return Response(payload)
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
+    """
+    Append a user-authored custom monitored prompt to ``BusinessProfile.selected_aeo_prompts``
+    and queue Phase 1 (which chains extraction, multi-pass / stability, scoring, recommendations).
+    """
+    import re
+
+    from .aeo.aeo_plan_targets import aeo_effective_monitored_target_for_profile
+    from .aeo.aeo_prompts import AEOPromptType
+    from .aeo.aeo_utils import prompt_record
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order, prompt_text_from_storage_row
+    from .models import AEODashboardBundleCache, AEOExecutionRun
+    from .tasks import run_aeo_phase1_execution_task
+
+    profile = resolve_main_business_profile_for_user(request.user)
+    if profile is None:
+        return Response({"error": "No active business profile."}, status=404)
+    access = viewer_team_access(request.user, profile)
+    if not access.get("viewer_can_edit_company_profile"):
+        return Response({"detail": "You do not have permission to edit monitored prompts."}, status=403)
+
+    body = request.data if isinstance(request.data, dict) else {}
+    prompt_raw = str(body.get("prompt") or "").strip()
+    if not prompt_raw or len(prompt_raw) > 2000:
+        return Response({"error": "A non-empty prompt under 2000 characters is required."}, status=400)
+
+    category = str(body.get("category") or "Comparison").strip()
+    cat_map = {
+        "Comparison": AEOPromptType.COMPARISON,
+        "Feature": AEOPromptType.AUTHORITY,
+        "Use Case": AEOPromptType.SCENARIO,
+        "Category": AEOPromptType.TRANSACTIONAL,
+    }
+    ptype = cat_map.get(category, AEOPromptType.TRANSACTIONAL)
+
+    cap = aeo_effective_monitored_target_for_profile(profile)
+    current = list(profile.selected_aeo_prompts or [])
+    keys = monitored_prompt_keys_in_order(current)
+    if prompt_raw.casefold() in {k.casefold() for k in keys}:
+        return Response({"error": "That prompt is already on your monitored list."}, status=400)
+    if len(keys) >= cap:
+        return Response({"error": f"You can track at most {cap} prompts on your current plan."}, status=400)
+
+    normalized_text = re.sub(r"\s+", " ", prompt_raw).strip()
+    new_row = prompt_record(
+        normalized_text,
+        prompt_type=ptype,
+        weight=1.0,
+        dynamic=True,
+        is_custom=True,
+    )
+
+    with transaction.atomic():
+        locked = BusinessProfile.objects.select_for_update().get(pk=profile.pk)
+        cur = list(locked.selected_aeo_prompts or [])
+        kset = {prompt_text_from_storage_row(x).casefold() for x in cur if prompt_text_from_storage_row(x)}
+        if normalized_text.casefold() in kset:
+            return Response({"error": "That prompt is already on your monitored list."}, status=400)
+        if len(monitored_prompt_keys_in_order(cur)) >= cap:
+            return Response({"error": f"You can track at most {cap} prompts on your current plan."}, status=400)
+        cur.append(dict(new_row))
+        locked.selected_aeo_prompts = cur
+        locked.save(update_fields=["selected_aeo_prompts", "updated_at"])
+
+    profile.refresh_from_db(fields=["selected_aeo_prompts", "updated_at"])
+    AEODashboardBundleCache.objects.filter(profile=profile).delete()
+
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exists()
+    if inflight:
+        return Response(
+            {
+                "ok": True,
+                "queued": False,
+                "reason": "A pipeline run is already in progress; your prompt was saved and will run when it finishes.",
+                "monitored_count": len(monitored_prompt_keys_in_order(profile.selected_aeo_prompts)),
+            },
+            status=200,
+        )
+
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        prompt_count_requested=1,
+        status=AEOExecutionRun.STATUS_PENDING,
+    )
+    transaction.on_commit(
+        lambda rid=run.id, payload=[dict(new_row)]: run_aeo_phase1_execution_task.delay(
+            rid, prompt_set=payload, force_refresh=True
+        )
+    )
+    return Response(
+        {
+            "ok": True,
+            "queued": True,
+            "run_id": run.id,
+            "monitored_count": len(monitored_prompt_keys_in_order(profile.selected_aeo_prompts)),
+        },
+        status=202,
+    )
 
 
 @csrf_exempt
@@ -3042,6 +3155,7 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
     JSON body: ``{"platform": "openai" | "gemini" | "perplexity"}`` — refresh one provider only.
     Does not regenerate the prompt list (onboarding / OpenAI prompt planning unchanged).
     """
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order
     from .models import AEOExecutionRun
     from .tasks import run_aeo_phase1_execution_task
 
@@ -3070,13 +3184,13 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
         )
 
     saved = profile.selected_aeo_prompts or []
-    if not isinstance(saved, list) or not any(str(x).strip() for x in saved):
+    if not isinstance(saved, list) or not monitored_prompt_keys_in_order(saved):
         return Response(
             {"detail": "No saved AEO prompts to refresh. Complete onboarding first."},
             status=400,
         )
 
-    raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved])
+    raw_items = plan_items_from_saved_prompt_strings(saved)
     if not raw_items:
         return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
 
@@ -3144,6 +3258,7 @@ def refresh_aeo_gemini(request: HttpRequest) -> Response:
     Reuses prompt strings stored in BusinessProfile.selected_aeo_prompts and enqueues
     the Gemini-only execution/extraction path.
     """
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order
     from .models import AEOExecutionRun
     from .tasks import run_aeo_gemini_refresh_task
 
@@ -3157,15 +3272,14 @@ def refresh_aeo_gemini(request: HttpRequest) -> Response:
     saved = profile.selected_aeo_prompts or []
     if not isinstance(saved, list):
         saved = []
-    saved_nonempty = [str(x).strip() for x in saved if str(x).strip()]
-    if not saved_nonempty:
+    if not monitored_prompt_keys_in_order(saved):
         return Response(
             {"detail": "No saved AEO prompts to refresh. Complete onboarding first."},
             status=400,
         )
 
     target = aeo_effective_monitored_target_for_profile(profile)
-    selected = plan_items_from_saved_prompt_strings(saved_nonempty)[:target]
+    selected = plan_items_from_saved_prompt_strings(saved, max_items=target)[:target]
     if not selected:
         return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
 
@@ -3217,6 +3331,7 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
     """
     Dedicated Perplexity-only AEO refresh endpoint (same pattern as refresh-gemini).
     """
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order
     from .models import AEOExecutionRun
     from .tasks import run_aeo_perplexity_refresh_task
 
@@ -3230,15 +3345,14 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
     saved = profile.selected_aeo_prompts or []
     if not isinstance(saved, list):
         saved = []
-    saved_nonempty = [str(x).strip() for x in saved if str(x).strip()]
-    if not saved_nonempty:
+    if not monitored_prompt_keys_in_order(saved):
         return Response(
             {"detail": "No saved AEO prompts to refresh. Complete onboarding first."},
             status=400,
         )
 
     target = aeo_effective_monitored_target_for_profile(profile)
-    selected = plan_items_from_saved_prompt_strings(saved_nonempty)[:target]
+    selected = plan_items_from_saved_prompt_strings(saved, max_items=target)[:target]
     if not selected:
         return Response({"detail": "Could not build prompt list from saved prompts."}, status=400)
 
@@ -3533,7 +3647,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
             len(saved_raw) == target_prompt_count
             and _saved_prompts_domain_matches_onboarding_context(profile, website_url_ctx)
         ):
-            raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved_raw])
+            raw_items = plan_items_from_saved_prompt_strings(saved_raw, max_items=target_prompt_count)
             if len(raw_items) == target_prompt_count:
                 ser = _serialize_aeo_prompt_items(raw_items)
                 prompt_texts = [
@@ -3575,7 +3689,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
         reuse_saved = False
 
     if reuse_saved and isinstance(saved_raw, list) and len(saved_raw) == target_prompt_count:
-        raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved_raw])
+        raw_items = plan_items_from_saved_prompt_strings(saved_raw, max_items=target_prompt_count)
         if len(raw_items) == target_prompt_count:
             ser = _serialize_aeo_prompt_items(raw_items)
             biz = aeo_business_input_from_profile(

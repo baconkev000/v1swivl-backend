@@ -363,10 +363,13 @@ def update_prompt_aggregate_from_extraction(
             "prompt_text": response_snapshot.prompt_text,
             "prompt_type": response_snapshot.prompt_type,
             "prompt_category": prompt_category or "",
+            "is_custom_prompt": bool(getattr(response_snapshot, "is_custom_prompt", False)),
         },
     )
     if prompt_category and not agg.prompt_category:
         agg.prompt_category = prompt_category
+    if getattr(response_snapshot, "is_custom_prompt", False):
+        agg.is_custom_prompt = True
     if response_snapshot.platform == PLATFORM_OPENAI:
         agg.openai_pass_count += 1
         openai_pass_idx = int(agg.openai_pass_count or 0)

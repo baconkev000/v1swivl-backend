@@ -514,33 +514,19 @@ def phase2_prompt_plan_items_for_execution_run(run: Any) -> list[dict[str, Any]]
 
 
 def plan_items_from_saved_prompt_strings(
-    texts: Sequence[str],
+    texts: Sequence[Any] | None,
     *,
     max_items: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Normalize stored prompt strings into JSON-ready dicts.
+    Normalize stored prompt rows (strings and/or dicts from ``selected_aeo_prompts``).
 
     When ``max_items`` is None, caps at ``AEO_ONBOARDING_PROMPT_COUNT`` (onboarding / legacy).
     Pass a larger ``max_items`` for Pro/Advanced execution payloads (e.g. expansion backfill).
     """
-    cap = AEO_ONBOARDING_PROMPT_COUNT if max_items is None else max(1, int(max_items))
-    out: list[dict[str, Any]] = []
-    for raw in texts:
-        t = str(raw).strip()
-        if not t:
-            continue
-        out.append(
-            prompt_record(
-                t,
-                prompt_type=AEOPromptType.TRANSACTIONAL,
-                weight=1.0,
-                dynamic=True,
-            )
-        )
-        if len(out) >= cap:
-            break
-    return out
+    from .prompt_storage import plan_items_from_profile_selected
+
+    return plan_items_from_profile_selected(list(texts or []), max_items=max_items)
 
 
 def prompt_record(
@@ -549,14 +535,18 @@ def prompt_record(
     prompt_type: str | AEOPromptType,
     weight: float,
     dynamic: bool,
+    is_custom: bool = False,
 ) -> dict[str, Any]:
     ptype = prompt_type.value if isinstance(prompt_type, AEOPromptType) else str(prompt_type)
-    return {
+    rec: dict[str, Any] = {
         "prompt": re.sub(r"\s+", " ", (text or "").strip()),
         "type": ptype,
         "weight": float(weight),
         "dynamic": bool(dynamic),
     }
+    if is_custom:
+        rec["is_custom"] = True
+    return rec
 
 
 def _clean_token(s: str) -> str:
@@ -701,7 +691,13 @@ def normalize_aeo_prompt_dict(item: Mapping[str, Any]) -> dict[str, Any]:
     dyn = item.get("dynamic")
     if dyn is None:
         dyn = False
-    return prompt_record(text, prompt_type=ptype, weight=w, dynamic=bool(dyn))
+    return prompt_record(
+        text,
+        prompt_type=ptype,
+        weight=w,
+        dynamic=bool(dyn),
+        is_custom=bool(item.get("is_custom")),
+    )
 
 
 def build_openai_batch_user_content(

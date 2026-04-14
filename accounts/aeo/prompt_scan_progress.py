@@ -18,15 +18,9 @@ _AEO_COVERAGE_PLATFORM_SET = frozenset(_AEO_COVERAGE_PLATFORMS_FULL)
 
 def monitored_prompt_keys_in_order(selected_aeo_prompts: list | None) -> list[str]:
     """Stable list of monitored prompt strings, deduped, order preserved."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in selected_aeo_prompts or []:
-        k = str(raw).strip()
-        if not k or k in seen:
-            continue
-        seen.add(k)
-        out.append(k)
-    return out
+    from .prompt_storage import monitored_prompt_keys_in_order as _keys
+
+    return _keys(selected_aeo_prompts)
 
 
 def prompt_scan_completed_count(

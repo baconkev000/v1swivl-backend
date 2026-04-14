@@ -447,6 +447,10 @@ class AEOResponseSnapshot(models.Model):
     )
     prompt_text = models.TextField()
     prompt_type = models.CharField(max_length=32, blank=True, default="")
+    is_custom_prompt = models.BooleanField(
+        default=False,
+        help_text="True when this snapshot was produced from a user-added custom monitored prompt.",
+    )
     weight = models.FloatField(default=1.0)
     is_dynamic = models.BooleanField(default=False)
     platform = models.CharField(max_length=64, default="openai")
@@ -609,6 +613,10 @@ class AEOPromptExecutionAggregate(models.Model):
     prompt_text = models.TextField(blank=True, default="")
     prompt_type = models.CharField(max_length=32, blank=True, default="")
     prompt_category = models.CharField(max_length=32, blank=True, default="")
+    is_custom_prompt = models.BooleanField(
+        default=False,
+        help_text="True when this aggregate row tracks a user-added custom monitored prompt.",
+    )
 
     openai_pass_count = models.IntegerField(default=0)
     gemini_pass_count = models.IntegerField(default=0)

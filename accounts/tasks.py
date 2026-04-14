@@ -884,7 +884,9 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
     profile = run.profile
     saved_prompts = list(prompt_set or [])
     if not saved_prompts:
-        saved_prompts = [{"prompt": p} for p in (profile.selected_aeo_prompts or []) if str(p).strip()]
+        from .aeo.prompt_storage import plan_items_dicts_fallback_from_profile
+
+        saved_prompts = plan_items_dicts_fallback_from_profile(profile)
 
     saved_by_hash = {}
     for p in saved_prompts:
@@ -1157,7 +1159,7 @@ def run_aeo_gemini_refresh_task(
     selected = list(prompt_set or [])
     if not selected:
         saved = profile.selected_aeo_prompts or []
-        selected = plan_items_from_saved_prompt_strings([str(x) for x in saved if str(x).strip()])
+        selected = plan_items_from_saved_prompt_strings(saved)
 
     if not selected:
         run.status = AEOExecutionRun.STATUS_FAILED
@@ -1206,7 +1208,7 @@ def run_aeo_perplexity_refresh_task(
     selected = list(prompt_set or [])
     if not selected:
         saved = profile.selected_aeo_prompts or []
-        selected = plan_items_from_saved_prompt_strings([str(x) for x in saved if str(x).strip()])
+        selected = plan_items_from_saved_prompt_strings(saved)
 
     if not selected:
         run.status = AEOExecutionRun.STATUS_FAILED
@@ -1581,7 +1583,9 @@ def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
 
 
 def _clean_profile_prompts_for_expansion(profile) -> list[str]:
-    return [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order
+
+    return monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
@@ -1735,7 +1739,9 @@ def aeo_repair_stalled_visibility_pipeline_task(self, profile_id: int) -> None:
         logger.info("[AEO repair] skip recommendations_not_settled profile_id=%s", pid)
         return
 
-    monitored = [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order
+
+    monitored = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
     if not monitored:
         return
 
@@ -2182,9 +2188,9 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
         prompt_texts = [str(x.get("prompt") or "").strip() for x in combined if str(x.get("prompt") or "").strip()]
         profile.selected_aeo_prompts = prompt_texts
         profile.save(update_fields=["selected_aeo_prompts", "updated_at"])
-        verify_saved = [
-            str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()
-        ]
+        from .aeo.prompt_storage import monitored_prompt_keys_in_order
+
+        verify_saved = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
         if len(verify_saved) != len(prompt_texts):
             logger.error(
                 "[onboarding prompt-plan] selected_aeo_prompts_save_verify_failed crawl_id=%s profile_id=%s expected=%s got=%s",

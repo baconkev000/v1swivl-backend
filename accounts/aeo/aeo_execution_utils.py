@@ -148,6 +148,7 @@ def save_aeo_response(
     prompt_hash: str | None = None,
     execution_run: AEOExecutionRun | None = None,
     execution_pair_id: UUID | None = None,
+    is_custom_prompt: bool = False,
 ) -> AEOResponseSnapshot:
     """
     Persist one execution row. Computes prompt_hash when omitted.
@@ -159,6 +160,7 @@ def save_aeo_response(
         execution_pair_id=execution_pair_id,
         prompt_text=prompt_text,
         prompt_type=(prompt_type or "")[:32],
+        is_custom_prompt=bool(is_custom_prompt),
         weight=float(weight),
         is_dynamic=bool(is_dynamic),
         platform=(platform or DEFAULT_PLATFORM)[:64],
@@ -282,6 +284,7 @@ def run_single_aeo_prompt(
             prompt_hash=ph,
             execution_run=execution_run,
             execution_pair_id=execution_pair_id,
+            is_custom_prompt=bool(spec.get("is_custom")),
         )
         snapshot_id = snap.id
 

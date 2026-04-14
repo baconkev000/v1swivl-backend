@@ -279,6 +279,7 @@ def run_single_aeo_prompt_perplexity(
             prompt_hash=ph,
             execution_run=execution_run,
             execution_pair_id=execution_pair_id,
+            is_custom_prompt=bool(spec.get("is_custom")),
         )
         snapshot_id = snap.id
 
