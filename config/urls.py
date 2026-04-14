@@ -11,7 +11,7 @@ from drf_spectacular.views import SpectacularAPIView
 from drf_spectacular.views import SpectacularSwaggerView
 from rest_framework.authtoken.views import obtain_auth_token
 
-from swivl.users.views import google_login_redirect_view
+from swivl.users.views import google_login_redirect_view, microsoft_login_redirect_view
 from accounts import views as accounts_views
 
 urlpatterns = [
@@ -27,6 +27,7 @@ urlpatterns = [
     # User management
     path("users/", include("swivl.users.urls", namespace="users")),
     path("auth/google/login/", google_login_redirect_view, name="google-login"),
+    path("auth/microsoft/login/", microsoft_login_redirect_view, name="microsoft-login"),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
     # ...

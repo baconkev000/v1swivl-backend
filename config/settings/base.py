@@ -78,6 +78,7 @@ THIRD_PARTY_APPS = [
     "allauth.mfa",
     "allauth.socialaccount",
     "allauth.socialaccount.providers.google",
+    "allauth.socialaccount.providers.microsoft",
     "rest_framework",
     "rest_framework.authtoken",
     "corsheaders",
@@ -313,6 +314,16 @@ SOCIALACCOUNT_PROVIDERS = {
         "SCOPE": ["email", "profile"],
         "AUTH_PARAMS": {"access_type": "online"},
     },
+    "microsoft": {
+        "APP": {
+            "client_id": env("MICROSOFT_CLIENT_ID", default=""),
+            "secret": env("MICROSOFT_CLIENT_SECRET", default=""),
+            "key": "",
+        },
+        "SCOPE": ["openid", "email", "profile", "User.Read"],
+        "AUTH_PARAMS": {"prompt": "select_account"},
+        "TENANT": env("MICROSOFT_TENANT", default="common"),
+    },
 }
 
 # django-rest-framework
@@ -359,6 +370,9 @@ LOGIN_REDIRECT_URL = f"{FRONTEND_BASE_URL}/onboarding"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "123")
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/accounts/google/login/callback/")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "123")
+MICROSOFT_CLIENT_ID = os.environ.get("MICROSOFT_CLIENT_ID", "")
+MICROSOFT_CLIENT_SECRET = os.environ.get("MICROSOFT_CLIENT_SECRET", "")
+MICROSOFT_TENANT = os.environ.get("MICROSOFT_TENANT", "common")
 GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "123")
 GOOGLE_ADS_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "123")
 DATAFORSEO_LOGIN = os.environ.get("DATAFORSEO_LOGIN", "123")

@@ -50,13 +50,15 @@ class UserRedirectView(LoginRequiredMixin, RedirectView):
 user_redirect_view = UserRedirectView.as_view()
 
 
-def google_login_redirect_view(request: HttpRequest) -> HttpResponseRedirect:
+def _social_login_redirect_view(
+    request: HttpRequest, provider_slug: str
+) -> HttpResponseRedirect:
     """
-    Entry point used by the frontend Google button.
+    Entry point used by frontend social auth buttons.
 
-    Redirects into django-allauth's Google login view and passes along an
-    optional `next` parameter so that, after Google completes, the user is
-    sent back to the desired frontend path (e.g. `/onboarding`).
+    Redirects into django-allauth's provider login view and passes along an
+    optional ``next`` parameter so that, after OAuth completes, the user is
+    sent back to the desired frontend path (e.g. ``/onboarding``).
     """
     # Default /app: Next middleware sends incomplete users to /onboarding.
     frontend_next = request.GET.get("next") or "/app"
@@ -66,4 +68,24 @@ def google_login_redirect_view(request: HttpRequest) -> HttpResponseRedirect:
         frontend_next = f"{base}{path}"
 
     qs = urlencode({"next": frontend_next})
-    return redirect(f"/accounts/google/login/?{qs}")
+    return redirect(f"/accounts/{provider_slug}/login/?{qs}")
+
+
+def google_login_redirect_view(request: HttpRequest) -> HttpResponseRedirect:
+    """
+    Entry point used by the frontend Google button.
+
+    Redirects into django-allauth's Google login view and passes along an
+    optional `next` parameter so that, after Google completes, the user is
+    sent back to the desired frontend path (e.g. `/onboarding`).
+    """
+    return _social_login_redirect_view(request, "google")
+
+
+def microsoft_login_redirect_view(request: HttpRequest) -> HttpResponseRedirect:
+    """
+    Entry point used by the frontend Outlook button.
+
+    Uses django-allauth's Microsoft provider.
+    """
+    return _social_login_redirect_view(request, "microsoft")

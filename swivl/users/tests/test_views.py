@@ -17,6 +17,8 @@ from swivl.users.models import User
 from swivl.users.tests.factories import UserFactory
 from swivl.users.views import UserRedirectView
 from swivl.users.views import UserUpdateView
+from swivl.users.views import google_login_redirect_view
+from swivl.users.views import microsoft_login_redirect_view
 from swivl.users.views import user_detail_view
 
 pytestmark = pytest.mark.django_db
@@ -99,3 +101,25 @@ class TestUserDetailView:
         assert isinstance(response, HttpResponseRedirect)
         assert response.status_code == HTTPStatus.FOUND
         assert response.url == f"{login_url}?next=/fake-url/"
+
+
+def test_google_login_redirect_view_uses_frontend_next(rf: RequestFactory, settings):
+    settings.FRONTEND_BASE_URL = "https://app.ripplerank.ai"
+    request = rf.get("/auth/google/login/", {"next": "/app"})
+    response = google_login_redirect_view(request)
+    assert response.status_code == HTTPStatus.FOUND
+    assert (
+        response.url
+        == "/accounts/google/login/?next=https%3A%2F%2Fapp.ripplerank.ai%2Fapp"
+    )
+
+
+def test_microsoft_login_redirect_view_uses_frontend_next(rf: RequestFactory, settings):
+    settings.FRONTEND_BASE_URL = "https://app.ripplerank.ai"
+    request = rf.get("/auth/microsoft/login/", {"next": "/app"})
+    response = microsoft_login_redirect_view(request)
+    assert response.status_code == HTTPStatus.FOUND
+    assert (
+        response.url
+        == "/accounts/microsoft/login/?next=https%3A%2F%2Fapp.ripplerank.ai%2Fapp"
+    )
