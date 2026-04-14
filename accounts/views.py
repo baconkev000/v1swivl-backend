@@ -63,6 +63,7 @@ from . import openai_utils
 from . import debug_log as _debug
 from .aeo.prompt_scan_progress import monitored_prompt_keys_in_order, prompt_scan_completed_count
 from .aeo.aeo_plan_targets import (
+    aeo_effective_custom_prompt_cap_for_profile,
     aeo_effective_monitored_target_for_profile,
     aeo_fallback_global_target_count,
     aeo_monitored_prompt_cap_for_plan_slug,
@@ -2631,7 +2632,11 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     from .aeo.aeo_plan_targets import aeo_effective_monitored_target_for_profile
     from .aeo.aeo_prompts import AEOPromptType
     from .aeo.aeo_utils import prompt_record
-    from .aeo.prompt_storage import monitored_prompt_keys_in_order, prompt_text_from_storage_row
+    from .aeo.prompt_storage import (
+        count_custom_prompts_in_selected,
+        monitored_prompt_keys_in_order,
+        prompt_text_from_storage_row,
+    )
     from .models import AEODashboardBundleCache, AEOExecutionRun
     from .tasks import run_aeo_phase1_execution_task
 
@@ -2647,27 +2652,25 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     if not prompt_raw or len(prompt_raw) > 2000:
         return Response({"error": "A non-empty prompt under 2000 characters is required."}, status=400)
 
-    category = str(body.get("category") or "Comparison").strip()
-    cat_map = {
-        "Comparison": AEOPromptType.COMPARISON,
-        "Feature": AEOPromptType.AUTHORITY,
-        "Use Case": AEOPromptType.SCENARIO,
-        "Category": AEOPromptType.TRANSACTIONAL,
-    }
-    ptype = cat_map.get(category, AEOPromptType.TRANSACTIONAL)
-
     cap = aeo_effective_monitored_target_for_profile(profile)
+    custom_cap = aeo_effective_custom_prompt_cap_for_profile(profile)
     current = list(profile.selected_aeo_prompts or [])
     keys = monitored_prompt_keys_in_order(current)
+    custom_n = count_custom_prompts_in_selected(current)
     if prompt_raw.casefold() in {k.casefold() for k in keys}:
         return Response({"error": "That prompt is already on your monitored list."}, status=400)
     if len(keys) >= cap:
         return Response({"error": f"You can track at most {cap} prompts on your current plan."}, status=400)
+    if custom_n >= custom_cap:
+        return Response(
+            {"error": f"You can add at most {custom_cap} custom prompts on your current plan."},
+            status=400,
+        )
 
     normalized_text = re.sub(r"\s+", " ", prompt_raw).strip()
     new_row = prompt_record(
         normalized_text,
-        prompt_type=ptype,
+        prompt_type=AEOPromptType.TRANSACTIONAL,
         weight=1.0,
         dynamic=True,
         is_custom=True,
@@ -2681,6 +2684,11 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
             return Response({"error": "That prompt is already on your monitored list."}, status=400)
         if len(monitored_prompt_keys_in_order(cur)) >= cap:
             return Response({"error": f"You can track at most {cap} prompts on your current plan."}, status=400)
+        if count_custom_prompts_in_selected(cur) >= custom_cap:
+            return Response(
+                {"error": f"You can add at most {custom_cap} custom prompts on your current plan."},
+                status=400,
+            )
         cur.append(dict(new_row))
         locked.selected_aeo_prompts = cur
         locked.save(update_fields=["selected_aeo_prompts", "updated_at"])

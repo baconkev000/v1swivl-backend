@@ -25,6 +25,11 @@ def row_is_custom(raw: Any) -> bool:
     return False
 
 
+def count_custom_prompts_in_selected(selected_aeo_prompts: list | None) -> int:
+    """How many stored rows are flagged ``is_custom`` (dict rows only; legacy strings are not custom)."""
+    return sum(1 for raw in (selected_aeo_prompts or []) if row_is_custom(raw))
+
+
 def monitored_prompt_keys_in_order(selected_aeo_prompts: list | None) -> list[str]:
     """Stable list of monitored prompt strings, deduped, order preserved."""
     out: list[str] = []

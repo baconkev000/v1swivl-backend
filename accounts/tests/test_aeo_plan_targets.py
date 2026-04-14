@@ -2,9 +2,14 @@ import pytest
 from django.contrib.auth import get_user_model
 
 from accounts.aeo.aeo_plan_targets import (
+    AEO_CUSTOM_PROMPT_CAP_ADVANCED,
+    AEO_CUSTOM_PROMPT_CAP_PRO,
+    AEO_CUSTOM_PROMPT_CAP_STARTER,
     AEO_PLAN_CAP_ADVANCED,
     AEO_PLAN_CAP_PRO,
     AEO_PLAN_CAP_STARTER,
+    aeo_custom_monitored_prompt_cap_for_plan_slug,
+    aeo_effective_custom_prompt_cap_for_profile,
     aeo_effective_monitored_target_for_profile,
     aeo_http_call_bounds_for_monitoring,
     aeo_monitored_prompt_cap_for_plan_slug,
@@ -21,6 +26,24 @@ def test_cap_by_plan_slug():
     assert aeo_monitored_prompt_cap_for_plan_slug("starter") == AEO_PLAN_CAP_STARTER
     assert aeo_monitored_prompt_cap_for_plan_slug("pro") == AEO_PLAN_CAP_PRO
     assert aeo_monitored_prompt_cap_for_plan_slug("advanced") == AEO_PLAN_CAP_ADVANCED
+
+
+@pytest.mark.django_db
+def test_custom_cap_by_plan_slug():
+    assert aeo_custom_monitored_prompt_cap_for_plan_slug("") == AEO_CUSTOM_PROMPT_CAP_STARTER
+    assert aeo_custom_monitored_prompt_cap_for_plan_slug("starter") == AEO_CUSTOM_PROMPT_CAP_STARTER
+    assert aeo_custom_monitored_prompt_cap_for_plan_slug("pro") == AEO_CUSTOM_PROMPT_CAP_PRO
+    assert aeo_custom_monitored_prompt_cap_for_plan_slug("advanced") == AEO_CUSTOM_PROMPT_CAP_ADVANCED
+
+
+@pytest.mark.django_db
+def test_effective_custom_cap_matches_plan(settings):
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="t3@example.com", email="t3@example.com", password="x")
+    adv = BusinessProfile.objects.create(
+        user=user, is_main=True, business_name="C", plan=BusinessProfile.PLAN_ADVANCED
+    )
+    assert aeo_effective_custom_prompt_cap_for_profile(adv) == AEO_CUSTOM_PROMPT_CAP_ADVANCED
 
 
 @pytest.mark.django_db

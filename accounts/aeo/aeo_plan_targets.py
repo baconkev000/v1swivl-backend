@@ -1,7 +1,11 @@
 """
 Plan-derived monitored AEO prompt targets (production).
 
-Starter: 10 | Pro: 50 | Advanced: 100. PLAN_NONE and starter both use the starter cap.
+Starter: 10 | Pro: 50 | Advanced: 100 — total monitored prompts per plan.
+
+Custom prompts (user-added) caps: Starter 10 | Pro 25 | Advanced 100.
+
+PLAN_NONE and starter both use the starter caps.
 
 Testing: AEO_TESTING_MODE + AEO_TEST_PROMPT_COUNT override plan (keeps tests small).
 
@@ -20,6 +24,10 @@ AEO_PLAN_CAP_STARTER: int = 10
 AEO_PLAN_CAP_PRO: int = 50
 AEO_PLAN_CAP_ADVANCED: int = 100
 
+AEO_CUSTOM_PROMPT_CAP_STARTER: int = 10
+AEO_CUSTOM_PROMPT_CAP_PRO: int = 25
+AEO_CUSTOM_PROMPT_CAP_ADVANCED: int = 100
+
 
 def aeo_monitored_prompt_cap_for_plan_slug(plan: str) -> int:
     p = (plan or "").strip().lower()
@@ -28,6 +36,15 @@ def aeo_monitored_prompt_cap_for_plan_slug(plan: str) -> int:
     if p == BusinessProfile.PLAN_ADVANCED:
         return AEO_PLAN_CAP_ADVANCED
     return AEO_PLAN_CAP_STARTER
+
+
+def aeo_custom_monitored_prompt_cap_for_plan_slug(plan: str) -> int:
+    p = (plan or "").strip().lower()
+    if p == BusinessProfile.PLAN_PRO:
+        return AEO_CUSTOM_PROMPT_CAP_PRO
+    if p == BusinessProfile.PLAN_ADVANCED:
+        return AEO_CUSTOM_PROMPT_CAP_ADVANCED
+    return AEO_CUSTOM_PROMPT_CAP_STARTER
 
 
 def aeo_testing_mode() -> bool:
@@ -54,6 +71,22 @@ def aeo_effective_monitored_target_for_profile(profile: BusinessProfile | None) 
     if aeo_testing_mode():
         return aeo_testing_target_count()
     return aeo_monitored_prompt_cap_for_plan_slug(profile.plan)
+
+
+def aeo_effective_custom_prompt_cap_for_profile(profile: BusinessProfile | None) -> int:
+    """
+    Max user-authored (``is_custom``) monitored prompts for the plan.
+
+    In testing mode, caps at the effective monitored target so append flows stay small.
+    """
+    base = aeo_custom_monitored_prompt_cap_for_plan_slug(
+        profile.plan if profile is not None else ""
+    )
+    if profile is None:
+        return base
+    if aeo_testing_mode():
+        return min(base, aeo_effective_monitored_target_for_profile(profile))
+    return base
 
 
 def aeo_onboarding_complete_min_prompts(profile: BusinessProfile) -> int:
