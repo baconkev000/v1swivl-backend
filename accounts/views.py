@@ -111,6 +111,43 @@ _AEO_COVERAGE_PLATFORM_SET = frozenset({"openai", "gemini", "perplexity"})
 User = get_user_model()
 
 
+def _money_minor_to_decimal_str(amount_minor: int | None) -> str:
+    if amount_minor is None:
+        return "0.00"
+    return f"{(int(amount_minor) / 100):.2f}"
+
+
+def _plan_label_from_slug(raw_plan: str) -> str:
+    k = (raw_plan or "").strip().lower()
+    if k == "pro":
+        return "Pro"
+    if k in {"advanced", "enterprise", "scale"}:
+        return "Advanced"
+    if k == "starter":
+        return "Starter"
+    return "Starter"
+
+
+def _monthly_price_from_price_obj(price_obj: dict) -> tuple[str, int | None]:
+    """
+    Return display and integer cents/month from Stripe price.
+    """
+    unit_amount = price_obj.get("unit_amount")
+    recurring = price_obj.get("recurring") or {}
+    if not isinstance(unit_amount, int) or unit_amount < 0:
+        return "0.00", None
+    interval = str(recurring.get("interval") or "").strip().lower()
+    interval_count_raw = recurring.get("interval_count")
+    interval_count = int(interval_count_raw) if isinstance(interval_count_raw, int) and interval_count_raw > 0 else 1
+    monthly_minor = unit_amount
+    if interval == "year":
+        # Convert yearly to monthly equivalent.
+        monthly_minor = round(unit_amount / float(12 * interval_count))
+    elif interval == "month":
+        monthly_minor = round(unit_amount / float(interval_count))
+    return _money_minor_to_decimal_str(monthly_minor), int(monthly_minor)
+
+
 def _seo_snapshot_context_for_profile(profile: BusinessProfile | None) -> tuple[str, int]:
     """Resolve snapshot identity context for SEO snapshots."""
     return seo_snapshot_context_for_profile(profile)
@@ -1386,6 +1423,134 @@ def business_profile_checkout_identity(request: HttpRequest) -> Response:
             "is_main": bool(profile.is_main),
         },
     )
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def billing_summary(request: HttpRequest) -> Response:
+    """
+    Stripe-backed billing summary for the authenticated user's main business profile.
+    """
+    profile = _resolve_main_business_profile_for_user(request.user)
+    if profile is None:
+        return Response({"error": "No active business profile."}, status=404)
+
+    out = {
+        "plan_label": _plan_label_from_slug(str(getattr(profile, "plan", "") or "")),
+        "price_month": "0.00",
+        "renewal_date": None,
+        "currency": "usd",
+        "invoices": [],
+    }
+
+    customer_id = str(getattr(profile, "stripe_customer_id", "") or "").strip()
+    subscription_id = str(getattr(profile, "stripe_subscription_id", "") or "").strip()
+    period_end = getattr(profile, "stripe_current_period_end", None)
+    if period_end is not None:
+        out["renewal_date"] = period_end.isoformat()
+
+    secret = str(getattr(settings, "STRIPE_SECRET_KEY", "") or "").strip()
+    if not secret or not customer_id:
+        return Response(out)
+
+    stripe.api_key = secret
+
+    subscription_dict: dict | None = None
+    if subscription_id:
+        try:
+            subscription = stripe.Subscription.retrieve(
+                subscription_id,
+                expand=["items.data.price"],
+            )
+            nsub = normalize_stripe_payload(subscription)
+            if isinstance(nsub, dict):
+                subscription_dict = nsub
+        except Exception:
+            logger.exception("[billing_summary] failed to retrieve Stripe subscription id=%s", subscription_id)
+
+    if subscription_dict is None:
+        try:
+            listed = stripe.Subscription.list(
+                customer=customer_id,
+                status="all",
+                limit=5,
+                expand=["data.items.data.price"],
+            )
+            nlisted = normalize_stripe_payload(listed)
+            rows = nlisted.get("data", []) if isinstance(nlisted, dict) else []
+            if isinstance(rows, list) and rows:
+                subscription_dict = rows[0] if isinstance(rows[0], dict) else None
+        except Exception:
+            logger.exception("[billing_summary] failed to list Stripe subscriptions customer=%s", customer_id)
+
+    if isinstance(subscription_dict, dict):
+        items = subscription_dict.get("items", {}).get("data", [])
+        first_item = items[0] if isinstance(items, list) and items else {}
+        price_obj = first_item.get("price") if isinstance(first_item, dict) else {}
+        if isinstance(price_obj, dict):
+            monthly_price, _monthly_minor = _monthly_price_from_price_obj(price_obj)
+            out["price_month"] = monthly_price
+            out["currency"] = str(price_obj.get("currency") or "usd").lower()
+        sub_period_end = subscription_dict.get("current_period_end")
+        if isinstance(sub_period_end, int):
+            dt = _safe_dt_from_unix(sub_period_end)
+            if dt is not None:
+                out["renewal_date"] = dt.isoformat()
+                if getattr(profile, "stripe_current_period_end", None) is None:
+                    try:
+                        profile.stripe_current_period_end = dt
+                        profile.save(update_fields=["stripe_current_period_end", "updated_at"])
+                    except Exception:
+                        logger.exception("[billing_summary] failed to persist fallback renewal profile_id=%s", profile.id)
+
+    latest_paid_at: datetime | None = None
+    try:
+        inv_list = stripe.Invoice.list(customer=customer_id, limit=12)
+        ninv = normalize_stripe_payload(inv_list)
+        rows = ninv.get("data", []) if isinstance(ninv, dict) else []
+        invoices_out: list[dict] = []
+        if isinstance(rows, list):
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    continue
+                created_unix = raw.get("created")
+                created_dt = _safe_dt_from_unix(created_unix if isinstance(created_unix, int) else None)
+                status = str(raw.get("status") or "").strip().lower() or "unknown"
+                paid_at_unix = raw.get("status_transitions", {}).get("paid_at")
+                paid_at = _safe_dt_from_unix(paid_at_unix if isinstance(paid_at_unix, int) else None)
+                if status == "paid" and paid_at is not None and (
+                    latest_paid_at is None or paid_at > latest_paid_at
+                ):
+                    latest_paid_at = paid_at
+                amount_minor = raw.get("amount_paid")
+                if not isinstance(amount_minor, int):
+                    amount_minor = raw.get("amount_due") if isinstance(raw.get("amount_due"), int) else 0
+                invoices_out.append(
+                    {
+                        "id": str(raw.get("number") or raw.get("id") or "").strip(),
+                        "date": created_dt.isoformat() if created_dt else None,
+                        "amount": _money_minor_to_decimal_str(amount_minor),
+                        "currency": str(raw.get("currency") or out["currency"] or "usd").lower(),
+                        "status": status.title(),
+                    }
+                )
+        out["invoices"] = invoices_out
+    except Exception:
+        logger.exception("[billing_summary] failed to list Stripe invoices customer=%s", customer_id)
+
+    # Fallback renewal date: 30 days from latest successful payment.
+    if out.get("renewal_date") is None and latest_paid_at is not None:
+        fallback = latest_paid_at + timedelta(days=30)
+        out["renewal_date"] = fallback.isoformat()
+        try:
+            profile.stripe_current_period_end = fallback
+            profile.save(update_fields=["stripe_current_period_end", "updated_at"])
+        except Exception:
+            logger.exception("[billing_summary] failed to persist renewal fallback profile_id=%s", profile.id)
+
+    return Response(out)
 
 
 @csrf_exempt
