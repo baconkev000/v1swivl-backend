@@ -180,6 +180,48 @@ class BusinessProfile(models.Model):
         return f"BusinessProfile(user={self.user!s})"
 
 
+class BusinessProfileMembership(models.Model):
+    """
+    Links a User to a BusinessProfile (team workspace).
+
+    The main billing account holder is marked ``is_owner=True`` (one per profile).
+    ``role`` distinguishes admins (full product access) from read-only members.
+    """
+
+    ROLE_ADMIN = "admin"
+    ROLE_MEMBER = "member"
+    ROLE_CHOICES = [
+        (ROLE_ADMIN, "Admin"),
+        (ROLE_MEMBER, "Member"),
+    ]
+
+    business_profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="team_memberships",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="business_profile_memberships",
+    )
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES, default=ROLE_MEMBER)
+    is_owner = models.BooleanField(
+        default=False,
+        help_text="True for the primary account holder (billing owner) of this business profile.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("business_profile", "user")
+        indexes = [
+            models.Index(fields=["user"]),
+            models.Index(fields=["business_profile"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"BusinessProfileMembership(profile={self.business_profile_id}, user={self.user_id})"
 
 
 class SEOOverviewSnapshot(models.Model):

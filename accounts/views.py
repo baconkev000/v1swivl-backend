@@ -19,11 +19,18 @@ from rest_framework.decorators import api_view, permission_classes, authenticati
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
+from .business_profile_access import (
+    get_membership,
+    resolve_main_business_profile_for_user,
+    viewer_team_access,
+    workspace_data_user,
+)
 from .models import (
     AEOCompetitorSnapshot,
     AEODashboardBundleCache,
     AgentActivityLog,
     BusinessProfile,
+    BusinessProfileMembership,
     SEOOverviewSnapshot,
     AgentConversation,
     AgentMessage,
@@ -439,11 +446,6 @@ def _onboarding_domain_claimed_by_other_user(domain: str, user) -> bool:
     return False
 
 
-def _resolve_main_business_profile_for_user(user):
-    profile_qs = BusinessProfile.objects.filter(user=user)
-    return profile_qs.filter(is_main=True).first() or profile_qs.first()
-
-
 def _onboarding_reusable_crawl_for_user(user, domain: str) -> OnboardingOnPageCrawl | None:
     """Latest completed onboarding crawl for this user/domain with keywords and/or review topics."""
     if not domain:
@@ -515,10 +517,17 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
         )
 
     try:
-        profile_qs = BusinessProfile.objects.filter(user=request.user)
-        profile = profile_qs.filter(is_main=True).first() or profile_qs.first()
+        profile = resolve_main_business_profile_for_user(request.user)
         if profile is None:
             profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+            BusinessProfileMembership.objects.get_or_create(
+                business_profile=profile,
+                user=request.user,
+                defaults={
+                    "role": BusinessProfileMembership.ROLE_ADMIN,
+                    "is_owner": True,
+                },
+            )
 
         crawl = OnboardingOnPageCrawl.objects.create(
             user=request.user,
@@ -644,7 +653,15 @@ def api_auth_register(request: HttpRequest) -> Response:
         return Response({"error": "An account with this email already exists"}, status=400)
     user = User.objects.create_user(username=email, email=email, password=password)
     if not BusinessProfile.objects.filter(user=user).exists():
-        BusinessProfile.objects.create(user=user, is_main=True)
+        bp = BusinessProfile.objects.create(user=user, is_main=True)
+        BusinessProfileMembership.objects.get_or_create(
+            business_profile=bp,
+            user=user,
+            defaults={
+                "role": BusinessProfileMembership.ROLE_ADMIN,
+                "is_owner": True,
+            },
+        )
     login(request, user)
     return Response({"ok": True, "redirect": "/onboarding"})
 
@@ -875,17 +892,16 @@ def seo_overview(request: HttpRequest) -> Response:
     cache_ttl = int(THIRD_PARTY_CACHE_TTL.total_seconds())
     force_refresh = request.GET.get("refresh") == "1"
 
-    profile_for_context = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
+    profile_for_context = profile
+    data_user = workspace_data_user(profile) or request.user
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile_for_context)
 
     # Serve from cache if we have a snapshot for this period fetched within the last hour (unless refresh=1).
     if not force_refresh:
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
-                user=request.user,
+                user=data_user,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
@@ -927,10 +943,6 @@ def seo_overview(request: HttpRequest) -> Response:
     try:
         # Cache miss, stale, or refresh=1: call DataForSEO Labs ranked_keywords API.
         # Always use the user's main business profile (selected in Settings).
-        profile = (
-            BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-            or BusinessProfile.objects.filter(user=request.user).first()
-        )
         site_url = profile.website_url if profile and profile.website_url else ""
         if not site_url:
             return Response(
@@ -951,7 +963,7 @@ def seo_overview(request: HttpRequest) -> Response:
 
         # If the website domain has changed since the last fetch, force a fresh
         # DataForSEO call instead of using cached snapshots.
-        domain_cache_key = f"seo_overview_domain:{request.user.id}"
+        domain_cache_key = f"seo_overview_domain:{data_user.id}"
         previous_domain = cache.get(domain_cache_key)
         if previous_domain and previous_domain != domain:
             force_refresh = True
@@ -991,7 +1003,7 @@ def seo_overview(request: HttpRequest) -> Response:
             )
             try:
                 snapshot = SEOOverviewSnapshot.objects.get(
-                    user=request.user,
+                    user=data_user,
                     period_start=start_current,
                     cached_location_mode=snapshot_mode,
                     cached_location_code=snapshot_location_code,
@@ -1025,7 +1037,7 @@ def seo_overview(request: HttpRequest) -> Response:
         # Compute growth vs previous snapshot visibility (stored in organic_visitors).
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
-                user=request.user,
+                user=data_user,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
@@ -1040,7 +1052,7 @@ def seo_overview(request: HttpRequest) -> Response:
             organic_growth_pct = ((current_visibility - prev_vis) / prev_vis) * 100.0
 
         snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
-            user=request.user,
+            user=data_user,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
@@ -1089,10 +1101,8 @@ def seo_keywords(request: HttpRequest) -> Response:
     """
     force_refresh = request.GET.get("refresh") == "1"
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
+    data_user = workspace_data_user(profile) or request.user
     site_url = profile.website_url if profile and profile.website_url else ""
     if not site_url:
         return Response({"keywords": []})
@@ -1107,7 +1117,7 @@ def seo_keywords(request: HttpRequest) -> Response:
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
     snapshot = (
         SEOOverviewSnapshot.objects.filter(
-            user=request.user,
+            user=data_user,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -1127,13 +1137,13 @@ def seo_keywords(request: HttpRequest) -> Response:
     # Recompute snapshot only on explicit refresh or once snapshot is stale.
     if force_refresh or not snapshot_fresh:
         get_or_refresh_seo_score_for_user(
-            request.user,
+            data_user,
             site_url=site_url,
             force_refresh=force_refresh,
         )
         snapshot = (
             SEOOverviewSnapshot.objects.filter(
-                user=request.user,
+                user=data_user,
                 period_start=start_current,
                 cached_domain__iexact=domain,
                 cached_location_mode=snapshot_mode,
@@ -1219,15 +1229,13 @@ def seo_keyword_debug(request: HttpRequest) -> Response:
 
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
+    data_user = workspace_data_user(profile) or request.user
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
 
     snapshot = (
         SEOOverviewSnapshot.objects.filter(
-            user=request.user,
+            user=data_user,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
@@ -1353,12 +1361,27 @@ def business_profile(request: HttpRequest) -> Response:
     in the serializer (returns null/empty SEO fields and a stub AEO bundle). Use during onboarding
     to avoid paid API calls when only updating basic fields.
     """
-    profile_qs = BusinessProfile.objects.filter(user=request.user).prefetch_related(
-        "tracked_competitors",
-    )
-    profile = _resolve_main_business_profile_for_user(request.user)
+    profile = resolve_main_business_profile_for_user(request.user)
     if profile is None:
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+        BusinessProfileMembership.objects.get_or_create(
+            business_profile=profile,
+            user=request.user,
+            defaults={
+                "role": BusinessProfileMembership.ROLE_ADMIN,
+                "is_owner": True,
+            },
+        )
+
+    profile = (
+        BusinessProfile.objects.filter(pk=profile.pk)
+        .prefetch_related("tracked_competitors")
+        .first()
+        or profile
+    )
+
+    access = viewer_team_access(request.user, profile)
+    base_ctx = {"request": request, "viewer_access": access}
 
     if request.method == "GET":
         force_aeo_refresh = str(request.GET.get("refresh_aeo", "")).strip().lower() in {"1", "true", "yes"}
@@ -1366,6 +1389,7 @@ def business_profile(request: HttpRequest) -> Response:
         serializer = BusinessProfileSerializer(
             profile,
             context={
+                **base_ctx,
                 "force_aeo_refresh": force_aeo_refresh,
                 "disable_seo_context_for_aeo": True,
                 "skip_heavy_profile_metrics": skip_heavy,
@@ -1374,12 +1398,19 @@ def business_profile(request: HttpRequest) -> Response:
         return Response(serializer.data)
 
     # For PATCH/PUT, apply partial updates
+    if not access["viewer_can_edit_company_profile"]:
+        return Response(
+            {"detail": "You do not have permission to edit company settings."},
+            status=403,
+        )
+
     skip_heavy = str(request.GET.get("skip_heavy", "")).strip().lower() in {"1", "true", "yes"}
     old_site_url = profile.website_url
     serializer = BusinessProfileSerializer(
         profile,
         data=request.data,
         partial=True,
+        context=base_ctx,
     )
     serializer.is_valid(raise_exception=True)
     serializer.save()
@@ -1390,7 +1421,7 @@ def business_profile(request: HttpRequest) -> Response:
     if new_site_url and new_site_url != old_site_url:
         try:
             get_or_refresh_seo_score_for_user(
-                request.user,
+                workspace_data_user(serializer.instance) or request.user,
                 site_url=new_site_url,
             )
         except Exception:
@@ -1400,6 +1431,7 @@ def business_profile(request: HttpRequest) -> Response:
     out = BusinessProfileSerializer(
         serializer.instance,
         context={
+            **base_ctx,
             "disable_seo_context_for_aeo": True,
             "skip_heavy_profile_metrics": skip_heavy,
         },
@@ -1408,13 +1440,109 @@ def business_profile(request: HttpRequest) -> Response:
 
 
 @csrf_exempt
+@api_view(["GET", "POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def business_profile_team(request: HttpRequest) -> Response:
+    profile = resolve_main_business_profile_for_user(request.user)
+    if profile is None:
+        return Response({"error": "No active business profile."}, status=404)
+
+    if request.method == "GET":
+        m_self = get_membership(request.user, profile)
+        if m_self is None and profile.user_id != request.user.id:
+            return Response({"detail": "Forbidden."}, status=403)
+        rows = (
+            BusinessProfileMembership.objects.filter(business_profile=profile)
+            .select_related("user")
+            .order_by("-is_owner", "role", "id")
+        )
+        return Response(
+            {
+                "members": [
+                    {
+                        "user_id": r.user_id,
+                        "email": r.user.email or "",
+                        "role": r.role,
+                        "is_owner": r.is_owner,
+                        "pending_sign_in": not r.user.has_usable_password(),
+                    }
+                    for r in rows
+                ],
+            },
+        )
+
+    if not viewer_team_access(request.user, profile)["viewer_can_manage_team"]:
+        return Response({"detail": "Forbidden."}, status=403)
+
+    email = (request.data.get("email") or "").strip().lower()
+    role_raw = (request.data.get("role") or "").strip().lower()
+    if not email or "@" not in email:
+        return Response({"error": "Valid email is required."}, status=400)
+    if role_raw not in (BusinessProfileMembership.ROLE_ADMIN, BusinessProfileMembership.ROLE_MEMBER):
+        return Response({"error": "role must be admin or member."}, status=400)
+
+    owner = profile.user
+    if owner and (owner.email or "").strip().lower() == email:
+        return Response({"error": "That email is already the account owner."}, status=400)
+
+    User = get_user_model()
+    invited = User.objects.filter(email__iexact=email).first()
+    if invited is None:
+        invited = User(username=email, email=email)
+        invited.set_unusable_password()
+        invited.save()
+
+    if BusinessProfileMembership.objects.filter(business_profile=profile, user=invited).exists():
+        return Response({"error": "That user is already on this team."}, status=400)
+
+    BusinessProfileMembership.objects.create(
+        business_profile=profile,
+        user=invited,
+        role=(
+            BusinessProfileMembership.ROLE_ADMIN
+            if role_raw == BusinessProfileMembership.ROLE_ADMIN
+            else BusinessProfileMembership.ROLE_MEMBER
+        ),
+        is_owner=False,
+    )
+    return Response({"ok": True, "user_id": invited.id}, status=201)
+
+
+@csrf_exempt
+@api_view(["DELETE"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def business_profile_team_member(request: HttpRequest, user_id: int) -> Response:
+    profile = resolve_main_business_profile_for_user(request.user)
+    if profile is None:
+        return Response({"error": "No active business profile."}, status=404)
+    if not viewer_team_access(request.user, profile)["viewer_can_manage_team"]:
+        return Response({"detail": "Forbidden."}, status=403)
+
+    row = BusinessProfileMembership.objects.filter(
+        business_profile=profile,
+        user_id=int(user_id),
+    ).first()
+    if row is None:
+        return Response({"error": "Not a team member."}, status=404)
+    if row.is_owner:
+        return Response({"error": "Cannot remove the primary account holder."}, status=400)
+    row.delete()
+    return Response(status=204)
+
+
+@csrf_exempt
 @api_view(["GET"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def business_profile_checkout_identity(request: HttpRequest) -> Response:
-    profile = _resolve_main_business_profile_for_user(request.user)
+    profile = resolve_main_business_profile_for_user(request.user)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
+    access = viewer_team_access(request.user, profile)
+    if not access["viewer_can_access_billing"]:
+        return Response({"error": "Billing is not available for this account."}, status=403)
     return Response(
         {
             "profile_id": profile.id,
@@ -1433,9 +1561,12 @@ def billing_summary(request: HttpRequest) -> Response:
     """
     Stripe-backed billing summary for the authenticated user's main business profile.
     """
-    profile = _resolve_main_business_profile_for_user(request.user)
+    profile = resolve_main_business_profile_for_user(request.user)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
+    access = viewer_team_access(request.user, profile)
+    if not access["viewer_can_access_billing"]:
+        return Response({"error": "Billing is not available for this account."}, status=403)
 
     out = {
         "plan_label": _plan_label_from_slug(str(getattr(profile, "plan", "") or "")),
@@ -1566,9 +1697,12 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
     if not settings.DEBUG:
         return Response(status=404)
 
-    profile = _resolve_main_business_profile_for_user(request.user)
+    profile = resolve_main_business_profile_for_user(request.user)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
+    access = viewer_team_access(request.user, profile)
+    if not access["viewer_can_access_billing"]:
+        return Response({"error": "Billing is not available for this account."}, status=403)
 
     raw_plan = request.data.get("plan") if isinstance(request.data, dict) else None
     plan = str(raw_plan or "").strip() or BusinessProfile.PLAN_PRO
@@ -1602,17 +1736,29 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def seo_profile_data(request: HttpRequest) -> Response:
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True)
-        .prefetch_related("tracked_competitors")
-        .first()
-        or BusinessProfile.objects.filter(user=request.user)
-        .prefetch_related("tracked_competitors")
-        .first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
-    serializer = BusinessProfileSEOSerializer(profile)
+        BusinessProfileMembership.objects.get_or_create(
+            business_profile=profile,
+            user=request.user,
+            defaults={
+                "role": BusinessProfileMembership.ROLE_ADMIN,
+                "is_owner": True,
+            },
+        )
+    profile = (
+        BusinessProfile.objects.filter(pk=profile.pk)
+        .prefetch_related("tracked_competitors")
+        .first()
+        or profile
+    )
+    data_user = workspace_data_user(profile) or request.user
+    access = viewer_team_access(request.user, profile)
+    serializer = BusinessProfileSEOSerializer(
+        profile,
+        context={"request": request, "viewer_access": access},
+    )
     payload = dict(serializer.data)
 
     # Expose SEO score trend from historical snapshots for dashboard charting.
@@ -1620,7 +1766,7 @@ def seo_profile_data(request: HttpRequest) -> Response:
     parsed_domain = normalize_domain(website) if website else ""
 
     snapshots_qs = SEOOverviewSnapshot.objects.filter(
-        user=request.user,
+        user=data_user,
     )
     if parsed_domain:
         snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
@@ -1646,13 +1792,11 @@ def seo_score_history_data(request: HttpRequest) -> Response:
     Return SEO score points (search_performance_score) from all matching
     SEOOverviewSnapshot rows for the authenticated user + current profile domain.
     """
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"points": []})
 
+    data_user = workspace_data_user(profile) or request.user
     website = str(getattr(profile, "website_url", "") or "").strip()
     parsed_domain = normalize_domain(website) if website else ""
     start_current = datetime.now(timezone.utc).date().replace(day=1)
@@ -1661,7 +1805,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
     if website:
         try:
             get_or_refresh_seo_score_for_user(
-                request.user,
+                data_user,
                 site_url=website,
                 force_refresh=False,
             )
@@ -1673,7 +1817,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
             )
 
     snapshots_qs = SEOOverviewSnapshot.objects.filter(
-        user=request.user,
+        user=data_user,
     )
     if parsed_domain:
         snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
@@ -1693,7 +1837,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
     if not has_current_point and website:
         try:
             current_bundle = get_or_refresh_seo_score_for_user(
-                request.user,
+                data_user,
                 site_url=website,
                 force_refresh=False,
             ) or {}
@@ -1719,15 +1863,26 @@ def seo_score_history_data(request: HttpRequest) -> Response:
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def aeo_profile_data(request: HttpRequest) -> Response:
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+        BusinessProfileMembership.objects.get_or_create(
+            business_profile=profile,
+            user=request.user,
+            defaults={
+                "role": BusinessProfileMembership.ROLE_ADMIN,
+                "is_owner": True,
+            },
+        )
+    access = viewer_team_access(request.user, profile)
     serializer = BusinessProfileAEOSerializer(
         profile,
-        context={"force_aeo_refresh": False, "disable_seo_context_for_aeo": True},
+        context={
+            "force_aeo_refresh": False,
+            "disable_seo_context_for_aeo": True,
+            "request": request,
+            "viewer_access": access,
+        },
     )
     return Response(serializer.data)
 
@@ -2404,10 +2559,7 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     Cached-only prompt coverage read for AI Visibility UI.
     One row per unique prompt text; per-platform (OpenAI / Gemini / Perplexity) citation from latest snapshot each.
     """
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response(
             {
@@ -2457,10 +2609,7 @@ def aeo_mark_recommendation_complete(request: HttpRequest) -> Response:
     """
     from .models import AEORecommendationRun
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"error": "Business profile not found."}, status=404)
 
@@ -2508,10 +2657,7 @@ def aeo_platform_visibility_data(request: HttpRequest) -> Response:
     OpenAI (ChatGPT), Gemini, and Perplexity are computed from stored snapshots when present.
     Other platforms return 0% until integrations exist (frontend still shows them).
     """
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"platforms": []})
 
@@ -2551,10 +2697,7 @@ def aeo_share_of_voice_data(request: HttpRequest) -> Response:
     """
     from .aeo.aeo_scoring_utils import aggregate_aeo_share_of_voice
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response(
             {
@@ -2581,10 +2724,7 @@ def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
     """
     from .aeo.aeo_scoring_utils import aeo_onboarding_competitors_visibility
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"has_data": False, "total_prompts": 0, "rows": []})
     return Response(aeo_onboarding_competitors_visibility(profile))
@@ -2601,14 +2741,14 @@ def aeo_competitors_data(request: HttpRequest) -> Response:
     """
     from .aeo.competitor_snapshots import compute_and_save_competitor_snapshot
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True)
-        .prefetch_related("tracked_competitors")
-        .first()
-        or BusinessProfile.objects.filter(user=request.user)
-        .prefetch_related("tracked_competitors")
-        .first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
+    if profile is not None:
+        profile = (
+            BusinessProfile.objects.filter(pk=profile.pk)
+            .prefetch_related("tracked_competitors")
+            .first()
+            or profile
+        )
     if not profile:
         return Response(
             {
@@ -2731,10 +2871,7 @@ def aeo_pipeline_status_data(request: HttpRequest) -> Response:
     from .aeo.aeo_scoring_utils import composite_aeo_score_from_snapshot
     from .models import AEOExecutionRun, AEORecommendationRun, AEOScoreSnapshot
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response(
             {
@@ -2862,10 +2999,7 @@ def aeo_pass_count_analytics_data(request: HttpRequest) -> Response:
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def refresh_aeo_snapshot(request: HttpRequest) -> Response:
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
     logger.info(
@@ -2899,10 +3033,7 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
     from .models import AEOExecutionRun
     from .tasks import run_aeo_phase1_execution_task
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -3004,10 +3135,7 @@ def refresh_aeo_gemini(request: HttpRequest) -> Response:
     from .models import AEOExecutionRun
     from .tasks import run_aeo_gemini_refresh_task
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -3080,10 +3208,7 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
     from .models import AEOExecutionRun
     from .tasks import run_aeo_perplexity_refresh_task
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -3156,10 +3281,7 @@ def aeo_retry_prompt_expansion(request: HttpRequest) -> Response:
     """
     from .tasks import schedule_aeo_prompt_plan_expansion
 
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -3350,12 +3472,17 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     Response ``meta`` includes ``openai_status`` (``ok`` | ``partial`` | ``failed_empty`` |
     ``reused_saved``) and ``openai_message`` when generation cannot hit target count.
     """
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
+    profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+        BusinessProfileMembership.objects.get_or_create(
+            business_profile=profile,
+            user=request.user,
+            defaults={
+                "role": BusinessProfileMembership.ROLE_ADMIN,
+                "is_owner": True,
+            },
+        )
 
     body = request.data if request.method == "POST" else {}
     if not isinstance(body, dict):
@@ -3629,10 +3756,7 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
     start_current = today.replace(day=1)
     user = request.user
 
-    profile = (
-        BusinessProfile.objects.filter(user=user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=user).first()
-    )
+    profile = resolve_main_business_profile_for_user(user)
     if not profile or not profile.website_url:
         return Response(
             {"detail": "No main business profile with a website URL is configured."},
@@ -3647,10 +3771,11 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
             status=400,
         )
 
+    data_user = workspace_data_user(profile) or user
     try:
         snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=user,
+            user=data_user,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -3664,9 +3789,9 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
         # which will create one and enqueue enrichment tasks; then try again.
         from .dataforseo_utils import get_or_refresh_seo_score_for_user
 
-        get_or_refresh_seo_score_for_user(user, site_url=site_url)
+        get_or_refresh_seo_score_for_user(data_user, site_url=site_url)
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=user,
+            user=data_user,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -3708,7 +3833,11 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
     snapshot.save(update_fields=["seo_next_steps", "seo_next_steps_refreshed_at"])
 
     # Return the updated main profile (serializer will now include fresh seo_next_steps)
-    serializer = BusinessProfileSerializer(profile)
+    access = viewer_team_access(request.user, profile)
+    serializer = BusinessProfileSerializer(
+        profile,
+        context={"request": request, "viewer_access": access},
+    )
     return Response(serializer.data)
 
 
@@ -3727,10 +3856,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
     """
     user = request.user
 
-    profile = (
-        BusinessProfile.objects.filter(user=user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=user).first()
-    )
+    profile = resolve_main_business_profile_for_user(user)
     if not profile or not profile.website_url:
         return Response(
             {"detail": "No main business profile with a website URL is configured."},
@@ -3738,6 +3864,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         )
 
     site_url = profile.website_url
+    data_user = workspace_data_user(profile) or user
     logger.info(
         "[refresh_endpoint] module=seo user_id=%s profile_id=%s refresh_started=true external_api_called=false",
         getattr(user, "id", None),
@@ -3784,7 +3911,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
 
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=user,
+            user=data_user,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
@@ -3792,9 +3919,9 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
 
         # If snapshot doesn't exist yet, fall back to full creation (it will enqueue tasks).
         if not snapshot:
-            get_or_refresh_seo_score_for_user(user, site_url=site_url)
+            get_or_refresh_seo_score_for_user(data_user, site_url=site_url)
             snapshot = SEOOverviewSnapshot.objects.filter(
-                user=user,
+                user=data_user,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
@@ -4023,7 +4150,11 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         getattr(profile, "id", None),
         bool(external_api_called),
     )
-    serializer = BusinessProfileSEOSerializer(profile)
+    access = viewer_team_access(request.user, profile)
+    serializer = BusinessProfileSEOSerializer(
+        profile,
+        context={"request": request, "viewer_access": access},
+    )
     return Response(serializer.data)
 
 @csrf_exempt
@@ -4044,15 +4175,26 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
         return Response({"detail": "Not found."}, status=404)
 
     if request.method == "GET":
-        serializer = BusinessProfileSerializer(profile)
+        access = viewer_team_access(request.user, profile)
+        serializer = BusinessProfileSerializer(
+            profile,
+            context={"request": request, "viewer_access": access},
+        )
         return Response(serializer.data)
 
     if request.method in ("PATCH", "PUT"):
+        access = viewer_team_access(request.user, profile)
+        if not access["viewer_can_edit_company_profile"]:
+            return Response(
+                {"detail": "You do not have permission to edit company settings."},
+                status=403,
+            )
         old_site_url = profile.website_url
         serializer = BusinessProfileSerializer(
             profile,
             data=request.data,
             partial=(request.method == "PATCH"),
+            context={"request": request, "viewer_access": access},
         )
         serializer.is_valid(raise_exception=True)
         profile = serializer.save()

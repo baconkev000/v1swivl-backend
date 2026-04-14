@@ -3393,10 +3393,9 @@ def _best_rank_from_ranked_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
 def _resolve_profile_for_rank_enrichment(user: Any) -> Optional[BusinessProfile]:
     """Resolve the main business profile for the given user, if available."""
     try:
-        return (
-            BusinessProfile.objects.filter(user=user, is_main=True).first()
-            or BusinessProfile.objects.filter(user=user).first()
-        )
+        from .business_profile_access import resolve_main_business_profile_for_user
+
+        return resolve_main_business_profile_for_user(user)
     except Exception:
         return None
 

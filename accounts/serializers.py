@@ -148,6 +148,12 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         allow_empty=True,
     )
     aeo_onboarding_prompt_target_count = serializers.SerializerMethodField()
+    viewer_team_role = serializers.SerializerMethodField()
+    viewer_is_main_account_owner = serializers.SerializerMethodField()
+    viewer_can_edit_company_profile = serializers.SerializerMethodField()
+    viewer_can_access_billing = serializers.SerializerMethodField()
+    viewer_can_manage_team = serializers.SerializerMethodField()
+    viewer_email = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessProfile
@@ -208,6 +214,12 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "local_verification_affects_visibility",
             "created_at",
             "updated_at",
+            "viewer_team_role",
+            "viewer_is_main_account_owner",
+            "viewer_can_edit_company_profile",
+            "viewer_can_access_billing",
+            "viewer_can_manage_team",
+            "viewer_email",
         ]
         read_only_fields = [
             "id",
@@ -226,7 +238,47 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "stripe_cancel_at_period_end",
             "created_at",
             "updated_at",
+            "viewer_team_role",
+            "viewer_is_main_account_owner",
+            "viewer_can_edit_company_profile",
+            "viewer_can_access_billing",
+            "viewer_can_manage_team",
+            "viewer_email",
         ]
+
+    def _viewer_access_dict(self) -> dict:
+        raw = self.context.get("viewer_access")
+        if isinstance(raw, dict) and raw:
+            return raw
+        return {
+            "viewer_team_role": "owner",
+            "viewer_is_main_account_owner": True,
+            "viewer_can_edit_company_profile": True,
+            "viewer_can_access_billing": True,
+            "viewer_can_manage_team": True,
+        }
+
+    def get_viewer_team_role(self, obj: BusinessProfile) -> str:
+        return str(self._viewer_access_dict().get("viewer_team_role") or "owner")
+
+    def get_viewer_is_main_account_owner(self, obj: BusinessProfile) -> bool:
+        return bool(self._viewer_access_dict().get("viewer_is_main_account_owner"))
+
+    def get_viewer_can_edit_company_profile(self, obj: BusinessProfile) -> bool:
+        return bool(self._viewer_access_dict().get("viewer_can_edit_company_profile", True))
+
+    def get_viewer_can_access_billing(self, obj: BusinessProfile) -> bool:
+        return bool(self._viewer_access_dict().get("viewer_can_access_billing", True))
+
+    def get_viewer_can_manage_team(self, obj: BusinessProfile) -> bool:
+        return bool(self._viewer_access_dict().get("viewer_can_manage_team", True))
+
+    def get_viewer_email(self, obj: BusinessProfile) -> str:
+        req = self.context.get("request")
+        u = getattr(req, "user", None) if req is not None else None
+        if u is not None and getattr(u, "is_authenticated", False) and getattr(u, "email", None):
+            return str(u.email)
+        return str(getattr(obj.user, "email", "") or "")
 
     def get_aeo_onboarding_prompt_target_count(self, obj: BusinessProfile) -> int:
         return aeo_effective_monitored_target_for_profile(obj)
@@ -944,6 +996,12 @@ class BusinessProfileSEOSerializer(BusinessProfileSerializer):
             "local_verification_affects_visibility",
             "created_at",
             "updated_at",
+            "viewer_team_role",
+            "viewer_is_main_account_owner",
+            "viewer_can_edit_company_profile",
+            "viewer_can_access_billing",
+            "viewer_can_manage_team",
+            "viewer_email",
         ]
 
     def _get_aeo_bundle(self, obj: BusinessProfile) -> dict:
@@ -991,6 +1049,12 @@ class BusinessProfileAEOSerializer(BusinessProfileSerializer):
             "aeo_last_computed_at",
             "created_at",
             "updated_at",
+            "viewer_team_role",
+            "viewer_is_main_account_owner",
+            "viewer_can_edit_company_profile",
+            "viewer_can_access_billing",
+            "viewer_can_manage_team",
+            "viewer_email",
         ]
 
     def _get_seo_bundle(self, obj: BusinessProfile) -> dict | None:
