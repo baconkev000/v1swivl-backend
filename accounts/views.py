@@ -1870,6 +1870,9 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
             business_profile=profile,
             monitored_prompt_count=selected_prompt_count,
         )
+    completed_strategy_ids = _completed_strategy_ids_from_actions_log(
+        getattr(latest_reco, "actions_completed_json", None) if latest_reco else None
+    )
 
     ordered_keys: list[str] = []
     seen: set[str] = set()
@@ -1987,6 +1990,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
         "monitored_count": selected_prompt_count,
         "tracked_business_name": tracked_name,
         "recommendation_strategies": recommendation_strategies,
+        "completed_strategy_ids": completed_strategy_ids,
         "prompt_scan_total": prompt_scan_total,
         "prompt_scan_completed": prompt_scan_completed,
         "visibility_pending": visibility_pending,
@@ -2206,6 +2210,26 @@ def _aeo_recommendations_pipeline_pending(profile: BusinessProfile) -> bool:
     )
 
 
+def _completed_strategy_ids_from_actions_log(raw: object) -> list[str]:
+    """Normalize ``actions_completed_json`` into unique strategy ids."""
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        strategy_id = ""
+        if isinstance(item, dict):
+            strategy_id = str(item.get("strategy_id") or "").strip()
+        elif isinstance(item, str):
+            # Legacy shape: stored as a bare id.
+            strategy_id = item.strip()
+        if not strategy_id or strategy_id in seen:
+            continue
+        seen.add(strategy_id)
+        out.append(strategy_id)
+    return out
+
+
 @csrf_exempt
 @api_view(["GET"])
 @authentication_classes([CsrfExemptSessionAuthentication])
@@ -2256,6 +2280,56 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     )
     _patch_prompt_coverage_response_live(profile, payload)
     return Response(payload)
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_mark_recommendation_complete(request: HttpRequest) -> Response:
+    """
+    Mark a recommendation strategy as completed for the latest recommendation run.
+    """
+    from .models import AEORecommendationRun
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"error": "Business profile not found."}, status=404)
+
+    strategy_id = str(request.data.get("strategy_id") or "").strip()
+    if not strategy_id:
+        return Response({"error": "strategy_id is required."}, status=400)
+
+    latest = (
+        AEORecommendationRun.objects.filter(profile=profile)
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if latest is None:
+        return Response({"error": "No recommendation run found."}, status=404)
+
+    with transaction.atomic():
+        locked = AEORecommendationRun.objects.select_for_update().get(pk=latest.pk)
+        existing = list(locked.actions_completed_json or [])
+        completed_ids = _completed_strategy_ids_from_actions_log(existing)
+        if strategy_id not in completed_ids:
+            existing.append(
+                {
+                    "strategy_id": strategy_id,
+                    "completed_at": django_timezone.now().isoformat(),
+                }
+            )
+            locked.actions_completed_json = existing
+            locked.save(update_fields=["actions_completed_json"])
+            completed_ids.append(strategy_id)
+
+    # Ensure prompt-coverage reads pick up latest completion state immediately.
+    AEODashboardBundleCache.objects.filter(profile=profile).delete()
+
+    return Response({"ok": True, "completed_strategy_ids": completed_ids})
 
 
 @csrf_exempt

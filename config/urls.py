@@ -84,6 +84,11 @@ urlpatterns += [
     path("api/aeo/profile/", accounts_views.aeo_profile_data, name="aeo-profile-data"),
     path("api/aeo/prompt-coverage/", accounts_views.aeo_prompt_coverage_data, name="aeo-prompt-coverage-data"),
     path(
+        "api/aeo/recommendations/complete/",
+        accounts_views.aeo_mark_recommendation_complete,
+        name="aeo-mark-recommendation-complete",
+    ),
+    path(
         "api/aeo/platform-visibility/",
         accounts_views.aeo_platform_visibility_data,
         name="aeo-platform-visibility-data",
