@@ -22,6 +22,7 @@ from rest_framework.response import Response
 from .business_profile_access import (
     get_membership,
     resolve_main_business_profile_for_user,
+    should_create_owned_main_business_profile_for_user,
     viewer_team_access,
     workspace_data_user,
 )
@@ -519,6 +520,11 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
     try:
         profile = resolve_main_business_profile_for_user(request.user)
         if profile is None:
+            if not should_create_owned_main_business_profile_for_user(request.user):
+                return Response(
+                    {"error": "No business profile for this account. Ask an admin to add you to the team."},
+                    status=403,
+                )
             profile = BusinessProfile.objects.create(user=request.user, is_main=True)
             BusinessProfileMembership.objects.get_or_create(
                 business_profile=profile,
@@ -652,7 +658,7 @@ def api_auth_register(request: HttpRequest) -> Response:
     ).exists():
         return Response({"error": "An account with this email already exists"}, status=400)
     user = User.objects.create_user(username=email, email=email, password=password)
-    if not BusinessProfile.objects.filter(user=user).exists():
+    if should_create_owned_main_business_profile_for_user(user):
         bp = BusinessProfile.objects.create(user=user, is_main=True)
         BusinessProfileMembership.objects.get_or_create(
             business_profile=bp,
@@ -1363,6 +1369,8 @@ def business_profile(request: HttpRequest) -> Response:
     """
     profile = resolve_main_business_profile_for_user(request.user)
     if profile is None:
+        if not should_create_owned_main_business_profile_for_user(request.user):
+            return Response({"error": "No active business profile."}, status=404)
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
         BusinessProfileMembership.objects.get_or_create(
             business_profile=profile,
@@ -1738,6 +1746,8 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
 def seo_profile_data(request: HttpRequest) -> Response:
     profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
+        if not should_create_owned_main_business_profile_for_user(request.user):
+            return Response({"error": "No active business profile."}, status=404)
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
         BusinessProfileMembership.objects.get_or_create(
             business_profile=profile,
@@ -1865,6 +1875,8 @@ def seo_score_history_data(request: HttpRequest) -> Response:
 def aeo_profile_data(request: HttpRequest) -> Response:
     profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
+        if not should_create_owned_main_business_profile_for_user(request.user):
+            return Response({"error": "No active business profile."}, status=404)
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
         BusinessProfileMembership.objects.get_or_create(
             business_profile=profile,
@@ -3474,6 +3486,8 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     """
     profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
+        if not should_create_owned_main_business_profile_for_user(request.user):
+            return Response({"error": "No active business profile."}, status=404)
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
         BusinessProfileMembership.objects.get_or_create(
             business_profile=profile,

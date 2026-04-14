@@ -373,22 +373,6 @@ class BusinessProfileMembershipInline(admin.TabularInline):
         return super().get_queryset(request).select_related("user")
 
 
-class ThirdPartyApiRequestLogInline(admin.TabularInline):
-    model = ThirdPartyApiRequestLog
-    fk_name = "business_profile"
-    extra = 0
-    can_delete = False
-    show_change_link = True
-    fields = ("created_at", "provider", "operation", "tokens_sent", "tokens_received", "cost_usd")
-    readonly_fields = fields
-    ordering = ("-created_at",)
-    verbose_name_plural = "Third-party API requests (this profile; newest first via model ordering)"
-
-    def get_queryset(self, request):
-        # Must not slice here: the inline formset applies FK filters after get_queryset().
-        return super().get_queryset(request).order_by("-created_at")
-
-
 class ThirdPartyApiErrorLogInline(admin.TabularInline):
     model = ThirdPartyApiErrorLog
     fk_name = "business_profile"
@@ -400,8 +384,15 @@ class ThirdPartyApiErrorLogInline(admin.TabularInline):
     ordering = ("-created_at",)
     verbose_name_plural = "Third-party API errors (this profile; newest first via model ordering)"
 
+    # Cap rows so the change-form POST stays under Django's DATA_UPLOAD_MAX_NUMBER_FIELDS.
+    _max_rows = 120
+
     def get_queryset(self, request):
-        return super().get_queryset(request).order_by("-created_at")
+        base = super().get_queryset(request).order_by("-created_at")
+        pks = list(base.values_list("pk", flat=True)[: self._max_rows])
+        if not pks:
+            return base.none()
+        return base.model.objects.filter(pk__in=pks).order_by("-created_at")
 
 
 @admin.register(BusinessProfile)
@@ -423,7 +414,6 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     filter_horizontal = ("tracked_competitors",)
     inlines = (
         BusinessProfileMembershipInline,
-        ThirdPartyApiRequestLogInline,
         ThirdPartyApiErrorLogInline,
     )
     readonly_fields = ("created_at", "updated_at")

@@ -11,6 +11,22 @@ from django.contrib.auth.models import AnonymousUser
 from .models import BusinessProfile, BusinessProfileMembership
 
 
+def should_create_owned_main_business_profile_for_user(user: Any) -> bool:
+    """
+    True when we should bootstrap an owned main BusinessProfile for this user.
+
+    Team-only accounts (already have a ``BusinessProfileMembership`` on another user's
+    workspace, and no owned ``BusinessProfile``) must not get a personal profile row.
+    """
+    if user is None or isinstance(user, AnonymousUser) or not user.is_authenticated:
+        return False
+    if BusinessProfile.objects.filter(user=user).exists():
+        return False
+    if BusinessProfileMembership.objects.filter(user=user).exists():
+        return False
+    return True
+
+
 def resolve_main_business_profile_for_user(user: Any) -> BusinessProfile | None:
     """
     Prefer a team workspace the user was invited to (membership on another user's profile),

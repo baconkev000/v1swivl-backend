@@ -82,10 +82,11 @@ class SocialAccountAdapter(DefaultSocialAccountAdapter):
         After Google (or other social) signup/login, ensure a main BusinessProfile exists
         so onboarding can PATCH /api/business-profile/.
         """
+        from accounts.business_profile_access import should_create_owned_main_business_profile_for_user
         from accounts.models import BusinessProfile, BusinessProfileMembership
 
         user = super().save_user(request, sociallogin, form)
-        if not BusinessProfile.objects.filter(user=user).exists():
+        if should_create_owned_main_business_profile_for_user(user):
             bp = BusinessProfile.objects.create(user=user, is_main=True)
             BusinessProfileMembership.objects.get_or_create(
                 business_profile=bp,
