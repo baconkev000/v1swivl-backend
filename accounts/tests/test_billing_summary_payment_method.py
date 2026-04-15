@@ -7,6 +7,14 @@ from accounts.models import BusinessProfile, BusinessProfileMembership, ThirdPar
 User = get_user_model()
 
 
+class _StripeLikeObject:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def _to_dict_recursive(self):
+        return self._payload
+
+
 def _mk_user_profile() -> tuple[object, BusinessProfile]:
     user = User.objects.create_user(
         username="bill_pm@example.com",
@@ -350,3 +358,73 @@ def test_billing_summary_records_third_party_error_on_stripe_failure(monkeypatch
     assert row is not None
     assert row.operation == "stripe.subscription.retrieve.billing_summary"
     assert row.error_kind == ThirdPartyApiErrorLog.ErrorKind.UNKNOWN_EXCEPTION
+
+
+@pytest.mark.django_db
+def test_billing_summary_handles_stripe_sdk_object_payloads(monkeypatch, settings):
+    pytest.importorskip("stripe")
+    settings.STRIPE_SECRET_KEY = "sk_test_123"
+    user, _profile = _mk_user_profile()
+
+    monkeypatch.setattr(
+        "accounts.views.stripe.Subscription.retrieve",
+        lambda *_a, **_k: _StripeLikeObject(
+            {
+                "items": {
+                    "data": [
+                        {
+                            "price": {
+                                "unit_amount": 4900,
+                                "currency": "usd",
+                                "recurring": {"interval": "month", "interval_count": 1},
+                            }
+                        }
+                    ]
+                },
+                "default_payment_method": _StripeLikeObject(
+                    {
+                        "card": {
+                            "brand": "visa",
+                            "last4": "4242",
+                            "exp_month": 9,
+                            "exp_year": 2030,
+                            "funding": "credit",
+                        }
+                    }
+                ),
+                "current_period_end": 1893456000,
+            }
+        ),
+    )
+    monkeypatch.setattr("accounts.views.stripe.Subscription.list", lambda *_a, **_k: {"data": []})
+    monkeypatch.setattr("accounts.views.stripe.Customer.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        "accounts.views.stripe.Invoice.list",
+        lambda *_a, **_k: _StripeLikeObject(
+            {
+                "data": [
+                    {
+                        "id": "in_1",
+                        "number": "INV-1",
+                        "created": 1704067200,
+                        "amount_paid": 4900,
+                        "currency": "usd",
+                        "status": "paid",
+                        "status_transitions": {"paid_at": 1704067300},
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr("accounts.views.stripe.PaymentMethod.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr("accounts.views.stripe.PaymentIntent.retrieve", lambda *_a, **_k: {})
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.get("/api/billing/summary/")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["price_month"] == "49.00"
+    assert body["payment_method"] is not None
+    assert body["payment_method"]["brand"] == "visa"
+    assert len(body["invoices"]) == 1

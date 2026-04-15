@@ -215,21 +215,56 @@ def _resolve_price_id_for_checkout_session(obj: dict) -> str:
 def normalize_stripe_payload(value):
     """
     Recursively normalize Stripe payload objects to plain Python dict/list/scalars.
+
+    Supports SDK variants that expose either ``to_dict_recursive()`` or
+    ``_to_dict_recursive()`` and falls back to mapping-like ``items()`` objects.
     """
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return {str(k): normalize_stripe_payload(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [normalize_stripe_payload(v) for v in value]
-    if isinstance(value, tuple):
-        return [normalize_stripe_payload(v) for v in value]
-    if hasattr(value, "to_dict_recursive"):
-        try:
-            return normalize_stripe_payload(value.to_dict_recursive())
-        except Exception:
-            return {}
-    return value
+
+    def _normalize(v, _seen: set[int]):
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        vid = id(v)
+        if vid in _seen:
+            return None
+        if isinstance(v, dict):
+            _seen.add(vid)
+            return {str(k): _normalize(val, _seen) for k, val in v.items()}
+        if isinstance(v, list):
+            _seen.add(vid)
+            return [_normalize(x, _seen) for x in v]
+        if isinstance(v, tuple):
+            _seen.add(vid)
+            return [_normalize(x, _seen) for x in v]
+
+        to_dict = getattr(v, "to_dict_recursive", None)
+        if callable(to_dict):
+            try:
+                _seen.add(vid)
+                return _normalize(to_dict(), _seen)
+            except Exception:
+                return {}
+
+        to_dict_private = getattr(v, "_to_dict_recursive", None)
+        if callable(to_dict_private):
+            try:
+                _seen.add(vid)
+                return _normalize(to_dict_private(), _seen)
+            except Exception:
+                return {}
+
+        # Mapping-like fallback for SDK wrappers that only expose ``items``.
+        items_fn = getattr(v, "items", None)
+        if callable(items_fn):
+            try:
+                raw_items = items_fn()
+                as_dict = dict(raw_items)
+                _seen.add(vid)
+                return {str(k): _normalize(val, _seen) for k, val in as_dict.items()}
+            except Exception:
+                pass
+        return v
+
+    return _normalize(value, set())
 
 
 def extract_match_debug_fields(payload) -> dict[str, str]:
