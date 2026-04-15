@@ -40,8 +40,8 @@ from .models import (
     ThirdPartyApiErrorLog,
 )
 
-# Third-party API cache: only refetch from GSC/GBP if last fetch was >= this long ago.
-THIRD_PARTY_CACHE_TTL = timedelta(hours=1)
+# SEO overview cache: only refetch DataForSEO after snapshot TTL (7 days).
+THIRD_PARTY_CACHE_TTL = timedelta(days=7)
 # Google My Business Account Management API: 1 request per minute per project. Enforce per-user to avoid 429.
 GBP_API_MIN_INTERVAL_SECONDS = 60
 from .serializers import (
@@ -1186,7 +1186,7 @@ def seo_overview(request: HttpRequest) -> Response:
     organic_visitors for backwards compatibility with the frontend), and
     keywords_count / top3_positions as supporting metrics.
 
-    Uses a 1-hour cache: if we have fresh snapshot data, return it without calling the API.
+    Uses a 7-day snapshot cache: if we have fresh snapshot data, return it without calling DataForSEO.
     """
     # #region agent log
     _debug.log("views.py:seo_overview:entry", "seo_overview called", {"user_id": getattr(request.user, "id", None), "query_refresh": request.GET.get("refresh")}, "H1")
