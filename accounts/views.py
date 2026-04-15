@@ -329,6 +329,46 @@ def _monthly_price_from_price_obj(price_obj: dict) -> tuple[str, int | None]:
     return _money_minor_to_decimal_str(monthly_minor), int(monthly_minor)
 
 
+def _subscription_rank_for_billing(sub: dict) -> tuple[int, int]:
+    status = str(sub.get("status") or "").strip().lower()
+    status_rank = {
+        "active": 0,
+        "trialing": 1,
+        "past_due": 2,
+        "incomplete": 3,
+        "paused": 4,
+        "canceled": 5,
+        "unpaid": 6,
+    }.get(status, 9)
+    created = sub.get("created")
+    created_int = int(created) if isinstance(created, int) else 0
+    return status_rank, -created_int
+
+
+def _price_obj_from_subscription_dict(subscription_dict: dict) -> dict:
+    items = subscription_dict.get("items", {}).get("data", [])
+    first_item = items[0] if isinstance(items, list) and items else {}
+    if not isinstance(first_item, dict):
+        return {}
+    price_obj = first_item.get("price")
+    if isinstance(price_obj, dict):
+        return price_obj
+    # Legacy Stripe payloads can still expose ``plan`` under items.
+    plan_obj = first_item.get("plan")
+    if isinstance(plan_obj, dict):
+        return plan_obj
+    return {}
+
+
+def _safe_dt_from_unix(ts: int | None) -> datetime | None:
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    except Exception:
+        return None
+
+
 def _seo_snapshot_context_for_profile(profile: BusinessProfile | None) -> tuple[str, int]:
     """Resolve snapshot identity context for SEO snapshots."""
     return seo_snapshot_context_for_profile(profile)
@@ -1808,9 +1848,31 @@ def billing_summary(request: HttpRequest) -> Response:
         "payment_method": None,
     }
 
-    customer_id = str(getattr(profile, "stripe_customer_id", "") or "").strip()
-    subscription_id = str(getattr(profile, "stripe_subscription_id", "") or "").strip()
-    period_end = getattr(profile, "stripe_current_period_end", None)
+    billing_profile = profile
+    customer_id = str(getattr(billing_profile, "stripe_customer_id", "") or "").strip()
+    subscription_id = str(getattr(billing_profile, "stripe_subscription_id", "") or "").strip()
+    period_end = getattr(billing_profile, "stripe_current_period_end", None)
+    if not customer_id:
+        owned_with_customer = (
+            BusinessProfile.objects.filter(user=request.user)
+            .exclude(pk=billing_profile.pk)
+            .exclude(stripe_customer_id__isnull=True)
+            .exclude(stripe_customer_id="")
+            .order_by("-is_main", "id")
+            .first()
+        )
+        if owned_with_customer is not None:
+            billing_profile = owned_with_customer
+            customer_id = str(getattr(billing_profile, "stripe_customer_id", "") or "").strip()
+            subscription_id = str(getattr(billing_profile, "stripe_subscription_id", "") or "").strip()
+            period_end = getattr(billing_profile, "stripe_current_period_end", None)
+            out["plan_label"] = _plan_label_from_slug(str(getattr(billing_profile, "plan", "") or ""))
+            logger.info(
+                "[billing_summary] using owned profile fallback resolved_profile_id=%s billing_profile_id=%s user_id=%s",
+                profile.id,
+                billing_profile.id,
+                request.user.id,
+            )
     if period_end is not None:
         out["renewal_date"] = period_end.isoformat()
 
@@ -1844,14 +1906,15 @@ def billing_summary(request: HttpRequest) -> Response:
             nlisted = normalize_stripe_payload(listed)
             rows = nlisted.get("data", []) if isinstance(nlisted, dict) else []
             if isinstance(rows, list) and rows:
-                subscription_dict = rows[0] if isinstance(rows[0], dict) else None
+                sub_rows = [r for r in rows if isinstance(r, dict)]
+                if sub_rows:
+                    sub_rows.sort(key=_subscription_rank_for_billing)
+                    subscription_dict = sub_rows[0]
         except Exception:
             logger.exception("[billing_summary] failed to list Stripe subscriptions customer=%s", customer_id)
 
     if isinstance(subscription_dict, dict):
-        items = subscription_dict.get("items", {}).get("data", [])
-        first_item = items[0] if isinstance(items, list) and items else {}
-        price_obj = first_item.get("price") if isinstance(first_item, dict) else {}
+        price_obj = _price_obj_from_subscription_dict(subscription_dict)
         if isinstance(price_obj, dict):
             monthly_price, _monthly_minor = _monthly_price_from_price_obj(price_obj)
             out["price_month"] = monthly_price
@@ -1861,12 +1924,12 @@ def billing_summary(request: HttpRequest) -> Response:
             dt = _safe_dt_from_unix(sub_period_end)
             if dt is not None:
                 out["renewal_date"] = dt.isoformat()
-                if getattr(profile, "stripe_current_period_end", None) is None:
+                if getattr(billing_profile, "stripe_current_period_end", None) is None:
                     try:
-                        profile.stripe_current_period_end = dt
-                        profile.save(update_fields=["stripe_current_period_end", "updated_at"])
+                        billing_profile.stripe_current_period_end = dt
+                        billing_profile.save(update_fields=["stripe_current_period_end", "updated_at"])
                     except Exception:
-                        logger.exception("[billing_summary] failed to persist fallback renewal profile_id=%s", profile.id)
+                        logger.exception("[billing_summary] failed to persist fallback renewal profile_id=%s", billing_profile.id)
 
     latest_paid_at: datetime | None = None
     invoice_rows: list[dict] = []
@@ -1874,6 +1937,12 @@ def billing_summary(request: HttpRequest) -> Response:
         inv_list = stripe.Invoice.list(customer=customer_id, limit=12)
         ninv = normalize_stripe_payload(inv_list)
         rows = ninv.get("data", []) if isinstance(ninv, dict) else []
+        if (not isinstance(rows, list) or len(rows) == 0) and subscription_id:
+            inv_list_sub = stripe.Invoice.list(subscription=subscription_id, limit=12)
+            ninv_sub = normalize_stripe_payload(inv_list_sub)
+            rows_sub = ninv_sub.get("data", []) if isinstance(ninv_sub, dict) else []
+            if isinstance(rows_sub, list) and rows_sub:
+                rows = rows_sub
         invoice_rows = rows if isinstance(rows, list) else []
         invoices_out: list[dict] = []
         if isinstance(rows, list):
@@ -1916,10 +1985,10 @@ def billing_summary(request: HttpRequest) -> Response:
         fallback = latest_paid_at + timedelta(days=30)
         out["renewal_date"] = fallback.isoformat()
         try:
-            profile.stripe_current_period_end = fallback
-            profile.save(update_fields=["stripe_current_period_end", "updated_at"])
+            billing_profile.stripe_current_period_end = fallback
+            billing_profile.save(update_fields=["stripe_current_period_end", "updated_at"])
         except Exception:
-            logger.exception("[billing_summary] failed to persist renewal fallback profile_id=%s", profile.id)
+            logger.exception("[billing_summary] failed to persist renewal fallback profile_id=%s", billing_profile.id)
 
     return Response(out)
 

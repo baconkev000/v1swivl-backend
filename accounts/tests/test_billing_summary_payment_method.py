@@ -2,7 +2,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
 
-from accounts.models import BusinessProfile
+from accounts.models import BusinessProfile, BusinessProfileMembership
 
 User = get_user_model()
 
@@ -163,3 +163,164 @@ def test_billing_summary_payment_method_null_when_missing_everywhere(monkeypatch
     assert res.status_code == 200
     body = res.json()
     assert body["payment_method"] is None
+
+
+@pytest.mark.django_db
+def test_billing_summary_reads_monthly_price_from_legacy_plan_shape(monkeypatch, settings):
+    pytest.importorskip("stripe")
+    settings.STRIPE_SECRET_KEY = "sk_test_123"
+    user, _profile = _mk_user_profile()
+
+    monkeypatch.setattr(
+        "accounts.views.stripe.Subscription.retrieve",
+        lambda *_a, **_k: {
+            "items": {
+                "data": [
+                    {
+                        "plan": {
+                            "unit_amount": 12900,
+                            "currency": "usd",
+                            "recurring": {"interval": "month", "interval_count": 1},
+                        }
+                    }
+                ]
+            },
+            "default_payment_method": None,
+            "current_period_end": 1893456000,
+        },
+    )
+    monkeypatch.setattr("accounts.views.stripe.Subscription.list", lambda *_a, **_k: {"data": []})
+    monkeypatch.setattr("accounts.views.stripe.Customer.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr("accounts.views.stripe.Invoice.list", lambda *_a, **_k: {"data": []})
+    monkeypatch.setattr("accounts.views.stripe.PaymentMethod.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr("accounts.views.stripe.PaymentIntent.retrieve", lambda *_a, **_k: {})
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.get("/api/billing/summary/")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["price_month"] == "129.00"
+    assert body["currency"] == "usd"
+    assert body["renewal_date"] is not None
+
+
+@pytest.mark.django_db
+def test_billing_summary_uses_subscription_scoped_invoice_fallback(monkeypatch, settings):
+    pytest.importorskip("stripe")
+    settings.STRIPE_SECRET_KEY = "sk_test_123"
+    user, _profile = _mk_user_profile()
+
+    monkeypatch.setattr(
+        "accounts.views.stripe.Subscription.retrieve",
+        lambda *_a, **_k: {
+            "items": {
+                "data": [
+                    {
+                        "price": {
+                            "unit_amount": 4900,
+                            "currency": "usd",
+                            "recurring": {"interval": "month", "interval_count": 1},
+                        }
+                    }
+                ]
+            },
+            "default_payment_method": None,
+        },
+    )
+    monkeypatch.setattr("accounts.views.stripe.Subscription.list", lambda *_a, **_k: {"data": []})
+    monkeypatch.setattr("accounts.views.stripe.Customer.retrieve", lambda *_a, **_k: {})
+
+    def _invoice_list(*_a, **kwargs):
+        if kwargs.get("customer"):
+            return {"data": []}
+        if kwargs.get("subscription"):
+            return {
+                "data": [
+                    {
+                        "id": "in_123",
+                        "number": "INV-123",
+                        "created": 1704067200,
+                        "amount_paid": 4900,
+                        "currency": "usd",
+                        "status": "paid",
+                        "status_transitions": {"paid_at": 1704067300},
+                    }
+                ]
+            }
+        return {"data": []}
+
+    monkeypatch.setattr("accounts.views.stripe.Invoice.list", _invoice_list)
+    monkeypatch.setattr("accounts.views.stripe.PaymentMethod.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr("accounts.views.stripe.PaymentIntent.retrieve", lambda *_a, **_k: {})
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.get("/api/billing/summary/")
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["invoices"]) == 1
+    assert body["invoices"][0]["id"] == "INV-123"
+
+
+@pytest.mark.django_db
+def test_billing_summary_falls_back_to_owned_profile_with_customer_id(monkeypatch, settings):
+    pytest.importorskip("stripe")
+    settings.STRIPE_SECRET_KEY = "sk_test_123"
+
+    owner = User.objects.create_user(username="owner_main@example.com", email="owner_main@example.com", password="pw")
+    external_owner = User.objects.create_user(username="other@example.com", email="other@example.com", password="pw")
+    owned = BusinessProfile.objects.create(
+        user=owner,
+        is_main=True,
+        business_name="Owned Billing",
+        stripe_customer_id="cus_owned_real",
+        stripe_subscription_id="sub_owned_real",
+        plan=BusinessProfile.PLAN_PRO,
+    )
+    external = BusinessProfile.objects.create(
+        user=external_owner,
+        is_main=True,
+        business_name="External Workspace",
+        stripe_customer_id="",
+        stripe_subscription_id="",
+        plan=BusinessProfile.PLAN_PRO,
+    )
+    BusinessProfileMembership.objects.create(
+        business_profile=external,
+        user=owner,
+        role=BusinessProfileMembership.ROLE_ADMIN,
+        is_owner=False,
+        hidden_from_team_ui=False,
+    )
+
+    seen_customers: list[str] = []
+
+    monkeypatch.setattr(
+        "accounts.views.stripe.Subscription.retrieve",
+        lambda *_a, **_k: {
+            "items": {"data": [{"price": {"unit_amount": 4900, "currency": "usd", "recurring": {"interval": "month"}}}]},
+            "default_payment_method": None,
+        },
+    )
+    monkeypatch.setattr("accounts.views.stripe.Subscription.list", lambda *_a, **_k: {"data": []})
+    monkeypatch.setattr("accounts.views.stripe.Customer.retrieve", lambda *_a, **_k: {})
+
+    def _invoice_list(*_a, **kwargs):
+        if kwargs.get("customer"):
+            seen_customers.append(str(kwargs.get("customer")))
+        return {"data": []}
+
+    monkeypatch.setattr("accounts.views.stripe.Invoice.list", _invoice_list)
+    monkeypatch.setattr("accounts.views.stripe.PaymentMethod.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr("accounts.views.stripe.PaymentIntent.retrieve", lambda *_a, **_k: {})
+
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    res = client.get("/api/billing/summary/")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["plan_label"] == "Pro"
+    assert seen_customers == ["cus_owned_real"]
+    owned.refresh_from_db()
+    assert owned.id != external.id
