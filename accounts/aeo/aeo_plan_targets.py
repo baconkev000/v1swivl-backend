@@ -1,9 +1,9 @@
 """
 Plan-derived monitored AEO prompt targets (production).
 
-Starter: 10 | Pro: 50 | Advanced: 100 — total monitored prompts per plan.
+Starter: 10 | Pro: 75 | Advanced: 150 — total monitored prompts per plan.
 
-Custom prompts (user-added) caps: Starter 10 | Pro 25 | Advanced 100.
+Custom prompts (user-added) caps: Starter 10 | Pro 25 | Advanced 50.
 
 PLAN_NONE and starter both use the starter caps.
 
@@ -21,12 +21,12 @@ from django.conf import settings
 from accounts.models import BusinessProfile
 
 AEO_PLAN_CAP_STARTER: int = 10
-AEO_PLAN_CAP_PRO: int = 50
-AEO_PLAN_CAP_ADVANCED: int = 100
+AEO_PLAN_CAP_PRO: int = 75
+AEO_PLAN_CAP_ADVANCED: int = 150
 
 AEO_CUSTOM_PROMPT_CAP_STARTER: int = 10
 AEO_CUSTOM_PROMPT_CAP_PRO: int = 25
-AEO_CUSTOM_PROMPT_CAP_ADVANCED: int = 100
+AEO_CUSTOM_PROMPT_CAP_ADVANCED: int = 50
 
 
 def aeo_monitored_prompt_cap_for_plan_slug(plan: str) -> int:

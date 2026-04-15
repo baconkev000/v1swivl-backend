@@ -22,6 +22,8 @@ User = get_user_model()
 
 @pytest.mark.django_db
 def test_cap_by_plan_slug():
+    assert AEO_PLAN_CAP_PRO == 75
+    assert AEO_PLAN_CAP_ADVANCED == 150
     assert aeo_monitored_prompt_cap_for_plan_slug("") == AEO_PLAN_CAP_STARTER
     assert aeo_monitored_prompt_cap_for_plan_slug("starter") == AEO_PLAN_CAP_STARTER
     assert aeo_monitored_prompt_cap_for_plan_slug("pro") == AEO_PLAN_CAP_PRO
@@ -30,6 +32,8 @@ def test_cap_by_plan_slug():
 
 @pytest.mark.django_db
 def test_custom_cap_by_plan_slug():
+    assert AEO_CUSTOM_PROMPT_CAP_PRO == 25
+    assert AEO_CUSTOM_PROMPT_CAP_ADVANCED == 50
     assert aeo_custom_monitored_prompt_cap_for_plan_slug("") == AEO_CUSTOM_PROMPT_CAP_STARTER
     assert aeo_custom_monitored_prompt_cap_for_plan_slug("starter") == AEO_CUSTOM_PROMPT_CAP_STARTER
     assert aeo_custom_monitored_prompt_cap_for_plan_slug("pro") == AEO_CUSTOM_PROMPT_CAP_PRO
