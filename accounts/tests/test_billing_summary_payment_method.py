@@ -2,7 +2,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
 
-from accounts.models import BusinessProfile, BusinessProfileMembership
+from accounts.models import BusinessProfile, BusinessProfileMembership, ThirdPartyApiErrorLog
 
 User = get_user_model()
 
@@ -324,3 +324,29 @@ def test_billing_summary_falls_back_to_owned_profile_with_customer_id(monkeypatc
     assert seen_customers == ["cus_owned_real"]
     owned.refresh_from_db()
     assert owned.id != external.id
+
+
+@pytest.mark.django_db
+def test_billing_summary_records_third_party_error_on_stripe_failure(monkeypatch, settings):
+    pytest.importorskip("stripe")
+    settings.STRIPE_SECRET_KEY = "sk_test_123"
+    user, _profile = _mk_user_profile()
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("stripe unavailable")
+
+    monkeypatch.setattr("accounts.views.stripe.Subscription.retrieve", _boom)
+    monkeypatch.setattr("accounts.views.stripe.Subscription.list", lambda *_a, **_k: {"data": []})
+    monkeypatch.setattr("accounts.views.stripe.Customer.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr("accounts.views.stripe.Invoice.list", lambda *_a, **_k: {"data": []})
+    monkeypatch.setattr("accounts.views.stripe.PaymentMethod.retrieve", lambda *_a, **_k: {})
+    monkeypatch.setattr("accounts.views.stripe.PaymentIntent.retrieve", lambda *_a, **_k: {})
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.get("/api/billing/summary/")
+    assert res.status_code == 200
+    row = ThirdPartyApiErrorLog.objects.filter(provider="stripe").order_by("-id").first()
+    assert row is not None
+    assert row.operation == "stripe.subscription.retrieve.billing_summary"
+    assert row.error_kind == ThirdPartyApiErrorLog.ErrorKind.UNKNOWN_EXCEPTION

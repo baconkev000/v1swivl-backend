@@ -37,6 +37,7 @@ from .models import (
     AgentConversation,
     AgentMessage,
     OnboardingOnPageCrawl,
+    ThirdPartyApiErrorLog,
 )
 
 # Third-party API cache: only refetch from GSC/GBP if last fetch was >= this long ago.
@@ -90,6 +91,7 @@ from .stripe_billing import normalize_stripe_payload
 from .stripe_billing import extract_sync_debug_fields
 from .stripe_billing import infer_sync_failure_reason
 from .stripe_billing import mask_email
+from .third_party_usage import record_third_party_api_error
 
 logger = logging.getLogger(__name__)
 _STRIPE_EVENT_SHAPE_LOGGED = False
@@ -367,6 +369,45 @@ def _safe_dt_from_unix(ts: int | None) -> datetime | None:
         return datetime.fromtimestamp(int(ts), tz=timezone.utc)
     except Exception:
         return None
+
+
+def _stripe_http_status_from_exception(exc: Exception) -> int | None:
+    raw = getattr(exc, "http_status", None)
+    if isinstance(raw, int):
+        return raw
+    try:
+        parsed = int(raw)
+        return parsed
+    except Exception:
+        return None
+
+
+def _record_billing_stripe_error(
+    *,
+    billing_profile: BusinessProfile | None,
+    operation: str,
+    exc: Exception,
+) -> None:
+    name = type(exc).__name__
+    http_status = _stripe_http_status_from_exception(exc)
+    lname = name.lower()
+    if "timeout" in lname:
+        kind = ThirdPartyApiErrorLog.ErrorKind.TIMEOUT
+    elif "connection" in lname:
+        kind = ThirdPartyApiErrorLog.ErrorKind.CONNECTION_ERROR
+    elif http_status is not None:
+        kind = ThirdPartyApiErrorLog.ErrorKind.HTTP_ERROR
+    else:
+        kind = ThirdPartyApiErrorLog.ErrorKind.UNKNOWN_EXCEPTION
+    record_third_party_api_error(
+        provider="stripe",
+        operation=operation,
+        error_kind=kind,
+        http_status=http_status,
+        message=f"{name}: {str(exc)[:400]}",
+        detail=f"billing_summary operation={operation}",
+        business_profile=billing_profile,
+    )
 
 
 def _seo_snapshot_context_for_profile(profile: BusinessProfile | None) -> tuple[str, int]:
@@ -1878,11 +1919,21 @@ def billing_summary(request: HttpRequest) -> Response:
 
     secret = str(getattr(settings, "STRIPE_SECRET_KEY", "") or "").strip()
     if not secret or not customer_id:
+        logger.info(
+            "[billing_summary] skipped_stripe profile_id=%s billing_profile_id=%s has_secret=%s has_customer_id=%s",
+            profile.id,
+            billing_profile.id,
+            bool(secret),
+            bool(customer_id),
+        )
         return Response(out)
 
     stripe.api_key = secret
 
     subscription_dict: dict | None = None
+    subscription_retrieve_ok = False
+    subscription_list_ok = False
+    invoice_list_ok = False
     if subscription_id:
         try:
             subscription = stripe.Subscription.retrieve(
@@ -1892,8 +1943,14 @@ def billing_summary(request: HttpRequest) -> Response:
             nsub = normalize_stripe_payload(subscription)
             if isinstance(nsub, dict):
                 subscription_dict = nsub
-        except Exception:
+                subscription_retrieve_ok = True
+        except Exception as exc:
             logger.exception("[billing_summary] failed to retrieve Stripe subscription id=%s", subscription_id)
+            _record_billing_stripe_error(
+                billing_profile=billing_profile,
+                operation="stripe.subscription.retrieve.billing_summary",
+                exc=exc,
+            )
 
     if subscription_dict is None:
         try:
@@ -1910,8 +1967,14 @@ def billing_summary(request: HttpRequest) -> Response:
                 if sub_rows:
                     sub_rows.sort(key=_subscription_rank_for_billing)
                     subscription_dict = sub_rows[0]
-        except Exception:
+            subscription_list_ok = True
+        except Exception as exc:
             logger.exception("[billing_summary] failed to list Stripe subscriptions customer=%s", customer_id)
+            _record_billing_stripe_error(
+                billing_profile=billing_profile,
+                operation="stripe.subscription.list.billing_summary",
+                exc=exc,
+            )
 
     if isinstance(subscription_dict, dict):
         price_obj = _price_obj_from_subscription_dict(subscription_dict)
@@ -1944,6 +2007,7 @@ def billing_summary(request: HttpRequest) -> Response:
             if isinstance(rows_sub, list) and rows_sub:
                 rows = rows_sub
         invoice_rows = rows if isinstance(rows, list) else []
+        invoice_list_ok = True
         invoices_out: list[dict] = []
         if isinstance(rows, list):
             for raw in rows:
@@ -1971,8 +2035,13 @@ def billing_summary(request: HttpRequest) -> Response:
                     }
                 )
         out["invoices"] = invoices_out
-    except Exception:
+    except Exception as exc:
         logger.exception("[billing_summary] failed to list Stripe invoices customer=%s", customer_id)
+        _record_billing_stripe_error(
+            billing_profile=billing_profile,
+            operation="stripe.invoice.list.billing_summary",
+            exc=exc,
+        )
 
     out["payment_method"] = _billing_resolve_payment_method(
         customer_id=customer_id,
@@ -1990,6 +2059,20 @@ def billing_summary(request: HttpRequest) -> Response:
         except Exception:
             logger.exception("[billing_summary] failed to persist renewal fallback profile_id=%s", billing_profile.id)
 
+    logger.info(
+        "[billing_summary] stripe_result profile_id=%s billing_profile_id=%s customer_id=%s subscription_id=%s subscription_retrieve_ok=%s subscription_list_ok=%s invoice_list_ok=%s price_month=%s renewal_date=%s invoice_count=%s payment_method_present=%s",
+        profile.id,
+        billing_profile.id,
+        customer_id,
+        subscription_id,
+        subscription_retrieve_ok,
+        subscription_list_ok,
+        invoice_list_ok,
+        out.get("price_month"),
+        bool(out.get("renewal_date")),
+        len(out.get("invoices", []) or []),
+        bool(out.get("payment_method")),
+    )
     return Response(out)
 
 
