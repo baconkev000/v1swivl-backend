@@ -27,28 +27,44 @@ def should_create_owned_main_business_profile_for_user(user: Any) -> bool:
     return True
 
 
+def user_has_external_workspace_membership(user: Any) -> bool:
+    if user is None or isinstance(user, AnonymousUser) or not user.is_authenticated:
+        return False
+    return BusinessProfileMembership.objects.filter(user=user).exclude(business_profile__user=user).exists()
+
+
 def resolve_main_business_profile_for_user(user: Any) -> BusinessProfile | None:
     """
     Prefer a team workspace the user was invited to (membership on another user's profile),
     then fall back to profiles they own.
     """
+    profile, _source = resolve_main_business_profile_for_user_with_source(user)
+    return profile
+
+
+def resolve_main_business_profile_for_user_with_source(user: Any) -> tuple[BusinessProfile | None, str]:
     if user is None or isinstance(user, AnonymousUser) or not user.is_authenticated:
-        return None
+        return None, "unauthenticated"
 
     qs = BusinessProfileMembership.objects.filter(user=user).select_related("business_profile")
-    external = qs.exclude(business_profile__user=user).order_by("pk").first()
+    visible_qs = qs.filter(hidden_from_team_ui=False)
+    external = visible_qs.exclude(business_profile__user=user).order_by("pk").first()
     if external is not None:
-        return external.business_profile
+        return external.business_profile, "external_membership"
 
     owned = BusinessProfile.objects.filter(user=user)
     owned_main = owned.filter(is_main=True).first() or owned.first()
     if owned_main is not None:
-        return owned_main
+        return owned_main, "owned_main"
+
+    any_visible = visible_qs.order_by("-is_owner", "pk").first()
+    if any_visible is not None:
+        return any_visible.business_profile, "membership_fallback_visible"
 
     any_m = qs.order_by("-is_owner", "pk").first()
     if any_m is not None:
-        return any_m.business_profile
-    return None
+        return any_m.business_profile, "membership_fallback_hidden"
+    return None, "none"
 
 
 def get_membership(user: Any, profile: BusinessProfile | None) -> BusinessProfileMembership | None:

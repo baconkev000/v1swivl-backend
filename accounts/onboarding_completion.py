@@ -6,7 +6,10 @@ Used by auth/status, post-login redirects, and should stay aligned with onboardi
 from __future__ import annotations
 
 from .dataforseo_utils import normalize_domain
-from .business_profile_access import resolve_main_business_profile_for_user
+from .business_profile_access import (
+    resolve_main_business_profile_for_user,
+    user_has_external_workspace_membership,
+)
 from .models import (
     AEOExecutionRun,
     AEOExtractionSnapshot,
@@ -138,5 +141,7 @@ def business_profile_fully_onboarded(profile: BusinessProfile | None) -> bool:
 def user_has_completed_full_onboarding(user) -> bool:
     if user is None or not user.is_authenticated:
         return False
+    if user_has_external_workspace_membership(user):
+        return True
     profile = resolve_main_business_profile_for_user(user)
     return business_profile_fully_onboarded(profile)

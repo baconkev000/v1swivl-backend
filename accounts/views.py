@@ -22,6 +22,7 @@ from rest_framework.response import Response
 from .business_profile_access import (
     get_membership,
     resolve_main_business_profile_for_user,
+    resolve_main_business_profile_for_user_with_source,
     should_create_owned_main_business_profile_for_user,
     viewer_team_access,
     workspace_data_user,
@@ -59,6 +60,10 @@ from .dataforseo_utils import (
 )
 from .constants import SEO_SNAPSHOT_TTL
 from .onboarding_completion import user_has_completed_full_onboarding
+from .user_identity_reconciliation import (
+    authenticate_by_email_candidates,
+    reconcile_user_identity_for_email,
+)
 from . import openai_utils
 from . import debug_log as _debug
 from .aeo.prompt_scan_progress import monitored_prompt_keys_in_order, prompt_scan_completed_count
@@ -118,6 +123,38 @@ def _stripe_get_nested(obj, *path, default=None):
 # Prompt coverage + pending checks: stored AEOResponseSnapshot.platform values we surface in the UI.
 _AEO_COVERAGE_PLATFORM_SET = frozenset({"openai", "gemini", "perplexity"})
 User = get_user_model()
+
+
+def _reconcile_request_user_identity(request: HttpRequest, *, reason: str) -> None:
+    user = getattr(request, "user", None)
+    if user is None or not getattr(user, "is_authenticated", False):
+        return
+    result = reconcile_user_identity_for_email(
+        getattr(user, "email", ""),
+        preferred_user=user,
+        reason=reason,
+    )
+    canonical = result.user
+    if canonical is None or canonical.id == user.id:
+        return
+    backend = getattr(user, "backend", None) or getattr(canonical, "backend", None)
+    if not backend:
+        backends = list(getattr(settings, "AUTHENTICATION_BACKENDS", []) or [])
+        backend = backends[0] if backends else None
+    if backend:
+        login(request, canonical, backend=backend)
+    else:
+        login(request, canonical)
+    request.user = canonical
+    logger.info(
+        "[identity_reconcile] reason=%s switched_user_id=%s->%s reconciled=%s memberships=%s owned_profiles=%s",
+        reason,
+        user.id,
+        canonical.id,
+        result.reconciled,
+        result.membership_count,
+        result.owned_profile_count,
+    )
 
 
 def _money_minor_to_decimal_str(amount_minor: int | None) -> str:
@@ -343,11 +380,20 @@ def auth_status(request: HttpRequest) -> Response:
     """
     if not request.user.is_authenticated:
         return Response({"authenticated": False, "onboarding_complete": False})
+    _reconcile_request_user_identity(request, reason="auth_status")
     try:
         onboarding_complete = user_has_completed_full_onboarding(request.user)
     except Exception:
         logger.exception("[auth_status] business profile check failed")
         onboarding_complete = False
+    profile, resolution_source = resolve_main_business_profile_for_user_with_source(request.user)
+    logger.info(
+        "[auth_status] user_id=%s onboarding_complete=%s resolved_profile_id=%s resolution_source=%s",
+        request.user.id,
+        onboarding_complete,
+        getattr(profile, "id", None),
+        resolution_source,
+    )
     return Response(
         {"authenticated": True, "onboarding_complete": onboarding_complete},
     )
@@ -757,17 +803,29 @@ def api_auth_login(request: HttpRequest) -> Response:
     password = request.data.get("password") or ""
     if not email or not password:
         return Response({"error": "Email and password are required"}, status=400)
-    user = User.objects.filter(email__iexact=email).first()
-    if user is not None:
-        if not user.check_password(password):
-            return Response({"error": "Invalid email or password"}, status=400)
-    else:
-        user = authenticate(request, username=email, password=password)
-        if user is None:
-            return Response({"error": "Invalid email or password"}, status=400)
+    authenticated_user = authenticate_by_email_candidates(email, password)
+    if authenticated_user is None:
+        return Response({"error": "Invalid email or password"}, status=400)
+    reconcile = reconcile_user_identity_for_email(
+        email,
+        preferred_user=authenticated_user,
+        reason="api_auth_login",
+    )
+    user = reconcile.user or authenticated_user
     if not user.is_active:
         return Response({"error": "Account is disabled"}, status=400)
     login(request, user)
+    profile, resolution_source = resolve_main_business_profile_for_user_with_source(user)
+    logger.info(
+        "[api_auth_login] user_id=%s reconciled=%s merged_user_ids=%s membership_count=%s owned_profile_count=%s resolved_profile_id=%s resolution_source=%s",
+        user.id,
+        reconcile.reconciled,
+        ",".join(str(x) for x in reconcile.merged_user_ids),
+        reconcile.membership_count,
+        reconcile.owned_profile_count,
+        getattr(profile, "id", None),
+        resolution_source,
+    )
     try:
         done = user_has_completed_full_onboarding(user)
     except Exception:
@@ -789,11 +847,27 @@ def api_auth_register(request: HttpRequest) -> Response:
             {"error": "Valid email and password (min 6 characters) required"},
             status=400,
         )
-    if User.objects.filter(email__iexact=email).exists() or User.objects.filter(
-        username__iexact=email
-    ).exists():
-        return Response({"error": "An account with this email already exists"}, status=400)
-    user = User.objects.create_user(username=email, email=email, password=password)
+    existing_email_rows = list(User.objects.filter(email__iexact=email).order_by("id"))
+    if existing_email_rows:
+        placeholder = next((u for u in existing_email_rows if not u.has_usable_password()), None)
+        if placeholder is None:
+            return Response({"error": "An account with this email already exists"}, status=400)
+        placeholder.set_password(password)
+        if not (placeholder.username or "").strip():
+            placeholder.username = email
+            placeholder.save(update_fields=["password", "username"])
+        else:
+            placeholder.save(update_fields=["password"])
+        reconcile = reconcile_user_identity_for_email(
+            email,
+            preferred_user=placeholder,
+            reason="api_auth_register_placeholder",
+        )
+        user = reconcile.user or placeholder
+    else:
+        if User.objects.filter(username__iexact=email).exists():
+            return Response({"error": "An account with this email already exists"}, status=400)
+        user = User.objects.create_user(username=email, email=email, password=password)
     if should_create_owned_main_business_profile_for_user(user):
         bp = BusinessProfile.objects.create(user=user, is_main=True)
         BusinessProfileMembership.objects.get_or_create(
@@ -805,6 +879,15 @@ def api_auth_register(request: HttpRequest) -> Response:
             },
         )
     login(request, user)
+    profile, resolution_source = resolve_main_business_profile_for_user_with_source(user)
+    logger.info(
+        "[api_auth_register] user_id=%s resolved_profile_id=%s resolution_source=%s memberships=%s owned_profiles=%s",
+        user.id,
+        getattr(profile, "id", None),
+        resolution_source,
+        BusinessProfileMembership.objects.filter(user=user).count(),
+        BusinessProfile.objects.filter(user=user).count(),
+    )
     return Response({"ok": True, "redirect": "/onboarding"})
 
 
@@ -1503,6 +1586,7 @@ def business_profile(request: HttpRequest) -> Response:
     in the serializer (returns null/empty SEO fields and a stub AEO bundle). Use during onboarding
     to avoid paid API calls when only updating basic fields.
     """
+    _reconcile_request_user_identity(request, reason="business_profile")
     profile = resolve_main_business_profile_for_user(request.user)
     if profile is None:
         if not should_create_owned_main_business_profile_for_user(request.user):
