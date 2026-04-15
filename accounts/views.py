@@ -3382,24 +3382,25 @@ def aeo_competitors_data(request: HttpRequest) -> Response:
         )
 
     suggested = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        dom = str(row.get("domain") or "").strip().lower()
-        if not dom or dom in tracked_domains:
-            continue
-        suggested.append(
-            {
-                "domain": dom,
-                "display_name": str(row.get("display_name") or dom),
-                "appearances": int(row.get("appearances") or 0),
-                "visibility_pct": float(row.get("visibility_pct") or 0.0),
-                "rank": int(row.get("rank") or 0),
-                "last_seen_at": row.get("last_seen_at"),
-            },
-        )
-        if len(suggested) >= 5:
-            break
+    if len(tracked) <= 3:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dom = str(row.get("domain") or "").strip().lower()
+            if not dom or dom in tracked_domains:
+                continue
+            suggested.append(
+                {
+                    "domain": dom,
+                    "display_name": str(row.get("display_name") or dom),
+                    "appearances": int(row.get("appearances") or 0),
+                    "visibility_pct": float(row.get("visibility_pct") or 0.0),
+                    "rank": int(row.get("rank") or 0),
+                    "last_seen_at": row.get("last_seen_at"),
+                },
+            )
+            if len(suggested) >= 5:
+                break
 
     total_slots = int(getattr(snapshot, "total_slots", 0) or 0) if snapshot is not None else 0
     return Response(

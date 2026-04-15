@@ -157,3 +157,27 @@ def test_competitors_api_limits_suggested_to_top_five(client) -> None:
     assert res.status_code == 200
     payload = res.json()
     assert len(payload["suggested_competitors"]) == 5
+
+
+@pytest.mark.django_db
+def test_competitors_api_hides_suggested_when_more_than_three_tracked(client) -> None:
+    user = User.objects.create_user(username="c6@example.com", email="c6@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Self",
+        website_url="https://self.com",
+    )
+    tracked_domains = ["beta.com", "charlie.com", "delta.com", "echo.com"]
+    for dom in tracked_domains:
+        tc = TrackedCompetitor.objects.create(name=dom.split(".")[0].title(), domain=dom)
+        profile.tracked_competitors.add(tc)
+    for i, dom in enumerate(["alpha.com", "beta.com", "gamma.com", "theta.com"], start=1):
+        _make_slot(profile, f"slot-x-{i}", [{"name": dom, "url": f"https://{dom}"}])
+
+    client.force_login(user)
+    res = client.get("/api/aeo/competitors/")
+    assert res.status_code == 200
+    payload = res.json()
+    assert len(payload["tracked_competitors"]) == 4
+    assert payload["suggested_competitors"] == []
