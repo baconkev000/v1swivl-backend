@@ -5,8 +5,9 @@ If ``makemigrations`` emitted ``RenameIndex`` from ``accounts_aeo_prompt_agg_pro
 but that index never existed under that name (auto-generated name differed, or 0048 did not apply),
 ``migrate`` fails. This migration renames a matching existing index or creates the missing one.
 
-If you have a separate migration that only contains the failing ``RenameIndex``, remove that
-operation (or replace it with ``RunPython(noop)``) after this file is merged, then ``migrate``.
+If ``makemigrations`` later emits ``RenameIndex`` for the same names, see
+``0075_rename_accounts_aeo_prompt_agg_profile_run_status_idx_acct_aeoagg_runstat_idx_and_more``:
+it reconciles duplicate short + legacy long indexes on PostgreSQL.
 """
 
 from django.db import migrations

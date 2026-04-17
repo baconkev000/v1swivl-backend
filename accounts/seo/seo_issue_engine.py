@@ -726,7 +726,9 @@ def _impact_payload(issue_id: str, *, search_volume: int, rank: int | None, prio
 def _detected_issues(issue_id: str, ev: dict[str, Any]) -> list[str]:
     out: list[str] = []
     if issue_id == "missing_keyword_page":
-        out.append(f"No ranking URL detected for '{ev.get('primary_keyword') or ev.get('keyword') or 'target keyword'}'")
+        out.append(
+            f"Ranking URL not detected in analyzed signals for '{ev.get('primary_keyword') or ev.get('keyword') or 'target keyword'}'",
+        )
         out.append(f"Search volume is {int(ev.get('search_volume') or 0)} per month")
     elif issue_id == "improve_existing_page":
         out.append(f"Current best rank is {ev.get('rank')} for cluster keyword")
@@ -743,21 +745,21 @@ def _detected_issues(issue_id: str, ev: dict[str, Any]) -> list[str]:
         out.append(f"FAQ blocks found: {int(ev.get('faq_blocks_found') or 0)}")
         out.append(f"FAQ schema present: {bool(ev.get('faq_schema_present'))}")
     elif issue_id == "missing_quick_answer_block":
-        out.append("No quick answer block detected near top of page")
-        out.append("Answer block count is zero or unavailable")
+        out.append("Quick answer block not detected near top of analyzed page content")
+        out.append("Quick-answer block count in analyzed extraction: zero or unavailable (not proof of absence site-wide)")
     elif issue_id == "missing_structured_facts":
-        out.append("No structured facts block detected (bullets/table)")
-        out.append("Pricing/timeline/facts are not presented in a scannable format")
+        out.append("Structured facts block (bullets/table) not detected in analyzed page content")
+        out.append("Pricing/timeline/facts not surfaced in a scannable format in extracted content")
     elif issue_id == "missing_comparison_table":
         out.append("Decision-intent keyword cluster detected")
-        out.append("No comparison table found on target page")
+        out.append("Comparison table not detected on analyzed target page")
     elif issue_id == "weak_entity_signals":
-        out.append(f"Organization schema present: {bool(ev.get('organization_schema_present'))}")
-        out.append(f"About page signal present: {bool(ev.get('about_page_present'))}")
+        out.append(f"Organization schema present in analyzed signals: {bool(ev.get('organization_schema_present'))}")
+        out.append(f"About page signal present in analyzed signals: {bool(ev.get('about_page_present'))}")
     elif issue_id == "missing_local_trust_signals":
-        out.append("No address found on page")
-        out.append("No LocalBusiness schema detected")
-        out.append("No customer reviews visible")
+        out.append("Address not detected in extracted page content used for this audit")
+        out.append("LocalBusiness JSON-LD not detected in crawl/schema signals used for this audit")
+        out.append("Customer reviews not detected in extracted content / signals used for this audit")
     if not out:
         out.append("Deterministic issue signal detected from ranking and on-page evidence")
     return out
@@ -837,8 +839,9 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
     if issue_id == "missing_keyword_page":
         issue_label = "Create one authority page for clustered demand"
         why = (
-            f"Related demand around '{keyword}' totals ~{search_volume}/mo, but no single page currently owns this intent on your site. "
-            f"Current rank is {ev.get('rank')}, so AI assistants and answer engines have no clear page to cite."
+            f"Demand for '{keyword}' and related queries is ~{search_volume}/mo in analyzed keyword data. "
+            f"Publish one authority page structured for extractable answers and FAQs so answer engines can cite a single definitive URL "
+            f"(observed rank in this audit: {ev.get('rank')})."
         )
         fix = (
             f"Create one new authority page at {blueprint_url} for keyword cluster '{keyword}'."
@@ -920,7 +923,10 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
             f"Your page has {int(ev.get('user_word_count') or 0)} words vs competitor average "
             f"{int(ev.get('competitor_avg_word_count') or 0)}."
         )
-        fix = f"Expand {url or blueprint_url} with missing sections and a structured facts block."
+        fix = (
+            f"Expand {url or blueprint_url} with additional depth and a structured facts block "
+            f"(prioritize sections that are thin in analyzed page content)."
+        )
         execution = {
             "page_blueprint": {
                 "url": url or blueprint_url,
@@ -940,7 +946,10 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
         aeo_boost = "Expanded coverage gives AI systems more relevant passages for follow-up questions."
     elif issue_id == "missing_quick_answer_block":
         issue_label = "Add top-of-page quick answer block"
-        why = f"Search demand is ~{search_volume}/mo and no quick answer block is detected on the target page."
+        why = (
+            f"Search demand is ~{search_volume}/mo in analyzed data; add a quick answer block immediately below H1 "
+            f"so assistants can extract a concise, citation-ready passage from {url or blueprint_url}."
+        )
         fix = f"Insert a 2–3 sentence direct answer immediately below H1 on {url or blueprint_url}."
         execution = {
             "ai_citation_block": _citation_block(keyword),
@@ -949,7 +958,10 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
         aeo_boost = "Short direct answers are high-probability citation snippets."
     elif issue_id == "missing_structured_facts":
         issue_label = "Add structured facts section"
-        why = f"Search demand is ~{search_volume}/mo and no structured facts block is detected."
+        why = (
+            f"Search demand is ~{search_volume}/mo in analyzed data; publish a structured facts block (bullets or table) "
+            f"on {url or blueprint_url} so answer engines can quote concrete ranges and constraints."
+        )
         fix = f"Add a bullet list or table with pricing, duration, benefits, and limitations on {url or blueprint_url}."
         execution = {
             "ai_citation_block": _citation_block(keyword),
@@ -958,7 +970,10 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
         aeo_boost = "Structured fact blocks increase quotable, low-ambiguity content for assistants."
     elif issue_id == "missing_comparison_table":
         issue_label = "Add comparison table for decision intent"
-        why = f"Decision-intent cluster (~{search_volume}/mo) has no comparison table on the target page."
+        why = (
+            f"Decision-intent cluster (~{search_volume}/mo in analyzed data); add a comparison table under a dedicated H2 "
+            f"on {url or blueprint_url} to strengthen extractable decision summaries for assistants."
+        )
         fix = f"Add a comparison table under a dedicated H2 on {url or blueprint_url}."
         execution = {
             "page_blueprint": {
@@ -974,8 +989,8 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
     elif issue_id == "missing_faq_for_question_intent":
         issue_label = "Add FAQ block for question-intent traffic"
         why = (
-            f"Question intent is detected and FAQ blocks found={int(ev.get('faq_blocks_found') or 0)}; "
-            f"cluster demand is ~{search_volume}/mo."
+            f"Question-style intent is present for this cluster (~{search_volume}/mo in analyzed data); "
+            f"add or expand 3–5 FAQ Q&A pairs on {url or blueprint_url} so assistants can extract direct answers."
         )
         fix = f"Add 3–5 FAQ Q&A pairs on {url or blueprint_url} using direct wording from user intent."
         execution = {
@@ -987,8 +1002,8 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
     elif issue_id == "weak_entity_signals":
         issue_label = "Build stronger entity trust signals"
         why = (
-            f"Organization schema present={bool(ev.get('organization_schema_present'))}, "
-            f"about page present={bool(ev.get('about_page_present'))}; weak entity signals reduce citation trust."
+            "Strengthen verifiable entity signals (consistent business name, location, credentials, and proof) "
+            "across About, footer, and key service pages so answer engines can attribute citations with higher confidence."
         )
         fix = "Add clear entity details and proof blocks on About, footer, and service pages."
         execution = {
@@ -1006,9 +1021,13 @@ def build_structured_recommendation(issue: Dict[str, Any]) -> Dict[str, Any]:
     elif issue_id == "missing_local_trust_signals":
         issue_label = "Build local trust block"
         why = (
-            "Local-intent cluster is detected but no address, LocalBusiness schema, or review signals are present."
+            "Local-intent cluster is present in analyzed keyword data; add visible NAP, LocalBusiness JSON-LD, "
+            "and first-party review proof on analyzed landing pages so location-aware answers can cite verifiable trust signals."
         )
-        fix = f"Add a local trust block on {url or blueprint_url} with address, service area, reviews, and credentials."
+        fix = (
+            f"Add a local trust block on {url or blueprint_url} with visible NAP, service area, first-party reviews, "
+            f"and credentials (verify and publish even if some signals exist outside analyzed excerpts)."
+        )
         execution = {
             "local_trust_block": {
                 "elements": ["address", "reviews", "credentials", "service_area"],

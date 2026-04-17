@@ -2222,11 +2222,12 @@ def billing_summary(request: HttpRequest) -> Response:
 @permission_classes([IsAuthenticated])
 def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
     """
-    DEBUG only: set fake Stripe billing fields so onboarding_complete passes without Payment Links.
+    Set fake Stripe billing fields so onboarding can complete without Payment Links.
 
-    Returns 404 when DEBUG is False (production and typical staging).
+    Enabled when DJANGO_DEBUG is True (local) or when ALLOW_ONBOARDING_BILLING_BYPASS is True
+    (explicit staging opt-in). Otherwise returns 404 (production default).
     """
-    if not settings.DEBUG:
+    if not (settings.DEBUG or settings.ALLOW_ONBOARDING_BILLING_BYPASS):
         return Response(status=404)
 
     profile = resolve_main_business_profile_for_user(request.user)
