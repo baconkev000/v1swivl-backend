@@ -89,6 +89,55 @@ def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> li
     return []
 
 
+def _skip_heavy_latest_seo_snapshot_actions_payload(user) -> dict:
+    """
+    When ``skip_heavy_profile_metrics`` avoids calling DataForSEO, still expose stored
+    SEO overview actions from the latest ``SEOOverviewSnapshot`` for this user (same
+    ordering as ``get_top_keywords`` skip-heavy branch: ``-last_fetched_at``, ``-id``).
+    """
+    if not user:
+        return {
+            "seo_next_steps": [],
+            "keyword_action_suggestions": [],
+            "seo_structured_issues": [],
+            "enrichment_status": "complete",
+        }
+    snap = (
+        SEOOverviewSnapshot.objects.filter(user=user)
+        .order_by("-last_fetched_at", "-id")
+        .only(
+            "seo_next_steps",
+            "keyword_action_suggestions",
+            "seo_structured_issues",
+            "keywords_enriched_at",
+            "seo_next_steps_refreshed_at",
+            "keyword_action_suggestions_refreshed_at",
+        )
+        .first()
+    )
+    if snap is None:
+        return {
+            "seo_next_steps": [],
+            "keyword_action_suggestions": [],
+            "seo_structured_issues": [],
+            "enrichment_status": "complete",
+        }
+    steps = getattr(snap, "seo_next_steps", None) or []
+    kws = getattr(snap, "keyword_action_suggestions", None) or []
+    issues = getattr(snap, "seo_structured_issues", None) or []
+    enrichment_status = "complete" if (
+        getattr(snap, "keywords_enriched_at", None)
+        and getattr(snap, "seo_next_steps_refreshed_at", None)
+        and getattr(snap, "keyword_action_suggestions_refreshed_at", None)
+    ) else "pending"
+    return {
+        "seo_next_steps": list(steps) if isinstance(steps, list) else [],
+        "keyword_action_suggestions": list(kws) if isinstance(kws, list) else [],
+        "seo_structured_issues": list(issues) if isinstance(issues, list) else [],
+        "enrichment_status": enrichment_status,
+    }
+
+
 def _aeo_prompt_target_count() -> int:
     """Backward-compatible global default when no profile is in context (tests, helpers)."""
     return aeo_fallback_global_target_count()
@@ -142,6 +191,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     aeo_status = serializers.SerializerMethodField()
     aeo_last_computed_at = serializers.SerializerMethodField()
     keyword_action_suggestions = serializers.SerializerMethodField()
+    seo_structured_issues = serializers.SerializerMethodField()
     enrichment_status = serializers.SerializerMethodField()
     seo_metrics_location_mode = serializers.SerializerMethodField()
     seo_location_label = serializers.SerializerMethodField()
@@ -219,6 +269,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "aeo_status",
             "aeo_last_computed_at",
             "keyword_action_suggestions",
+            "seo_structured_issues",
             "enrichment_status",
             "seo_metrics_location_mode",
             "seo_location_label",
@@ -619,7 +670,24 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             return from_bundle
         return _fallback_top_keywords_from_stored_snapshots(obj)
 
+    def _get_skip_heavy_seo_actions_payload(self, obj: BusinessProfile) -> dict:
+        cache_attr = "_skip_heavy_seo_actions_payload_by_profile_id"
+        cache_map = getattr(self, cache_attr, None)
+        pid = getattr(obj, "id", None)
+        if isinstance(cache_map, dict) and pid in cache_map:
+            return cache_map[pid]
+        user = getattr(obj, "user", None)
+        payload = _skip_heavy_latest_seo_snapshot_actions_payload(user)
+        if not isinstance(cache_map, dict):
+            cache_map = {}
+        cache_map[pid] = payload
+        setattr(self, cache_attr, cache_map)
+        return payload
+
     def get_seo_next_steps(self, obj: BusinessProfile):
+        context = getattr(self, "context", {}) or {}
+        if context.get("skip_heavy_profile_metrics"):
+            return self._get_skip_heavy_seo_actions_payload(obj).get("seo_next_steps") or []
         bundle = self._get_seo_bundle(obj)
         if not bundle:
             return []
@@ -964,13 +1032,29 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         return bundle.get("aeo_last_computed_at")
 
     def get_keyword_action_suggestions(self, obj: BusinessProfile):
+        context = getattr(self, "context", {}) or {}
+        if context.get("skip_heavy_profile_metrics"):
+            return self._get_skip_heavy_seo_actions_payload(obj).get("keyword_action_suggestions") or []
         bundle = self._get_seo_bundle(obj)
         if not bundle:
             return []
         # List of {\"keyword\": str, \"suggestion\": str}
         return bundle.get("keyword_action_suggestions") or []
 
+    def get_seo_structured_issues(self, obj: BusinessProfile):
+        context = getattr(self, "context", {}) or {}
+        if context.get("skip_heavy_profile_metrics"):
+            return self._get_skip_heavy_seo_actions_payload(obj).get("seo_structured_issues") or []
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return []
+        raw = bundle.get("seo_structured_issues")
+        return list(raw) if isinstance(raw, list) else []
+
     def get_enrichment_status(self, obj: BusinessProfile) -> str:
+        context = getattr(self, "context", {}) or {}
+        if context.get("skip_heavy_profile_metrics"):
+            return str(self._get_skip_heavy_seo_actions_payload(obj).get("enrichment_status") or "complete")
         bundle = self._get_seo_bundle(obj)
         if not bundle:
             return "complete"
@@ -1028,6 +1112,7 @@ class BusinessProfileSEOSerializer(BusinessProfileSerializer):
             "top_keywords",
             "seo_next_steps",
             "keyword_action_suggestions",
+            "seo_structured_issues",
             "enrichment_status",
             "seo_metrics_location_mode",
             "seo_location_label",

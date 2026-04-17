@@ -4083,6 +4083,73 @@ def normalize_seo_snapshot_metrics(metrics: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def seo_issue_aux_context_for_snapshot(snapshot: Any) -> Dict[str, Any]:
+    """
+    Build ``on_page`` / ``serp`` blobs for ``build_structured_issues`` from data tied to the snapshot.
+
+    Uses the latest completed onboarding on-page crawl for a business profile whose website domain
+    matches ``snapshot.cached_domain`` (FAQ signals). SERP feature rows are not stored on the
+    snapshot today; callers may still pass ``serp`` via ``seo_data`` when available.
+    """
+    from .models import BusinessProfile, OnboardingOnPageCrawl
+
+    out_on: Dict[str, Any] = {}
+    out_serp: List[Dict[str, Any]] = []
+
+    domain = (getattr(snapshot, "cached_domain", "") or "").strip().lower()
+    if not domain:
+        return {"on_page": out_on, "serp": out_serp}
+
+    uid = getattr(snapshot, "user_id", None)
+    if not uid:
+        return {"on_page": out_on, "serp": out_serp}
+
+    profile = None
+    for p in BusinessProfile.objects.filter(user_id=uid).only("id", "website_url", "is_main"):
+        if normalize_domain(getattr(p, "website_url", "") or "") == domain:
+            profile = p
+            break
+    if profile is None:
+        profile = (
+            BusinessProfile.objects.filter(user_id=uid, is_main=True).only("id", "website_url").first()
+            or BusinessProfile.objects.filter(user_id=uid).only("id", "website_url").first()
+        )
+    if profile is None:
+        return {"on_page": out_on, "serp": out_serp}
+
+    crawl = (
+        OnboardingOnPageCrawl.objects.filter(
+            business_profile=profile,
+            domain__iexact=domain,
+            status=OnboardingOnPageCrawl.STATUS_COMPLETED,
+        )
+        .order_by("-id")
+        .first()
+    )
+    if not crawl:
+        return {"on_page": out_on, "serp": out_serp}
+
+    pages = list(getattr(crawl, "pages", None) or [])[:25]
+    if not pages:
+        return {"on_page": out_on, "serp": out_serp}
+
+    faq = compute_faq_readiness_for_pages(pages)
+    out_on["faq_blocks_found"] = int(faq.get("faq_blocks_found") or 0)
+    out_on["faq_schema_present"] = bool(faq.get("faq_schema_present"))
+    out_on["faq_content_present"] = out_on["faq_blocks_found"] > 0
+    first_url = ""
+    for pg in pages:
+        if isinstance(pg, dict):
+            u = str(pg.get("url") or pg.get("page_url") or "").strip()
+            if u:
+                first_url = u
+                break
+    if first_url:
+        out_on["user_url"] = first_url
+
+    return {"on_page": out_on, "serp": out_serp}
+
+
 def save_seo_snapshot(
     user,
     period_start,
@@ -4163,23 +4230,21 @@ def generate_or_get_next_steps(
     else:
         try:
             from .openai_utils import generate_seo_next_steps
-            steps = generate_seo_next_steps(result)
-            result["seo_next_steps"] = steps if steps else []
-        except Exception:
-            logger.exception("[SEO score] Failed to generate seo_next_steps for user_id=%s", getattr(user, "id", None))
-            result["seo_next_steps"] = []
-        try:
+
             snap, _ = SEOOverviewSnapshot.objects.get_or_create(
                 user=user,
                 period_start=period_start,
                 cached_location_mode=str(location_mode or "organic"),
                 cached_location_code=int(location_code or 0),
             )
+            steps = generate_seo_next_steps(result, snapshot=snap)
+            result["seo_next_steps"] = steps if steps else []
             snap.seo_next_steps = result.get("seo_next_steps") or []
             snap.seo_next_steps_refreshed_at = now_utc
             snap.save(update_fields=["seo_next_steps", "seo_next_steps_refreshed_at"])
         except Exception:
-            logger.exception("[SEO score] Failed to save seo_next_steps to snapshot for user_id=%s", getattr(user, "id", None))
+            logger.exception("[SEO score] Failed to generate seo_next_steps for user_id=%s", getattr(user, "id", None))
+            result["seo_next_steps"] = []
 
 
 def build_seo_response(
@@ -4194,6 +4259,8 @@ def build_seo_response(
     missed_searches_monthly: int,
     top_keywords: List[Dict[str, Any]],
     seo_next_steps: Optional[List[Any]] = None,
+    keyword_action_suggestions: Optional[List[Any]] = None,
+    seo_structured_issues: Optional[List[Any]] = None,
     enrichment_status: str = "complete",
     seo_metrics_location_mode: str = "organic",
     seo_location_label: str = "",
@@ -4234,6 +4301,10 @@ def build_seo_response(
         "missed_searches_monthly": int(normalized["missed_searches_monthly"] or 0),
         "top_keywords": top_keywords or [],
         "seo_next_steps": seo_next_steps if seo_next_steps is not None else [],
+        "keyword_action_suggestions": keyword_action_suggestions if keyword_action_suggestions is not None else [],
+        "seo_structured_issues": []
+        if seo_structured_issues is None
+        else list(seo_structured_issues),
         "enrichment_status": enrichment_status,
         "seo_metrics_location_mode": str(seo_metrics_location_mode or "organic"),
         **meta,
@@ -4256,6 +4327,8 @@ def _build_empty_seo_response(
         search_performance_score=fallback_score,
         organic_visitors=0, total_search_volume=0, estimated_search_appearances_monthly=0, keywords_ranking=0, top3_positions=0,
         search_visibility_percent=0, missed_searches_monthly=0, top_keywords=[], seo_next_steps=[],
+        keyword_action_suggestions=[],
+        seo_structured_issues=[],
         enrichment_status="complete",
         seo_metrics_location_mode=str(seo_metrics_location_mode or "organic"),
         seo_location_label=str(seo_location_label or ""),
@@ -4478,6 +4551,8 @@ def get_or_refresh_seo_score_for_user(
             missed_searches_monthly=int(getattr(snapshot, "missed_searches_monthly", 0) or 0),
             top_keywords=getattr(snapshot, "top_keywords", None) or [],
             seo_next_steps=getattr(snapshot, "seo_next_steps", None) or [],
+            keyword_action_suggestions=getattr(snapshot, "keyword_action_suggestions", None) or [],
+            seo_structured_issues=getattr(snapshot, "seo_structured_issues", None) or [],
             enrichment_status=enrichment_status,
             seo_metrics_location_mode=snap_mode,
             seo_location_label=snap_label,
@@ -4603,6 +4678,8 @@ def get_or_refresh_seo_score_for_user(
             missed_searches_monthly=int(agg["missed_searches_monthly"] or 0),
             top_keywords=top_keywords_ranked,
             seo_next_steps=[],
+            keyword_action_suggestions=[],
+            seo_structured_issues=[],
             enrichment_status="pending",
             seo_metrics_location_mode=str(location_mode or "organic"),
             seo_location_label=str(location_label or ""),

@@ -4,6 +4,9 @@ import pytest
 from django.contrib.auth import get_user_model
 
 from accounts.models import BusinessProfile
+from accounts.stripe_billing import (
+    AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS,
+)
 from accounts.stripe_billing import StripeSyncResult
 from accounts.stripe_billing import _resolve_profile_for_event
 from accounts.stripe_billing import apply_subscription_payload_to_profile
@@ -12,6 +15,19 @@ from accounts.stripe_billing import sync_from_invoice_paid
 from accounts.stripe_billing import sync_from_subscription
 
 User = get_user_model()
+
+
+@pytest.fixture(autouse=True)
+def _prevent_real_celery_from_stripe_on_commit(monkeypatch):
+    """Stripe tests run on_commit handlers; avoid connecting to Redis/AMQP in CI."""
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        lambda *a, **k: None,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -157,17 +173,30 @@ def test_checkout_session_sets_plan_from_expanded_subscription_price(settings):
 @pytest.mark.django_db
 def test_apply_subscription_pro_enqueues_expansion(monkeypatch, settings, django_capture_on_commit_callbacks):
     settings.STRIPE_PRICE_ID_PRO_MONTHLY = "price_maps_pro"
-    calls: list[tuple] = []
+    aeo_calls: list[tuple] = []
+    seo_pids: list[int] = []
 
-    def _fake_delay(*args, **kwargs):
-        calls.append((args, kwargs))
+    def _fake_apply_async(*args, **kwargs):
+        aeo_calls.append((args, kwargs))
+
+    def _fake_seo_delay(pid, *a, **k):
+        seo_pids.append(int(pid))
 
     monkeypatch.setattr(
-        "accounts.tasks.schedule_aeo_prompt_plan_expansion.delay",
-        _fake_delay,
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        _fake_apply_async,
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        _fake_seo_delay,
     )
     user = User.objects.create_user(username="expq@example.com", email="expq@example.com", password="x")
-    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Q")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Q",
+        website_url="https://pro-paid.example.com",
+    )
     from accounts.stripe_billing import apply_subscription_payload_to_profile
 
     with django_capture_on_commit_callbacks(execute=True):
@@ -181,10 +210,14 @@ def test_apply_subscription_pro_enqueues_expansion(monkeypatch, settings, django
         )
     profile.refresh_from_db()
     assert profile.plan == BusinessProfile.PLAN_PRO
-    assert len(calls) == 1
-    assert calls[0][0][0] == profile.id
-    assert calls[0][1]["expected_plan_slug"] == BusinessProfile.PLAN_PRO
-    assert calls[0][1]["expansion_cap"] == 50
+    assert seo_pids == [profile.id]
+    assert len(aeo_calls) == 1
+    opt = aeo_calls[0][1]
+    assert opt.get("countdown") == AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS
+    assert (opt.get("args") or ())[0] == profile.id
+    task_kw = opt.get("kwargs") or {}
+    assert task_kw.get("expected_plan_slug") == BusinessProfile.PLAN_PRO
+    assert task_kw.get("expansion_cap") == 75
 
 
 @pytest.mark.django_db
@@ -192,17 +225,27 @@ def test_apply_subscription_advanced_enqueues_expansion_with_cap_100(
     monkeypatch, settings, django_capture_on_commit_callbacks
 ):
     settings.STRIPE_PRICE_ID_ADVANCED_MONTHLY = "price_adv_m"
-    calls: list[tuple] = []
+    aeo_calls: list[tuple] = []
+    seo_pids: list[int] = []
 
-    def _fake_delay(*args, **kwargs):
-        calls.append((args, kwargs))
+    def _fake_apply_async(*args, **kwargs):
+        aeo_calls.append((args, kwargs))
 
     monkeypatch.setattr(
-        "accounts.tasks.schedule_aeo_prompt_plan_expansion.delay",
-        _fake_delay,
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        _fake_apply_async,
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        lambda pid, *a, **k: seo_pids.append(int(pid)),
     )
     user = User.objects.create_user(username="expadv@example.com", email="expadv@example.com", password="x")
-    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Adv")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Adv",
+        website_url="https://adv.example.com",
+    )
     with django_capture_on_commit_callbacks(execute=True):
         apply_subscription_payload_to_profile(
             profile,
@@ -213,8 +256,12 @@ def test_apply_subscription_advanced_enqueues_expansion_with_cap_100(
         )
     profile.refresh_from_db()
     assert profile.plan == BusinessProfile.PLAN_ADVANCED
-    assert calls[0][1]["expected_plan_slug"] == BusinessProfile.PLAN_ADVANCED
-    assert calls[0][1]["expansion_cap"] == 100
+    assert seo_pids == [profile.id]
+    opt = aeo_calls[0][1]
+    assert opt.get("countdown") == AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS
+    task_kw = opt.get("kwargs") or {}
+    assert task_kw.get("expected_plan_slug") == BusinessProfile.PLAN_ADVANCED
+    assert task_kw.get("expansion_cap") == 150
 
 
 @pytest.mark.django_db
@@ -222,17 +269,27 @@ def test_apply_subscription_starter_does_not_enqueue_expansion(
     monkeypatch, settings, django_capture_on_commit_callbacks
 ):
     settings.STRIPE_PRICE_ID_STARTER_MONTHLY = "price_st_only"
-    calls: list[tuple] = []
+    aeo_calls: list[tuple] = []
+    seo_pids: list[int] = []
 
-    def _fake_delay(*args, **kwargs):
-        calls.append((args, kwargs))
+    def _fake_apply_async(*args, **kwargs):
+        aeo_calls.append((args, kwargs))
 
     monkeypatch.setattr(
-        "accounts.tasks.schedule_aeo_prompt_plan_expansion.delay",
-        _fake_delay,
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        _fake_apply_async,
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        lambda pid, *a, **k: seo_pids.append(int(pid)),
     )
     user = User.objects.create_user(username="expst@example.com", email="expst@example.com", password="x")
-    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="St")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="St",
+        website_url="https://starter.example.com",
+    )
     with django_capture_on_commit_callbacks(execute=True):
         apply_subscription_payload_to_profile(
             profile,
@@ -241,7 +298,8 @@ def test_apply_subscription_starter_does_not_enqueue_expansion(
             status="active",
             price_id="price_st_only",
         )
-    assert calls == []
+    assert aeo_calls == []
+    assert seo_pids == [profile.id]
 
 
 @pytest.mark.django_db
@@ -251,12 +309,12 @@ def test_apply_subscription_no_plan_in_updates_does_not_enqueue_expansion(
     """Stripe fields only (no resolvable price / plan) — must not re-fire post-payment expansion."""
     calls: list[tuple] = []
 
-    def _fake_delay(*args, **kwargs):
+    def _fake_apply_async(*args, **kwargs):
         calls.append((args, kwargs))
 
     monkeypatch.setattr(
-        "accounts.tasks.schedule_aeo_prompt_plan_expansion.delay",
-        _fake_delay,
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        _fake_apply_async,
     )
     user = User.objects.create_user(username="exnoplan@example.com", email="exnoplan@example.com", password="x")
     profile = BusinessProfile.objects.create(
@@ -282,12 +340,12 @@ def test_apply_subscription_no_plan_in_updates_does_not_enqueue_expansion(
 def test_apply_subscription_empty_updates_does_not_enqueue(monkeypatch, django_capture_on_commit_callbacks):
     calls: list[tuple] = []
 
-    def _fake_delay(*args, **kwargs):
+    def _fake_apply_async(*args, **kwargs):
         calls.append((args, kwargs))
 
     monkeypatch.setattr(
-        "accounts.tasks.schedule_aeo_prompt_plan_expansion.delay",
-        _fake_delay,
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        _fake_apply_async,
     )
     user = User.objects.create_user(username="exempty@example.com", email="exempty@example.com", password="x")
     profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="E")
@@ -507,6 +565,139 @@ def test_invoice_paid_resolves_plan_via_subscription_retrieve_when_lines_empty(m
     profile.refresh_from_db()
     assert profile.stripe_price_id == "price_inv_api"
     assert profile.plan == BusinessProfile.PLAN_PRO
+
+
+@pytest.mark.django_db
+def test_apply_subscription_pro_skips_seo_without_website_still_schedules_aeo_expansion(
+    monkeypatch, settings, django_capture_on_commit_callbacks
+):
+    settings.STRIPE_PRICE_ID_PRO_MONTHLY = "price_maps_pro"
+    seo_pids: list[int] = []
+    aeo_calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        lambda pid, *a, **k: seo_pids.append(int(pid)),
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        lambda *a, **kw: aeo_calls.append((a, kw)),
+    )
+    user = User.objects.create_user(username="pro_noweb@example.com", email="pro_noweb@example.com", password="x")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="NoWeb", website_url="")
+    with django_capture_on_commit_callbacks(execute=True):
+        apply_subscription_payload_to_profile(
+            profile,
+            customer_id="cus_nw",
+            subscription_id="sub_nw",
+            status="active",
+            price_id="price_maps_pro",
+        )
+    assert seo_pids == []
+    assert len(aeo_calls) == 1
+    assert aeo_calls[0][1].get("countdown") == AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS
+
+
+@pytest.mark.django_db
+def test_apply_subscription_incomplete_status_does_not_enqueue_seo(
+    monkeypatch, settings, django_capture_on_commit_callbacks
+):
+    """Non-active status in this write must not trigger post-payment SEO (even with a website)."""
+    settings.STRIPE_PRICE_ID_PRO_MONTHLY = "price_maps_pro"
+    seo_pids: list[int] = []
+    aeo_calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        lambda pid, *a, **k: seo_pids.append(int(pid)),
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        lambda *a, **kw: aeo_calls.append((a, kw)),
+    )
+    user = User.objects.create_user(username="inc@example.com", email="inc@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Inc",
+        website_url="https://inc.example.com",
+        plan=BusinessProfile.PLAN_STARTER,
+        stripe_subscription_status="active",
+    )
+    with django_capture_on_commit_callbacks(execute=True):
+        apply_subscription_payload_to_profile(
+            profile,
+            subscription_id="sub_inc",
+            status="incomplete",
+        )
+    assert seo_pids == []
+    assert aeo_calls == []
+
+
+@pytest.mark.django_db
+def test_post_payment_seo_webhook_enqueue_deduped_within_ttl(
+    monkeypatch, settings, django_capture_on_commit_callbacks
+):
+    settings.STRIPE_PRICE_ID_STARTER_MONTHLY = "price_st_dedupe"
+    seo_pids: list[int] = []
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        lambda pid, *a, **k: seo_pids.append(int(pid)),
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.schedule_aeo_prompt_plan_expansion.apply_async",
+        lambda *a, **k: None,
+    )
+    user = User.objects.create_user(username="dedupe@example.com", email="dedupe@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://dedupe.example.com",
+    )
+    with django_capture_on_commit_callbacks(execute=True):
+        apply_subscription_payload_to_profile(
+            profile,
+            customer_id="cus_d1",
+            subscription_id="sub_d1",
+            status="active",
+            price_id="price_st_dedupe",
+        )
+    with django_capture_on_commit_callbacks(execute=True):
+        apply_subscription_payload_to_profile(
+            profile,
+            customer_id="cus_d2",
+            subscription_id="sub_d2",
+            status="active",
+            price_id="price_st_dedupe",
+        )
+    assert seo_pids == [profile.id]
+
+
+@pytest.mark.django_db
+def test_post_payment_seo_snapshot_task_calls_get_or_refresh_with_force(monkeypatch):
+    from accounts.tasks import post_payment_seo_snapshot_task
+
+    calls: list[tuple] = []
+
+    def _fake_get(user, *, site_url=None, force_refresh=False):
+        calls.append((getattr(user, "id", None), site_url, force_refresh))
+        return {"seo_score": 50}
+
+    monkeypatch.setattr(
+        "accounts.dataforseo_utils.get_or_refresh_seo_score_for_user",
+        _fake_get,
+    )
+    user = User.objects.create_user(username="seotask@example.com", email="seotask@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://seotask.example.com",
+    )
+    post_payment_seo_snapshot_task.run(profile.id)
+    assert len(calls) == 1
+    assert calls[0][0] == user.id
+    assert calls[0][1] == "https://seotask.example.com"
+    assert calls[0][2] is True
 
 
 def test_infer_sync_failure_reason_invoice_does_not_use_invoice_id_as_subscription():

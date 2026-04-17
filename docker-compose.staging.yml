@@ -1,0 +1,63 @@
+volumes:
+  production_postgres_data: {}
+  production_postgres_data_backups: {}
+  production_traefik: {}
+  
+
+
+services:
+  django:
+    build:
+      context: .
+      dockerfile: ./compose/production/django/Dockerfile
+
+    image: swivl_staging_django
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - /home/deploy/app/backend/.env
+    command: /start
+
+  celery:
+    build:
+      context: .
+      dockerfile: ./compose/production/django/Dockerfile
+    image: swivl_staging_celery
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - /home/deploy/app/backend/.env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    # Celery worker for async tasks (e.g. SEO enrichment)
+    command: celery -A config worker -l info
+
+  postgres:
+    build:
+      context: .
+      dockerfile: ./compose/production/postgres/Dockerfile
+    image: swivl_production_postgres
+    volumes:
+      - production_postgres_data:/var/lib/postgresql/18/docker
+      - production_postgres_data_backups:/backups
+    env_file:
+      - /home/deploy/app/backend/.env
+
+  traefik:
+    build:
+      context: .
+      dockerfile: ./compose/production/traefik/Dockerfile
+    image: swivl_production_traefik
+    depends_on:
+      - django
+    volumes:
+      - production_traefik:/etc/traefik/acme
+    ports:
+      - '0.0.0.0:80:80'
+      - '0.0.0.0:443:443'
+
+  redis:
+    image: docker.io/redis:7.2
+    

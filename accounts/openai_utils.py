@@ -6,6 +6,7 @@ Keeps all OpenAI client usage and message formatting in one place.
 
 import json
 import os
+import re
 from typing import Any
 
 from django.conf import settings
@@ -295,156 +296,494 @@ def generate_seo_keyword_candidates(
     return candidates[:15]
 
 
-def generate_seo_next_steps(seo_data: dict) -> list[dict]:
+def _merged_seo_issue_inputs(seo_data: dict, snapshot: Any) -> tuple[dict[str, Any], list[Any]]:
+    base_on: dict[str, Any] = {}
+    base_serp: list[Any] = []
+    if snapshot is not None:
+        from .dataforseo_utils import seo_issue_aux_context_for_snapshot
+
+        aux = seo_issue_aux_context_for_snapshot(snapshot)
+        base_on = dict(aux.get("on_page") or {})
+        base_serp = list(aux.get("serp") or [])
+
+    if "on_page" in seo_data:
+        on_page = {**base_on, **dict(seo_data.get("on_page") or {})}
+    else:
+        on_page = dict(base_on)
+
+    if "serp" in seo_data:
+        serp = list(seo_data.get("serp") or [])
+    else:
+        serp = list(base_serp)
+        for row in list(seo_data.get("top_keywords") or [])[:80]:
+            if not isinstance(row, dict):
+                continue
+            sr = row.get("serp_rows")
+            if isinstance(sr, list):
+                serp.extend(sr)
+        serp = serp[:500]
+    return on_page, serp
+
+
+def _persist_snapshot_structured_seo_issues(snapshot: Any, issues: list[dict[str, Any]]) -> None:
+    from django.utils import timezone
+
+    snapshot.seo_structured_issues = list(issues)
+    snapshot.seo_structured_issues_refreshed_at = timezone.now()
+    snapshot.save(
+        update_fields=["seo_structured_issues", "seo_structured_issues_refreshed_at"],
+    )
+
+
+def _recommendation_priority_weight(priority: str) -> int:
+    p = str(priority or "").strip().lower()
+    if p == "high":
+        return 3
+    if p == "medium":
+        return 2
+    return 1
+
+
+def _recommendation_rank_key(rec: dict) -> tuple[float, float]:
+    try:
+        impact = float(rec.get("impact_score") or 0.0)
+    except (TypeError, ValueError):
+        impact = 0.0
+    try:
+        confidence = float(rec.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    try:
+        effort = float(rec.get("effort_score") or 0.0)
+    except (TypeError, ValueError):
+        effort = 0.0
+    priority = _recommendation_priority_weight(str(rec.get("priority") or "low"))
+    return (priority * 10.0 + impact * confidence * (1.0 - max(0.0, min(1.0, effort))), impact)
+
+
+def _enforce_structured_recommendation_constraints(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Ask OpenAI for 6 next steps to improve SEO, given current SEO metrics.
-    seo_data should include: seo_score, missed_searches_monthly, organic_visitors,
-    total_search_volume, search_visibility_percent, top_keywords (list of {keyword, search_volume, rank}),
-    and optionally onpage_issue_summaries.
-    Returns list of {"label": str, "tag": str} (length 6). Tags are short, e.g. "Quick win", "High priority".
+    Validation/quality constraints for deterministic recommendations:
+    - max 1 recommendation per keyword cluster
+    - max 2 page_creation recommendations
+    - max 8 total
+    """
+    if not rows:
+        return []
+    sorted_rows = sorted(list(rows), key=_recommendation_rank_key, reverse=True)
+    out: list[dict[str, Any]] = []
+    seen_clusters: set[str] = set()
+    create_page_n = 0
+    for rec in sorted_rows:
+        execution = rec.get("execution")
+        if not isinstance(execution, dict) or not execution:
+            continue
+        evidence = rec.get("evidence") or {}
+        cluster_id = str(evidence.get("cluster_id") or "").strip()
+        if cluster_id and cluster_id in seen_clusters:
+            continue
+        rec_type = str(rec.get("type") or "")
+        action_type = str(rec.get("recommended_action_type") or "")
+        is_create = rec_type == "page_creation" or action_type == "create_cluster_page"
+        if is_create:
+            if create_page_n >= 2:
+                continue
+            create_page_n += 1
+        out.append(rec)
+        if cluster_id:
+            seen_clusters.add(cluster_id)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def generate_seo_next_steps(seo_data: dict, *, snapshot: Any | None = None) -> list[dict]:
+    """
+    Produce up to eight structured next steps grounded in ``build_structured_issues`` evidence, reframed
+    for answer engines (AI assistants, Perplexity-style answers, AI Overviews): citeable blocks,
+    entity clarity, and page-level actions—not generic “rank higher” advice.
+
+    ``seo_data`` should include scores, ``top_keywords``, and optionally ``on_page`` / ``serp`` for the
+    deterministic issue engine. When ``snapshot`` is set, merges crawl-derived FAQ signals and
+    persists structured issues on the snapshot.
+
+    Returns the same dict shape as before (``title``, ``why_it_matters``, ``exact_fix``, ``example``,
+    plus ``label`` / ``tag`` for backward compatibility).
     """
     if not seo_data:
         return []
 
-    score = seo_data.get("seo_score")
-    missed = seo_data.get("missed_searches_monthly")
-    organic = seo_data.get("organic_visitors")
-    total_vol = seo_data.get("total_search_volume")
-    visibility_pct = seo_data.get("search_visibility_percent")
-    keywords = seo_data.get("top_keywords") or []
-    onpage_summaries = seo_data.get("onpage_issue_summaries") or {}
-
-    keyword_preview = ""
-    if keywords:
-        parts = [f"{k.get('keyword', '')} ({k.get('search_volume', 0)}/mo)" for k in keywords[:12]]
-        keyword_preview = "\n".join(parts)
-
-    system = (
-        "You are an SEO expert. Given the site's current SEO data, output exactly 6 actionable next steps "
-        "to improve their SEO score. Each step must have: \"label\" (one short sentence, actionable, e.g. "
-        "'Rewrite your primary conversion page headline and CTA') and \"tag\" (2–3 words, e.g. 'Quick win', "
-        "'High priority', 'This week', 'Cross-channel'). Be specific to the data provided (e.g. mention "
-        "missed searches, visibility, or top keywords where relevant). Output only a JSON array of 6 objects "
-        "with keys \"label\" and \"tag\". No other text."
+    from .seo.seo_issue_engine import (
+        build_structured_issues,
+        build_structured_recommendations,
     )
-    user_parts = [
-        f"SEO score (0–100): {score}",
-        f"Monthly missed searches (not finding this site): {missed}",
-        f"Organic visitors (estimated): {organic}",
-        f"Total search volume (keyword set): {total_vol}",
-        f"Search visibility %: {visibility_pct}%",
-    ]
-    if keyword_preview:
-        user_parts.append("Top keywords (keyword, volume/mo):\n" + keyword_preview)
-    if onpage_summaries:
-        user_parts.append("On-page/technical issues: " + str(onpage_summaries))
-    user_content = "Current SEO data:\n\n" + "\n".join(user_parts) + "\n\nReturn a JSON array of 6 next steps with \"label\" and \"tag\"."
 
-    try:
-        client = _get_client("OPEN_AI_SEO_API_KEY")
-        model = _get_model()
-        completion = chat_completion_create_logged(
-            client,
-            operation="openai.chat.seo_next_steps",
-            business_profile=None,
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-        )
-        raw = (completion.choices[0].message.content or "").strip()
-        # Strip markdown code block if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1].rstrip("`").strip()
-        steps = json.loads(raw)
-        if not isinstance(steps, list):
-            return []
-        out = []
-        for i, item in enumerate(steps[:6]):
-            if not isinstance(item, dict):
-                continue
-            label = (item.get("label") or "").strip()
-            tag = (item.get("tag") or "Next step").strip()[:40]
-            if label:
-                out.append({"label": label, "tag": tag or "Next step"})
-        return out[:6]
-    except Exception:
+    keywords = list(seo_data.get("top_keywords") or [])
+    on_page, serp = _merged_seo_issue_inputs(seo_data, snapshot)
+    # ``top_keywords`` rows can include competitor fields after gap enrichment; pass those rows
+    # to both ranked and domain_intersection channels so deterministic rules can trigger.
+    issues = build_structured_issues(
+        ranked_keywords=keywords,
+        domain_intersection=keywords,
+        on_page=on_page,
+        serp=serp,
+    )
+    if snapshot is not None:
+        _persist_snapshot_structured_seo_issues(snapshot, list(issues))
+    if not issues:
         return []
 
+    deterministic = _enforce_structured_recommendation_constraints(
+        build_structured_recommendations(issues)
+    )
+    snap_ctx = seo_data.get("snapshot_context_for_rewrite")
+    out: list[dict] = []
+    for rec in deterministic:
+        rewritten = _rewrite_structured_seo_recommendation(
+            rec,
+            snapshot_context=snap_ctx if isinstance(snap_ctx, dict) else None,
+        )
+        merged = dict(rec)
+        merged.update(rewritten)
+        # Backward compatibility for old consumers.
+        merged["label"] = str(merged.get("title") or merged.get("issue") or "").strip()
+        merged["tag"] = (
+            "High priority"
+            if merged.get("priority") == "high"
+            else "Medium priority"
+            if merged.get("priority") == "medium"
+            else "Low priority"
+        )
+        if merged["label"]:
+            out.append(merged)
+    return out[:8]
 
-def generate_keyword_action_suggestions(keywords: list[dict]) -> list[dict]:
+
+def generate_keyword_action_suggestions(
+    keywords: list[dict],
+    *,
+    snapshot: Any | None = None,
+    snapshot_seo_data: dict | None = None,
+) -> list[dict]:
     """
-    Given a list of keyword dicts (from \"what people search for\" / top_keywords),
-    ask OpenAI to propose one-sentence SEO improvement actions per keyword.
+    Given keyword dicts from top_keywords / search demand, produce one action per row using the same
+    structured-issue pipeline as ``generate_seo_next_steps``, reframed for AI citation / answerability
+    in the LLM rewrite layer.
 
-    Returns a list of {\"keyword\": str, \"suggestion\": str}.
+    When ``snapshot`` is set, uses the same on-page / SERP merge and persists structured issues.
+
+    Optional ``snapshot_seo_data`` merges snapshot-wide context while keeping the passed ``keywords``
+    list as ``top_keywords`` for ranking rules.
+
+    Returns a list of {\"keyword\": str, \"suggestion\": str, ...} (extended fields unchanged).
     """
     if not keywords:
         return []
+    from .seo.seo_issue_engine import (
+        build_structured_issues,
+        build_structured_recommendations,
+    )
 
-    # Limit to a reasonable number of keywords to keep the prompt small.
-    top = []
-    for k in keywords:
-        kw = (k.get("keyword") or "").strip()
-        if not kw:
-            continue
-        vol = int(k.get("search_volume") or 0)
-        top.append((kw, vol))
-    if not top:
+    rows = list(keywords)
+    if snapshot_seo_data is not None:
+        fake_seo = {**dict(snapshot_seo_data), "top_keywords": rows}
+    else:
+        fake_seo = {"top_keywords": rows}
+    on_page, serp = _merged_seo_issue_inputs(fake_seo, snapshot)
+    issues = build_structured_issues(
+        ranked_keywords=rows, domain_intersection=rows, on_page=on_page, serp=serp
+    )
+    if snapshot is not None:
+        _persist_snapshot_structured_seo_issues(snapshot, list(issues))
+    if not issues:
         return []
-    # Sort by volume descending and cap to top 20 for the prompt.
-    top_sorted = sorted(top, key=lambda kv: kv[1], reverse=True)[:20]
-
-    lines = [f"- {kw} ({vol}/mo)" for kw, vol in top_sorted]
-    user_content = (
-        "For each of the following search keyword phrases, suggest exactly ONE concise, "
-        "one-sentence action the business owner should take to improve their SEO for that keyword.\n\n"
-        "List of keywords with approximate monthly search volume:\n"
-        + "\n".join(lines)
-        + "\n\n"
-        "Return a JSON array where each item has:\n"
-        "- \"keyword\": the original keyword phrase string\n"
-        "- \"suggestion\": one clear, actionable sentence describing what to do next.\n"
-        "Do not include any other fields or text."
+    deterministic = _enforce_structured_recommendation_constraints(
+        build_structured_recommendations(issues)
     )
-
-    system = (
-        "You are an SEO strategist. Given keyword phrases and their search volumes, "
-        "you propose highly practical, concrete actions the business can take to rank higher "
-        "for each keyword. Suggestions should be short (one sentence) and easy to do."
-    )
-
-    try:
-        client = _get_client("OPEN_AI_SEO_API_KEY")
-        model = _get_model()
-        completion = chat_completion_create_logged(
-            client,
-            operation="openai.chat.keyword_action_suggestions",
-            business_profile=None,
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
+    snap_ctx = fake_seo.get("snapshot_context_for_rewrite")
+    out: list[dict] = []
+    for rec in deterministic:
+        rewritten = _rewrite_structured_seo_recommendation(
+            rec,
+            snapshot_context=snap_ctx if isinstance(snap_ctx, dict) else None,
         )
-        raw = (completion.choices[0].message.content or "").strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1].rstrip("`").strip()
-        data = json.loads(raw)
-        if not isinstance(data, list):
-            return []
-        out: list[dict] = []
-        for item in data:
-            if not isinstance(item, dict):
+        merged = dict(rec)
+        merged.update(rewritten)
+        ev = merged.get("evidence") or {}
+        kw = str(ev.get("primary_keyword") or ev.get("keyword") or "").strip()
+        suggestion = str(merged.get("exact_fix") or "").strip()
+        if kw and suggestion:
+            out.append(
+                {
+                    "keyword": kw,
+                    "suggestion": suggestion,
+                    "title": str(merged.get("title") or merged.get("issue") or "").strip(),
+                    "priority": str(merged.get("priority") or "medium"),
+                    "why_it_matters": str(merged.get("why_it_matters") or "").strip(),
+                    "exact_fix": suggestion,
+                    "example": str(merged.get("example") or "").strip(),
+                    "evidence": merged.get("evidence") or {},
+                    "issue_id": str(merged.get("issue_id") or ""),
+                }
+            )
+    return out
+
+
+# System prompt for LLM rewrite of deterministic SEO issues → display-ready action cards.
+SEO_STRUCTURED_REWRITE_SYSTEM_PROMPT = (
+    "You are generating ACTION-CARD DATA for a frontend Actions page.\n"
+    "Focus on clarity, scanability, and implementation detail for SEO/AEO improvements that improve AI-answer inclusion "
+    "and citation likelihood in assistants (Google SGE/AI Overviews, ChatGPT, Perplexity).\n\n"
+    "Use wording that makes cited/cite outcomes explicit when supported by evidence.\n"
+    "INPUT JSON contains:\n"
+    "- actions[] (prioritized deterministic fixes)\n"
+    "- keywords[] (keyword-level context)\n"
+    "- optional snapshot context\n\n"
+    "Return ONLY valid JSON. No markdown. No extra prose.\n"
+    "Preferred output shape:\n"
+    "{"
+    "\"actions\":[{"
+    "\"id\":\"...\","
+    "\"source\":\"seo|keywords|aeo\","
+    "\"category_label\":\"SEO|Keyword|AEO\","
+    "\"pillar\":\"Content|Technical|Trust|Presence\","
+    "\"priority\":\"high|medium|low\","
+    "\"title\":\"...\","
+    "\"subtitle\":\"...\","
+    "\"goal\":\"...\","
+    "\"whats_missing\":[\"...\"],"
+    "\"steps\":[{\"step_number\":1,\"title\":\"...\",\"instruction\":\"...\"}],"
+    "\"copy_paste_content\":{\"local_trust_block\":\"...\",\"faq\":[{\"q\":\"...\",\"a\":\"...\"}],\"quick_facts\":[\"...\"]},"
+    "\"schema_requirements\":[\"...\"],"
+    "\"internal_linking\":[{\"from_or_section\":\"...\",\"to_url\":\"...\",\"anchor_hint\":\"...\"}],"
+    "\"target_url\":\"...\","
+    "\"ai_optimization_notes\":{\"why_it_helps\":[\"...\"],\"expected_impact\":[\"...\"]},"
+    "\"evidence\":{\"keyword\":\"...\",\"search_volume\":0,\"rank\":0,\"competitor_rank\":0,\"competitor_domains\":[\"...\"],\"location\":\"...\",\"source_issue_ids\":[\"...\"]},"
+    "\"display_hints\":{\"expanded_by_default\":false,\"show_copy_paste_section\":true,\"show_schema_section\":true,\"show_internal_linking_section\":true}"
+    "}]"
+    "}\n"
+    "If you cannot build the full card, return legacy compact JSON with keys title, why_it_matters, exact_fix, example.\n\n"
+    "STRICT RULES:\n"
+    "- Do NOT invent keywords, ranks, URLs, search volumes, competitor domains, location, or issue IDs.\n"
+    "- Deduplicate overlapping recommendations and keep the richer merged result.\n"
+    "- No vague directives like 'optimize SEO' or 'improve content' without exact sections/actions.\n"
+    "- Steps must be imperative and implementation-ready.\n"
+    "- Use empty strings/arrays instead of guessing unknown values.\n"
+)
+
+_SEO_VAGUE_PATTERN = re.compile(
+    r"\b(optimi[sz]e\s+seo|improve\s+seo\b|enhance\s+seo\b|increase\s+visibility|boost\s+rankings?|rank\s+higher|"
+    r"get\s+more\s+traffic|drive\s+more\s+clicks|climb\s+the\s+serp)\b",
+    re.IGNORECASE,
+)
+_SEO_ACTION_PATTERN = re.compile(
+    r"\b(create|add|publish|rewrite|expand|implement|build|update|link|schema|section|page|heading|h1|h2|faq|"
+    r"table|comparison|entity|snippet|paragraph|list|bullet|quote|citat|mentionable|answer block|internal\s+link|"
+    r"subhead|structured\s+data|json-ld|proof|testimonial|q&a|question)\b",
+    re.IGNORECASE,
+)
+# Vague “AI visibility” claims without concrete edits (must still match _SEO_ACTION_PATTERN somewhere in exact_fix).
+_AEO_VAGUE_PATTERN = re.compile(
+    r"\b(ai\s+visibility|be\s+seen\s+in\s+ai|win\s+at\s+aeo|dominate\s+ai)\b",
+    re.IGNORECASE,
+)
+_BANNED_GENERIC_WORDS = re.compile(r"\b(optimi[sz]e|improve|enhance)\b", re.IGNORECASE)
+
+
+def _seo_rewrite_output_is_valid(payload: dict, recommendation: dict) -> bool:
+    title = str(payload.get("title") or "").strip()
+    why = str(payload.get("why_it_matters") or "").strip()
+    fix = str(payload.get("exact_fix") or "").strip()
+    if not title or not why or not fix:
+        return False
+    if _SEO_VAGUE_PATTERN.search(fix) and not _SEO_ACTION_PATTERN.search(fix):
+        return False
+    if _AEO_VAGUE_PATTERN.search(fix) and not _SEO_ACTION_PATTERN.search(fix):
+        return False
+    if _BANNED_GENERIC_WORDS.search(fix) and not _SEO_ACTION_PATTERN.search(fix):
+        return False
+    if len(fix) < 20:
+        return False
+    evidence = recommendation.get("evidence") or {}
+    keyword = str(evidence.get("primary_keyword") or evidence.get("keyword") or "").strip().lower()
+    url = str(evidence.get("url") or evidence.get("your_url") or "").strip().lower()
+    # When we have concrete context, ensure rewritten output keeps at least one anchor.
+    combined = f"{title} {why} {fix} {payload.get('example') or ''}".lower()
+    if keyword and keyword not in combined and url and url not in combined:
+        return False
+    return True
+
+
+def _coerce_rewrite_payload_to_legacy(data: dict) -> dict:
+    """
+    Accept execution_tasks[] JSON and coerce to legacy keys used by SEO overview responses.
+    Keeps compatibility with existing API consumers while allowing richer prompt outputs.
+    """
+    if not isinstance(data, dict):
+        return {}
+    if all(k in data for k in ("title", "why_it_matters", "exact_fix")):
+        return {
+            "title": str(data.get("title") or "").strip(),
+            "why_it_matters": str(data.get("why_it_matters") or "").strip(),
+            "exact_fix": str(data.get("exact_fix") or "").strip(),
+            "example": str(data.get("example") or "").strip(),
+        }
+
+    cards = data.get("actions")
+    if isinstance(cards, list) and cards and isinstance(cards[0], dict):
+        first_card = cards[0]
+        title = str(first_card.get("title") or "").strip()
+        goal = str(first_card.get("goal") or "").strip()
+        missing = [str(x).strip() for x in list(first_card.get("whats_missing") or []) if str(x).strip()]
+        why = " ".join([x for x in [goal, ". ".join(missing[:2])] if x]).strip()
+
+        steps = list(first_card.get("steps") or [])
+        step_lines: list[str] = []
+        for row in steps[:6]:
+            if not isinstance(row, dict):
                 continue
-            kw = (item.get("keyword") or "").strip()
-            suggestion = (item.get("suggestion") or "").strip()
-            if kw and suggestion:
-                out.append({"keyword": kw, "suggestion": suggestion})
-        return out
-    except Exception:
-        return []
+            st = str(row.get("title") or "").strip()
+            ins = str(row.get("instruction") or "").strip()
+            line = " — ".join([x for x in [st, ins] if x]).strip()
+            if line:
+                step_lines.append(line)
+        exact_fix = " ".join([f"{i + 1}) {line}" for i, line in enumerate(step_lines)]).strip()
+        if not exact_fix:
+            exact_fix = goal
+
+        cpc = first_card.get("copy_paste_content") or {}
+        example = ""
+        if isinstance(cpc, dict):
+            trust = str(cpc.get("local_trust_block") or "").strip()
+            faq = cpc.get("faq")
+            quick = cpc.get("quick_facts")
+            if trust:
+                example = trust
+            elif isinstance(faq, list) and faq and isinstance(faq[0], dict):
+                q = str(faq[0].get("q") or "").strip()
+                a = str(faq[0].get("a") or "").strip()
+                if q and a:
+                    example = f"{q} — {a}"
+            elif isinstance(quick, list) and quick:
+                example = str(quick[0] or "").strip()
+
+        return {
+            "title": title,
+            "why_it_matters": why,
+            "exact_fix": exact_fix,
+            "example": example,
+            "action_card": first_card,
+        }
+
+    tasks = data.get("execution_tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return {}
+    first = tasks[0] if isinstance(tasks[0], dict) else {}
+    if not first:
+        return {}
+
+    title = str(first.get("title") or "").strip()
+    goal = str(first.get("goal") or "").strip()
+    ai_notes = str(first.get("ai_optimization_notes") or "").strip()
+    why = " ".join([x for x in [goal, ai_notes] if x]).strip()
+
+    impl_raw = first.get("implementation")
+    impl_list = [str(x).strip() for x in (impl_raw or []) if str(x).strip()] if isinstance(impl_raw, list) else []
+    exact_fix = " ".join([f"{idx + 1}) {step}" for idx, step in enumerate(impl_list)]).strip()
+    if not exact_fix:
+        exact_fix = str(first.get("goal") or "").strip()
+
+    content = first.get("content_requirements") or {}
+    example = ""
+    if isinstance(content, dict):
+        trust = str(content.get("trust_block_example") or "").strip()
+        faq = content.get("faq")
+        quick = content.get("quick_facts")
+        if trust:
+            example = trust
+        elif isinstance(faq, list) and faq and isinstance(faq[0], dict):
+            q = str(faq[0].get("q") or faq[0].get("question") or "").strip()
+            a = str(faq[0].get("a") or faq[0].get("answer") or "").strip()
+            if q and a:
+                example = f"{q} — {a}"
+        elif isinstance(quick, list) and quick:
+            example = str(quick[0] or "").strip()
+
+    return {
+        "title": title,
+        "why_it_matters": why,
+        "exact_fix": exact_fix,
+        "example": example,
+    }
+
+
+def _rewrite_structured_seo_recommendation(
+    recommendation: dict,
+    *,
+    snapshot_context: dict | None = None,
+) -> dict:
+    """
+    AI rewrite layer for deterministic SEO issue recommendations, reframed for AI answer / citation use
+    without changing structured keys (title, why_it_matters, exact_fix, example).
+    """
+    system = SEO_STRUCTURED_REWRITE_SYSTEM_PROMPT
+    ev = recommendation.get("evidence") or {}
+    keyword_rows = []
+    if isinstance(ev, dict):
+        primary_keyword = str(ev.get("primary_keyword") or ev.get("keyword") or "").strip()
+        if primary_keyword:
+            keyword_rows.append(
+                {
+                    "keyword": primary_keyword,
+                    "search_volume": ev.get("search_volume"),
+                    "rank": ev.get("rank"),
+                }
+            )
+        for kw in list(ev.get("target_keywords") or []):
+            kws = str(kw or "").strip()
+            if kws and kws.lower() != primary_keyword.lower():
+                keyword_rows.append({"keyword": kws})
+    user_payload = {
+        "actions": [recommendation],
+        "keywords": keyword_rows[:12],
+    }
+    user_content = "Input:\n" + json.dumps(user_payload, ensure_ascii=False)
+    if snapshot_context:
+        user_content += "\n\nSnapshot context (read-only; never invent facts):\n"
+        user_content += json.dumps(snapshot_context, ensure_ascii=False)
+    fallback = {
+        "title": str(recommendation.get("issue") or "").strip(),
+        "why_it_matters": str(recommendation.get("why_it_matters") or "").strip(),
+        "exact_fix": str(recommendation.get("exact_fix") or "").strip(),
+        "example": str(recommendation.get("example") or "").strip(),
+    }
+
+    for _ in range(2):
+        try:
+            client = _get_client("OPEN_AI_SEO_API_KEY")
+            model = _get_model()
+            completion = chat_completion_create_logged(
+                client,
+                operation="openai.chat.seo_structured_rewrite",
+                business_profile=None,
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            raw = (completion.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rstrip("`").strip()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                continue
+            candidate = _coerce_rewrite_payload_to_legacy(data)
+            if _seo_rewrite_output_is_valid(candidate, recommendation):
+                return candidate
+        except Exception:
+            continue
+    return fallback
 
 
 def generate_aeo_recommendations(aeo_data: dict, seo_data: dict | None = None) -> list[str]:

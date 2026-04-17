@@ -22,6 +22,11 @@ AEO monitored-prompt expansion toward the Pro/Advanced cap is scheduled only fro
 ``apply_subscription_payload_to_profile`` when a webhook applies ``plan`` = pro or advanced
 (``transaction.on_commit``), with ``expected_plan_slug`` / ``expansion_cap`` tied to that
 resolution—not from onboarding, checkout-return-only flows, or generic profile saves.
+
+Post-payment SEO overview refresh (``post_payment_seo_snapshot_task``) is enqueued from the same
+place when billing shows a paid signal and ``website_url`` is set. AEO expansion is staggered
+``AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS`` behind that task so workers prioritize
+SEO snapshot work without relying on Celery ``.delay()`` call order.
 """
 
 import logging
@@ -42,6 +47,33 @@ logger = logging.getLogger(__name__)
 ACTIVE_STRIPE_STATUSES = frozenset({"active", "trialing", "past_due"})
 # Cleared to PLAN_NONE alongside stripe_subscription_status from Stripe (see module docstring).
 TERMINAL_PLAN_CLEAR_STATUSES = frozenset({"canceled", "unpaid", "incomplete_expired"})
+
+# Dedupe Stripe webhook replays: skip re-enqueueing post_payment_seo_snapshot_task within this window.
+POST_PAYMENT_SEO_WEBHOOK_ENQUEUE_TTL_SECONDS = 300
+# Defer Pro/Advanced AEO prompt expansion so SEO snapshot + follow-on tasks claim workers first
+# (Celery does not guarantee ordering between two immediate .delay() calls).
+AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS = 120
+
+
+def _try_enqueue_post_payment_seo_snapshot(profile_id: int) -> None:
+    from django.core.cache import cache
+
+    key = f"post_payment_seo_webhook_enqueued:{profile_id}"
+    if not cache.add(key, 1, POST_PAYMENT_SEO_WEBHOOK_ENQUEUE_TTL_SECONDS):
+        logger.info(
+            "[stripe->SEO] skip_duplicate_enqueue profile_id=%s ttl_s=%s",
+            profile_id,
+            POST_PAYMENT_SEO_WEBHOOK_ENQUEUE_TTL_SECONDS,
+        )
+        return
+    try:
+        from .tasks import post_payment_seo_snapshot_task
+
+        post_payment_seo_snapshot_task.delay(profile_id)
+        logger.info("[stripe->SEO] enqueued post_payment_seo_snapshot_task profile_id=%s", profile_id)
+    except Exception:
+        cache.delete(key)
+        logger.exception("[stripe->SEO] enqueue_failed profile_id=%s", profile_id)
 
 
 @dataclass(frozen=True)
@@ -438,6 +470,10 @@ def apply_subscription_payload_to_profile(
     AEO post-payment prompt expansion is **only** scheduled from here (via ``transaction.on_commit``)
     when this call applies a **plan** change to Pro or Advanced—never for Stripe-only field updates
     (e.g. customer id alone) and never when ``updates`` is empty (no DB write).
+
+    Post-payment SEO refresh is scheduled (on commit, never inline) when ``stripe_subscription_status``
+    is present in ``updates``, normalizes to a value in ``ACTIVE_STRIPE_STATUSES``, and
+    ``website_url`` is non-empty after save (Stripe replays are deduped via a short cache TTL).
     """
     effective_price = (price_id or "").strip()
     if not effective_price and subscription_dict:
@@ -517,28 +553,49 @@ def apply_subscription_payload_to_profile(
         setattr(profile, k, v)
     profile.save(update_fields=list(updates.keys()))
     plan_written = updates.get("plan")
-    if plan_written in {BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}:
-        slug = str(plan_written)
-        cap = int(aeo_monitored_prompt_cap_for_plan_slug(slug))
+    status_in_updates = "stripe_subscription_status" in updates
+    status_val = str(updates.get("stripe_subscription_status", "") or "").strip().lower()
+    paid_status_in_updates = status_in_updates and status_val in ACTIVE_STRIPE_STATUSES
+    website_url = str(profile.website_url or "").strip()
+    should_post_payment_seo = bool(website_url) and paid_status_in_updates
 
-        def _enqueue_aeo_expansion() -> None:
-            try:
-                from .tasks import schedule_aeo_prompt_plan_expansion
+    pro_or_adv = plan_written in {BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}
 
-                schedule_aeo_prompt_plan_expansion.delay(
-                    profile.id,
-                    expected_plan_slug=slug,
-                    expansion_cap=cap,
-                )
-            except Exception:
-                logger.exception(
-                    "[stripe] enqueue AEO prompt expansion failed profile_id=%s plan=%s cap=%s",
-                    profile.id,
-                    slug,
-                    cap,
-                )
+    if should_post_payment_seo or pro_or_adv:
 
-        transaction.on_commit(_enqueue_aeo_expansion)
+        def _enqueue_post_payment_async_work() -> None:
+            if should_post_payment_seo:
+                _try_enqueue_post_payment_seo_snapshot(profile.id)
+            if pro_or_adv:
+                slug = str(plan_written)
+                cap = int(aeo_monitored_prompt_cap_for_plan_slug(slug))
+                try:
+                    from .tasks import schedule_aeo_prompt_plan_expansion
+
+                    schedule_aeo_prompt_plan_expansion.apply_async(
+                        args=[profile.id],
+                        kwargs={
+                            "expected_plan_slug": slug,
+                            "expansion_cap": cap,
+                        },
+                        countdown=AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS,
+                    )
+                    logger.info(
+                        "[stripe] enqueued AEO prompt expansion (delayed) profile_id=%s plan=%s cap=%s countdown_s=%s",
+                        profile.id,
+                        slug,
+                        cap,
+                        AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[stripe] enqueue AEO prompt expansion failed profile_id=%s plan=%s cap=%s",
+                        profile.id,
+                        slug,
+                        cap,
+                    )
+
+        transaction.on_commit(_enqueue_post_payment_async_work)
     return True, list(updates.keys())
 
 

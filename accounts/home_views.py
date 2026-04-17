@@ -4,6 +4,7 @@ Site home page: optional staff-only third-party API usage charts.
 
 from __future__ import annotations
 
+import logging
 from urllib.parse import urlencode
 
 from django.contrib import messages
@@ -12,14 +13,15 @@ from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils.translation import gettext as _
 
-from accounts.models import BusinessProfile
+from accounts.models import AEOExecutionRun, BusinessProfile
 from accounts.third_party_usage import (
     build_aeo_pass_count_analytics_context,
     build_monthly_aeo_visibility_chart_context,
     build_monthly_api_usage_chart_context,
     build_monthly_token_usage_chart_context,
 )
-from accounts.models import AEOExecutionRun
+
+logger = logging.getLogger(__name__)
 
 
 def site_home(request):
@@ -77,9 +79,13 @@ def aeo_pass_count_staff_page(request):
         return HttpResponseForbidden("Staff only")
 
     if request.method == "POST":
-        from accounts.tasks import try_enqueue_aeo_full_monitored_pipeline
+        from accounts.tasks import (
+            try_enqueue_aeo_full_monitored_pipeline,
+            try_enqueue_aeo_phase5_recommendations_only,
+        )
 
-        if request.POST.get("action") == "full_rerun":
+        action = request.POST.get("action")
+        if action == "full_rerun":
             pid_str = (request.POST.get("aeo_full_rerun_profile_id") or "").strip()
             if pid_str in ("", "all"):
                 messages.warning(
@@ -106,6 +112,107 @@ def aeo_pass_count_staff_page(request):
                         messages.error(request, out.get("message") or "Could not enqueue pipeline.")
                     else:
                         messages.info(request, out.get("message") or "Done.")
+        elif action == "phase5_recommendations_only":
+            pid_str = (request.POST.get("aeo_phase5_rerun_profile_id") or "").strip()
+            if pid_str in ("", "all"):
+                messages.warning(
+                    request,
+                    "Select a specific business profile (not All) to re-run Phase 5 recommendations.",
+                )
+            else:
+                try:
+                    pid = int(pid_str)
+                except (TypeError, ValueError):
+                    messages.error(request, "Invalid profile id.")
+                else:
+                    out = try_enqueue_aeo_phase5_recommendations_only(
+                        pid, source="staff_aeo_pass_counts"
+                    )
+                    if out.get("queued"):
+                        messages.success(
+                            request,
+                            f"{out.get('message', 'Enqueued.')} Run id {out.get('run_id')}.",
+                        )
+                    elif out.get("reason") == "duplicate_inflight":
+                        messages.warning(request, out.get("message") or "A run is already in progress.")
+                    elif out.get("reason") == "phase5_inflight":
+                        messages.warning(
+                            request,
+                            out.get("message") or "Phase 5 is already running for this execution run.",
+                        )
+                    elif out.get("reason") in ("recommendations_disabled", "no_eligible_run"):
+                        messages.warning(
+                            request,
+                            out.get("message") or "Could not enqueue Phase 5 recommendations.",
+                        )
+                    elif out.get("reason") == "no_prompts":
+                        messages.warning(request, out.get("message") or "No monitored prompts on profile.")
+                    elif not out.get("ok"):
+                        messages.error(request, out.get("message") or "Could not enqueue Phase 5.")
+                    else:
+                        messages.info(request, out.get("message") or "Done.")
+        elif action == "seo_snapshot_refresh":
+            pid_str = (request.POST.get("seo_snapshot_refresh_profile_id") or "").strip()
+            if pid_str in ("", "all"):
+                messages.warning(
+                    request,
+                    "Select a specific business profile (not All) to refresh the SEO snapshot.",
+                )
+            else:
+                try:
+                    pid = int(pid_str)
+                except (TypeError, ValueError):
+                    messages.error(request, "Invalid profile id.")
+                else:
+                    profile = (
+                        BusinessProfile.objects.filter(pk=pid)
+                        .select_related("user")
+                        .first()
+                    )
+                    if profile is None:
+                        messages.error(request, "Business profile not found.")
+                    else:
+                        site_url = (getattr(profile, "website_url", None) or "").strip()
+                        if not site_url:
+                            messages.warning(
+                                request,
+                                "Profile has no website URL; SEO snapshot cannot run.",
+                            )
+                        else:
+                            from accounts.business_profile_access import workspace_data_user
+                            from accounts.dataforseo_utils import get_or_refresh_seo_score_for_user
+
+                            data_user = workspace_data_user(profile) or profile.user
+                            try:
+                                result = get_or_refresh_seo_score_for_user(
+                                    data_user,
+                                    site_url=site_url,
+                                    force_refresh=True,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[staff aeo pass counts] SEO snapshot refresh failed profile_id=%s",
+                                    pid,
+                                )
+                                messages.error(
+                                    request,
+                                    "SEO snapshot refresh failed due to an unexpected error. "
+                                    "Check server logs.",
+                                )
+                            else:
+                                if result is None:
+                                    messages.error(
+                                        request,
+                                        "SEO snapshot refresh did not return data "
+                                        "(domain could not be resolved or configuration issue).",
+                                    )
+                                else:
+                                    messages.success(
+                                        request,
+                                        "SEO snapshot refresh ran for this profile’s site (DataForSEO). "
+                                        "Keyword enrichment and next-steps tasks may still be running; "
+                                        "structured SEO issues appear after those Celery jobs complete.",
+                                    )
         else:
             messages.error(request, "Unknown action.")
 

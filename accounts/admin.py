@@ -7,7 +7,7 @@ from django.contrib import admin
 from django.core.exceptions import ValidationError
 from django.forms.models import BaseInlineFormSet
 from django.http import HttpResponse
-from django.utils.html import format_html
+from django.utils.html import escape, format_html
 
 from .models import (
     AEOPromptExecutionAggregate,
@@ -545,8 +545,89 @@ class OnboardingOnPageCrawlAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 
 @admin.register(SEOOverviewSnapshot)
 class SEOOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "period_start", "organic_visitors", "keywords_ranking", "top3_positions", "last_fetched_at")
+    list_display = (
+        "id",
+        "user",
+        "period_start",
+        "organic_visitors",
+        "keywords_ranking",
+        "top3_positions",
+        "has_seo_structured_issues",
+        "seo_structured_issues_refreshed_at",
+        "last_fetched_at",
+    )
     search_fields = ("user__email", "user__username")
+    readonly_fields = (
+        "last_fetched_at",
+        "seo_structured_issues_refreshed_at",
+        "seo_structured_issues_formatted",
+    )
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "user",
+                    "period_start",
+                    "last_fetched_at",
+                    "refreshed_at",
+                    "cached_domain",
+                    "cached_location_mode",
+                    "cached_location_code",
+                    "cached_location_label",
+                    "organic_visitors",
+                    "prev_organic_visitors",
+                    "keywords_ranking",
+                    "top3_positions",
+                    "total_search_volume",
+                    "estimated_search_appearances_monthly",
+                    "missed_searches_monthly",
+                    "search_visibility_percent",
+                    "search_performance_score",
+                    "local_verification_applied",
+                    "local_verified_keyword_count",
+                    "keywords_enriched_at",
+                    "seo_next_steps_refreshed_at",
+                    "keyword_action_suggestions_refreshed_at",
+                    "seo_structured_issues_refreshed_at",
+                )
+            },
+        ),
+        (
+            "Structured SEO issues (read-only)",
+            {
+                "classes": ("collapse",),
+                "fields": ("seo_structured_issues_formatted",),
+            },
+        ),
+        (
+            "JSON payloads",
+            {
+                "classes": ("collapse",),
+                "fields": ("top_keywords", "seo_next_steps", "keyword_action_suggestions"),
+            },
+        ),
+    )
+
+    @admin.display(description="Has structured issues", boolean=True)
+    def has_seo_structured_issues(self, obj):
+        return bool(getattr(obj, "seo_structured_issues", None))
+
+    @admin.display(description="Structured issues (JSON)")
+    def seo_structured_issues_formatted(self, obj):
+        raw = getattr(obj, "seo_structured_issues", None) or []
+        if not raw:
+            return "—"
+        try:
+            text = json.dumps(raw, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(raw)
+        if len(text) > 50000:
+            text = text[:50000] + "\n… (truncated)"
+        return format_html(
+            '<pre style="max-height:480px;overflow:auto;white-space:pre-wrap;">{}</pre>',
+            escape(text),
+        )
 
 
 @admin.register(AgentConversation)

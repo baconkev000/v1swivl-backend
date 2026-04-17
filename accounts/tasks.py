@@ -32,6 +32,143 @@ KEYWORDS_ENRICHMENT_TTL = timedelta(days=7)
 NEXT_STEPS_TTL = timedelta(days=7)
 # Per-keyword action suggestions TTL (for \"Do these now\" UI).
 KEYWORD_ACTION_TTL = timedelta(days=7)
+# Cap keyword rows passed into LLM rewrite for per-keyword suggestions (cost control).
+KEYWORD_ACTION_SUGGESTIONS_MAX_ROWS = 80
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=60, ignore_result=True)
+def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
+    """
+    Stripe webhook follow-up: run a full SEO overview refresh for the workspace.
+
+    Invoked from ``transaction.on_commit`` in ``apply_subscription_payload_to_profile`` only (never
+    inline in the webhook). Uses ``force_refresh=True`` so post-payment users get a fresh snapshot
+    and the existing pipeline can enqueue enrichment / ``generate_snapshot_next_steps_task`` /
+    ``generate_keyword_action_suggestions_task``.
+    """
+    from .business_profile_access import workspace_data_user
+    from .dataforseo_utils import get_or_refresh_seo_score_for_user
+    from .models import BusinessProfile
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).select_related("user").first()
+    if profile is None:
+        logger.warning("[stripe->SEO] profile_not_found profile_id=%s", pid)
+        return
+    site = str(getattr(profile, "website_url", "") or "").strip()
+    if not site:
+        logger.info("[stripe->SEO] skip_no_website profile_id=%s", pid)
+        return
+    data_user = workspace_data_user(profile) or profile.user
+    if data_user is None:
+        logger.warning("[stripe->SEO] skip_no_data_user profile_id=%s", pid)
+        return
+    try:
+        bundle = get_or_refresh_seo_score_for_user(
+            data_user,
+            site_url=site,
+            force_refresh=True,
+        )
+        logger.info(
+            "[stripe->SEO] refresh_done profile_id=%s user_id=%s has_bundle=%s",
+            pid,
+            getattr(data_user, "id", None),
+            bundle is not None,
+        )
+    except Exception:
+        logger.exception("[stripe->SEO] refresh_failed profile_id=%s", pid)
+        raise
+
+
+def _seo_datetime_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
+
+def seo_data_dict_from_seo_overview_snapshot(snapshot: Any) -> Dict[str, Any]:
+    """
+    Build a broad ``seo_data`` dict from a persisted ``SEOOverviewSnapshot`` (snapshot JSON only;
+    no new DataForSEO calls). Used by Celery next-steps tasks and API refresh paths so the issue
+    engine + rewrite layer see the same surface as the stored snapshot.
+    """
+    issues = getattr(snapshot, "seo_structured_issues", None) or []
+    if not isinstance(issues, list):
+        issues = []
+    kws = list(getattr(snapshot, "top_keywords", None) or [])
+    snapshot_context_for_rewrite = {
+        "cached_domain": str(getattr(snapshot, "cached_domain", "") or ""),
+        "cached_location_mode": str(getattr(snapshot, "cached_location_mode", "") or "organic"),
+        "cached_location_code": int(getattr(snapshot, "cached_location_code", 0) or 0),
+        "cached_location_label": str(getattr(snapshot, "cached_location_label", "") or ""),
+        "local_verification_applied": bool(getattr(snapshot, "local_verification_applied", False)),
+        "local_verified_keyword_count": int(getattr(snapshot, "local_verified_keyword_count", 0) or 0),
+        "refreshed_at": _seo_datetime_iso(getattr(snapshot, "refreshed_at", None)),
+        "keywords_enriched_at": _seo_datetime_iso(getattr(snapshot, "keywords_enriched_at", None)),
+        "seo_next_steps_refreshed_at": _seo_datetime_iso(getattr(snapshot, "seo_next_steps_refreshed_at", None)),
+        "keyword_action_suggestions_refreshed_at": _seo_datetime_iso(
+            getattr(snapshot, "keyword_action_suggestions_refreshed_at", None)
+        ),
+        "snapshot_id": int(snapshot.pk),
+    }
+    score = int(getattr(snapshot, "search_performance_score", 0) or 0)
+    return {
+        "seo_score": score,
+        "search_performance_score": score,
+        "organic_visitors": int(getattr(snapshot, "organic_visitors", 0) or 0),
+        "total_search_volume": int(getattr(snapshot, "total_search_volume", 0) or 0),
+        "estimated_search_appearances_monthly": int(
+            getattr(snapshot, "estimated_search_appearances_monthly", 0) or 0
+        ),
+        "missed_searches_monthly": int(getattr(snapshot, "missed_searches_monthly", 0) or 0),
+        "search_visibility_percent": int(getattr(snapshot, "search_visibility_percent", 0) or 0),
+        "keywords_ranking": int(getattr(snapshot, "keywords_ranking", 0) or 0),
+        "top3_positions": int(getattr(snapshot, "top3_positions", 0) or 0),
+        "top_keywords": kws,
+        "seo_structured_issues": list(issues),
+        "cached_domain": str(getattr(snapshot, "cached_domain", "") or ""),
+        "cached_location_mode": str(getattr(snapshot, "cached_location_mode", "") or "organic"),
+        "cached_location_code": int(getattr(snapshot, "cached_location_code", 0) or 0),
+        "cached_location_label": str(getattr(snapshot, "cached_location_label", "") or ""),
+        "local_verification_applied": bool(getattr(snapshot, "local_verification_applied", False)),
+        "local_verified_keyword_count": int(getattr(snapshot, "local_verified_keyword_count", 0) or 0),
+        "refreshed_at": _seo_datetime_iso(getattr(snapshot, "refreshed_at", None)),
+        "keywords_enriched_at": _seo_datetime_iso(getattr(snapshot, "keywords_enriched_at", None)),
+        "snapshot_context_for_rewrite": snapshot_context_for_rewrite,
+    }
+
+
+def _seo_snapshot_corpus_newer_than_next_steps(snapshot: Any) -> bool:
+    """
+    When ranked keywords or headline metrics were refreshed after the last next-steps run,
+    bypass ``NEXT_STEPS_TTL`` so a new Celery pass can consume enriched ``top_keywords``.
+    """
+    steps_at = getattr(snapshot, "seo_next_steps_refreshed_at", None)
+    if not steps_at:
+        return True
+    enriched = getattr(snapshot, "keywords_enriched_at", None)
+    if enriched and enriched > steps_at:
+        return True
+    refreshed = getattr(snapshot, "refreshed_at", None)
+    if refreshed and refreshed > steps_at:
+        return True
+    return False
+
+
+def _seo_snapshot_corpus_newer_than_keyword_suggestions(snapshot: Any) -> bool:
+    steps_at = getattr(snapshot, "keyword_action_suggestions_refreshed_at", None)
+    if not steps_at:
+        return True
+    enriched = getattr(snapshot, "keywords_enriched_at", None)
+    if enriched and enriched > steps_at:
+        return True
+    refreshed = getattr(snapshot, "refreshed_at", None)
+    if refreshed and refreshed > steps_at:
+        return True
+    return False
 
 
 def _is_onboarding_sample_size_profile(profile) -> bool:
@@ -362,6 +499,16 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
                 ]
             )
 
+            # Enrichment completes after the initial snapshot save; re-queue next steps / keyword
+            # suggestions so they run on enriched ``top_keywords`` (TTL bypass sees newer timestamps).
+            sid = int(snapshot.id)
+
+            def _enqueue_post_enrichment_seo_tasks() -> None:
+                generate_snapshot_next_steps_task.delay(sid)
+                generate_keyword_action_suggestions_task.delay(sid)
+
+            transaction.on_commit(_enqueue_post_enrichment_seo_tasks)
+
         # Debug evidence after enrichment: did we keep rank values or end up null?
         try:
             from .dataforseo_utils import _dbg_ba84ae_log  # avoid module-level import
@@ -410,9 +557,20 @@ def generate_snapshot_next_steps_task(self, snapshot_id: int) -> None:
         logger.warning("[SEO async] generate_snapshot_next_steps_task snapshot not found snapshot_id=%s", snapshot_id)
         return
 
+    # TTL: skip duplicate work within NEXT_STEPS_TTL unless snapshot keywords/metrics were refreshed
+    # more recently than the last next-steps generation (enrichment pipeline finishes after first pass).
     if getattr(snapshot, "seo_next_steps_refreshed_at", None):
-        if django_tz.now() - snapshot.seo_next_steps_refreshed_at <= NEXT_STEPS_TTL:
+        within_ttl = django_tz.now() - snapshot.seo_next_steps_refreshed_at <= NEXT_STEPS_TTL
+        if within_ttl and not _seo_snapshot_corpus_newer_than_next_steps(snapshot):
             return
+
+    kws = list(getattr(snapshot, "top_keywords", None) or [])
+    if not kws:
+        logger.info(
+            "[SEO async] generate_snapshot_next_steps_task skip empty top_keywords snapshot_id=%s",
+            snapshot_id,
+        )
+        return
 
     try:
         from .openai_utils import generate_seo_next_steps
@@ -420,19 +578,10 @@ def generate_snapshot_next_steps_task(self, snapshot_id: int) -> None:
         logger.warning("[SEO async] generate_snapshot_next_steps_task openai_utils import failed: %s", e)
         return
 
-    # Build minimal seo_data for generate_seo_next_steps (no onpage in task context)
-    seo_data = {
-        "seo_score": int(snapshot.search_performance_score or 0),
-        "missed_searches_monthly": int(getattr(snapshot, "missed_searches_monthly", 0) or 0),
-        "organic_visitors": int(snapshot.organic_visitors or 0),
-        "total_search_volume": int(getattr(snapshot, "total_search_volume", 0) or 0),
-        "search_visibility_percent": int(getattr(snapshot, "search_visibility_percent", 0) or 0),
-        "top_keywords": getattr(snapshot, "top_keywords", None) or [],
-        "onpage_issue_summaries": {},
-    }
+    seo_data = seo_data_dict_from_seo_overview_snapshot(snapshot)
 
     try:
-        steps = generate_seo_next_steps(seo_data)
+        steps = generate_seo_next_steps(seo_data, snapshot=snapshot)
     except Exception as e:
         logger.exception(
             "[SEO async] generate_snapshot_next_steps_task LLM failed snapshot_id=%s: %s",
@@ -446,7 +595,12 @@ def generate_snapshot_next_steps_task(self, snapshot_id: int) -> None:
     try:
         snapshot.seo_next_steps = steps_list
         snapshot.seo_next_steps_refreshed_at = django_tz.now()
-        snapshot.save(update_fields=["seo_next_steps", "seo_next_steps_refreshed_at"])
+        snapshot.save(
+            update_fields=[
+                "seo_next_steps",
+                "seo_next_steps_refreshed_at",
+            ]
+        )
     except Exception as e:
         logger.exception(
             "[SEO async] generate_snapshot_next_steps_task save failed snapshot_id=%s: %s",
@@ -481,12 +635,14 @@ def generate_keyword_action_suggestions_task(self, snapshot_id: int) -> None:
         return
 
     if getattr(snapshot, "keyword_action_suggestions_refreshed_at", None):
-        if django_tz.now() - snapshot.keyword_action_suggestions_refreshed_at <= KEYWORD_ACTION_TTL:
+        within_ttl = django_tz.now() - snapshot.keyword_action_suggestions_refreshed_at <= KEYWORD_ACTION_TTL
+        if within_ttl and not _seo_snapshot_corpus_newer_than_keyword_suggestions(snapshot):
             return
 
     keywords: list[Dict[str, Any]] = getattr(snapshot, "top_keywords", None) or []
     if not keywords:
         return
+    keywords = keywords[:KEYWORD_ACTION_SUGGESTIONS_MAX_ROWS]
 
     try:
         from .openai_utils import generate_keyword_action_suggestions
@@ -497,8 +653,14 @@ def generate_keyword_action_suggestions_task(self, snapshot_id: int) -> None:
         )
         return
 
+    snapshot_seo_data = seo_data_dict_from_seo_overview_snapshot(snapshot)
+
     try:
-        suggestions = generate_keyword_action_suggestions(keywords)
+        suggestions = generate_keyword_action_suggestions(
+            keywords,
+            snapshot=snapshot,
+            snapshot_seo_data=snapshot_seo_data,
+        )
     except Exception as e:
         logger.exception(
             "[SEO async] generate_keyword_action_suggestions_task LLM failed snapshot_id=%s: %s",
@@ -1515,6 +1677,7 @@ def run_aeo_phase5_recommendation_task(self, run_id: int) -> None:
             run.profile_id,
             run.status,
         )
+        refresh_aeo_dashboard_bundle_cache_task.delay(run.profile_id)
         _enqueue_seo_after_aeo(run.id)
     except Exception as exc:
         run.recommendation_status = AEOExecutionRun.STAGE_FAILED
@@ -1610,6 +1773,153 @@ def try_enqueue_aeo_full_monitored_pipeline(profile_id: int, *, source: str = ""
         "run_id": rid,
         "reason": "enqueued",
         "message": f"Enqueued full monitoring pipeline for {len(payload)} prompt(s).",
+        "prompt_count": monitored_n,
+    }
+
+
+def try_enqueue_aeo_phase5_recommendations_only(
+    profile_id: int, *, source: str = ""
+) -> dict[str, Any]:
+    """
+    Enqueue ``run_aeo_phase5_recommendation_task`` for the latest **completed** execution run on
+    the profile that already has Phase 4 scoring (``scoring_status=completed`` + ``score_snapshot_id``).
+
+    Does not start Phase 1 / extraction / scoring. Refused while another execution run is
+    ``pending`` or ``running`` for the profile (same guard as full monitored pipeline).
+
+    Return keys align with ``try_enqueue_aeo_full_monitored_pipeline``: ``ok``, ``queued``,
+    ``run_id`` (target execution run id when applicable), ``reason``, ``message``, ``prompt_count``.
+    """
+    from django.db import transaction
+
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order
+    from .models import AEOExecutionRun, BusinessProfile
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).first()
+    if profile is None:
+        return {
+            "ok": False,
+            "queued": False,
+            "run_id": None,
+            "reason": "profile_not_found",
+            "message": "Business profile not found.",
+            "prompt_count": 0,
+        }
+
+    saved = list(profile.selected_aeo_prompts or [])
+    monitored_n = len(monitored_prompt_keys_in_order(saved))
+    if monitored_n == 0:
+        return {
+            "ok": False,
+            "queued": False,
+            "run_id": None,
+            "reason": "no_prompts",
+            "message": "No monitored prompts on this profile.",
+            "prompt_count": 0,
+        }
+
+    if not _aeo_recommendation_stage_enabled():
+        return {
+            "ok": False,
+            "queued": False,
+            "run_id": None,
+            "reason": "recommendations_disabled",
+            "message": "AEO recommendation stage is disabled in settings (AEO_ENABLE_RECOMMENDATION_STAGE).",
+            "prompt_count": monitored_n,
+        }
+
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exists()
+    if inflight:
+        return {
+            "ok": True,
+            "queued": False,
+            "run_id": None,
+            "reason": "duplicate_inflight",
+            "message": (
+                "A pipeline run is already in progress for this profile; wait for it to finish "
+                "before re-running recommendations."
+            ),
+            "prompt_count": monitored_n,
+        }
+
+    eligible = (
+        AEOExecutionRun.objects.filter(
+            profile_id=pid,
+            scoring_status=AEOExecutionRun.STAGE_COMPLETED,
+            score_snapshot_id__isnull=False,
+            status__in=[
+                AEOExecutionRun.STATUS_COMPLETED,
+                AEOExecutionRun.STATUS_SKIPPED_CACHED,
+            ],
+        )
+        .order_by("-id")
+        .first()
+    )
+    if eligible is None:
+        return {
+            "ok": False,
+            "queued": False,
+            "run_id": None,
+            "reason": "no_eligible_run",
+            "message": (
+                "No completed execution run with finished scoring found for this profile. "
+                "Run the full pipeline first."
+            ),
+            "prompt_count": monitored_n,
+        }
+
+    if eligible.recommendation_status == AEOExecutionRun.STAGE_RUNNING:
+        return {
+            "ok": True,
+            "queued": False,
+            "run_id": int(eligible.id),
+            "reason": "phase5_inflight",
+            "message": "Phase 5 recommendations are already running for the latest scored execution run.",
+            "prompt_count": monitored_n,
+        }
+
+    tag = (source or "").strip()[:400]
+    rid = int(eligible.id)
+    with transaction.atomic():
+        locked = (
+            AEOExecutionRun.objects.select_for_update()
+            .filter(pk=rid, profile_id=pid)
+            .first()
+        )
+        if locked is None:
+            return {
+                "ok": False,
+                "queued": False,
+                "run_id": None,
+                "reason": "no_eligible_run",
+                "message": "Execution run no longer available.",
+                "prompt_count": monitored_n,
+            }
+        if locked.recommendation_status == AEOExecutionRun.STAGE_RUNNING:
+            return {
+                "ok": True,
+                "queued": False,
+                "run_id": int(locked.id),
+                "reason": "phase5_inflight",
+                "message": "Phase 5 recommendations are already running for this execution run.",
+                "prompt_count": monitored_n,
+            }
+
+        transaction.on_commit(lambda r=rid: run_aeo_phase5_recommendation_task.delay(r))
+
+    msg = f"Enqueued Phase 5 recommendations for execution run {rid}."
+    if tag:
+        msg = f"{msg} (source={tag})"
+    return {
+        "ok": True,
+        "queued": True,
+        "run_id": rid,
+        "reason": "enqueued",
+        "message": msg[:2000],
         "prompt_count": monitored_n,
     }
 

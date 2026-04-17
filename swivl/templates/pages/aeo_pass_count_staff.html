@@ -53,6 +53,47 @@
     </div>
   </div>
 
+  <div class="card border mb-4 shadow-sm">
+    <div class="card-header py-2 fw-semibold bg-white">Recommendations only (Phase 5)</div>
+    <div class="card-body py-3">
+      <p class="small text-muted mb-2">Does not fetch new LLM answers or change monitored prompts. Regenerates recommendation strategies from the current visibility and extraction state for the latest completed, scored execution run.</p>
+      {% if selected_profile_id == "all" %}
+        <p class="small text-warning mb-2 mb-md-0"><strong>Choose a specific business profile</strong> in the filter above (not &ldquo;All profiles&rdquo;) to enable the button.</p>
+      {% endif %}
+      <form method="post" class="d-inline-block">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="phase5_recommendations_only" />
+        <input type="hidden" name="aeo_phase5_rerun_profile_id" value="{{ selected_profile_id }}" />
+        <input type="hidden" name="redirect_run_id" value="{{ selected_run_id }}" />
+        <input type="hidden" name="redirect_profile_id" value="{{ selected_profile_id }}" />
+        <button type="submit" class="btn btn-outline-danger" {% if selected_profile_id == "all" %}disabled aria-disabled="true"{% endif %}>
+          Re-run recommendations for this profile
+        </button>
+      </form>
+      <p class="small text-muted mt-2 mb-0">After Phase 5 finishes, the AEO dashboard may take a moment to reflect updates while the bundle cache refreshes.</p>
+    </div>
+  </div>
+
+  <div class="card border mb-4 shadow-sm">
+    <div class="card-header py-2 fw-semibold bg-white">SEO snapshot refresh (staff)</div>
+    <div class="card-body py-3">
+      <p class="small text-muted mb-2">Runs the Search/SEO DataForSEO pipeline for this profile’s website (not AEO). May incur API cost and take a short while. Snapshot rows update immediately; structured SEO issues fill after background next-steps / keyword tasks complete.</p>
+      {% if selected_profile_id == "all" %}
+        <p class="small text-warning mb-2 mb-md-0"><strong>Choose a specific business profile</strong> in the filter above (not &ldquo;All profiles&rdquo;) to enable the button.</p>
+      {% endif %}
+      <form method="post" class="d-inline-block">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="seo_snapshot_refresh" />
+        <input type="hidden" name="seo_snapshot_refresh_profile_id" value="{{ selected_profile_id }}" />
+        <input type="hidden" name="redirect_run_id" value="{{ selected_run_id }}" />
+        <input type="hidden" name="redirect_profile_id" value="{{ selected_profile_id }}" />
+        <button type="submit" class="btn btn-outline-primary" {% if selected_profile_id == "all" %}disabled aria-disabled="true"{% endif %}>
+          Run SEO snapshot + issues for this profile
+        </button>
+      </form>
+    </div>
+  </div>
+
   <div class="row">
     <div class="col-md-6">
       <ul class="list-group mb-3">

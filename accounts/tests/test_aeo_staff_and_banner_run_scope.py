@@ -11,9 +11,13 @@ from accounts.models import (
     AEOExecutionRun,
     AEOExtractionSnapshot,
     AEOResponseSnapshot,
+    AEOScoreSnapshot,
     BusinessProfile,
 )
-from accounts.tasks import try_enqueue_aeo_full_monitored_pipeline
+from accounts.tasks import (
+    try_enqueue_aeo_full_monitored_pipeline,
+    try_enqueue_aeo_phase5_recommendations_only,
+)
 
 User = get_user_model()
 
@@ -113,6 +117,146 @@ def test_staff_full_rerun_post_calls_enqueue_helper(monkeypatch):
     assert "profile_id=7" in resp.url or resp.url.endswith("7")
 
 
+@pytest.mark.django_db(transaction=True)
+def test_staff_phase5_recommendations_post_calls_phase5_delay_once(monkeypatch, settings):
+    settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
+    delayed: list[int] = []
+
+    def capture_delay(rid: int):
+        delayed.append(int(rid))
+
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase5_recommendation_task.delay", capture_delay
+    )
+
+    client = Client()
+    staff = User.objects.create_user(
+        username="p5st",
+        email="p5st@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    client.force_login(staff)
+    user = User.objects.create_user(username="p5u", email="p5u@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="P5Co",
+        selected_aeo_prompts=["alpha"],
+    )
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_COMPLETED,
+        scoring_status=AEOExecutionRun.STAGE_COMPLETED,
+        extraction_status=AEOExecutionRun.STAGE_COMPLETED,
+    )
+    snap = AEOScoreSnapshot.objects.create(profile=profile, execution_run=run, total_prompts=1)
+    run.score_snapshot_id = snap.id
+    run.save(update_fields=["score_snapshot_id"])
+
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "phase5_recommendations_only",
+            "aeo_phase5_rerun_profile_id": str(profile.id),
+            "redirect_run_id": "all",
+            "redirect_profile_id": str(profile.id),
+        },
+    )
+    assert resp.status_code == 302
+    assert delayed == [run.id]
+
+
+@pytest.mark.django_db
+def test_staff_phase5_post_all_profiles_warning(monkeypatch, settings):
+    settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase5_recommendation_task.delay",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not enqueue")),
+    )
+    client = Client()
+    staff = User.objects.create_user(
+        username="p5all",
+        email="p5all@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    client.force_login(staff)
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "phase5_recommendations_only",
+            "aeo_phase5_rerun_profile_id": "all",
+            "redirect_run_id": "all",
+            "redirect_profile_id": "all",
+        },
+        follow=True,
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.django_db
+def test_staff_phase5_inflight_main_pipeline_no_delay(monkeypatch, settings):
+    settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
+    delayed: list[int] = []
+
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase5_recommendation_task.delay",
+        lambda rid, *a, **k: delayed.append(int(rid)),
+    )
+
+    client = Client()
+    staff = User.objects.create_user(
+        username="p5inf",
+        email="p5inf@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    client.force_login(staff)
+    user = User.objects.create_user(username="p5u2", email="p5u2@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="P5Inf",
+        selected_aeo_prompts=["alpha"],
+    )
+    AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_RUNNING)
+    AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_COMPLETED,
+        scoring_status=AEOExecutionRun.STAGE_COMPLETED,
+        extraction_status=AEOExecutionRun.STAGE_COMPLETED,
+    )
+
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "phase5_recommendations_only",
+            "aeo_phase5_rerun_profile_id": str(profile.id),
+            "redirect_run_id": "all",
+            "redirect_profile_id": str(profile.id),
+        },
+    )
+    assert resp.status_code == 302
+    assert delayed == []
+
+
+@pytest.mark.django_db
+def test_try_enqueue_phase5_only_respects_main_pipeline_inflight(settings):
+    settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
+    user = User.objects.create_user(username="tp5", email="tp5@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="T",
+        selected_aeo_prompts=["x"],
+    )
+    AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_RUNNING)
+    out = try_enqueue_aeo_phase5_recommendations_only(profile.id, source="test")
+    assert out["queued"] is False
+    assert out["reason"] == "duplicate_inflight"
+
+
 @pytest.mark.django_db
 def test_prompt_coverage_banner_prompt_scan_scoped_to_latest_run_only():
     pytest.importorskip("stripe")
@@ -182,4 +326,116 @@ def test_aeo_scheduled_tick_skips_when_disabled(monkeypatch, settings):
     from accounts.tasks import aeo_scheduled_full_monitoring_tick_task
 
     aeo_scheduled_full_monitoring_tick_task.run()
+    assert called == []
+
+
+@pytest.mark.django_db
+def test_staff_seo_snapshot_refresh_post_calls_get_or_refresh(monkeypatch):
+    calls: list[tuple[int | None, str | None, bool]] = []
+
+    def capture(user, *, site_url=None, force_refresh=False):
+        calls.append((getattr(user, "id", None), site_url, bool(force_refresh)))
+        return {"seo_score": 50}
+
+    monkeypatch.setattr(
+        "accounts.dataforseo_utils.get_or_refresh_seo_score_for_user", capture
+    )
+
+    client = Client()
+    staff = User.objects.create_user(
+        username="seostf",
+        email="seostf@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    owner = User.objects.create_user(username="seoo", email="seoo@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=owner,
+        is_main=True,
+        business_name="SEO Co",
+        website_url="https://seo-co.example.com",
+        selected_aeo_prompts=["a"],
+    )
+    client.force_login(staff)
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "seo_snapshot_refresh",
+            "seo_snapshot_refresh_profile_id": str(profile.id),
+            "redirect_run_id": "all",
+            "redirect_profile_id": str(profile.id),
+        },
+    )
+    assert resp.status_code == 302
+    assert len(calls) == 1
+    assert calls[0][0] == owner.id
+    assert calls[0][1] == "https://seo-co.example.com"
+    assert calls[0][2] is True
+
+
+@pytest.mark.django_db
+def test_staff_seo_snapshot_refresh_post_all_profiles_no_refresh(monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("get_or_refresh should not run")
+
+    monkeypatch.setattr(
+        "accounts.dataforseo_utils.get_or_refresh_seo_score_for_user", boom
+    )
+    client = Client()
+    staff = User.objects.create_user(
+        username="seoall",
+        email="seoall@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    client.force_login(staff)
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "seo_snapshot_refresh",
+            "seo_snapshot_refresh_profile_id": "all",
+            "redirect_run_id": "all",
+            "redirect_profile_id": "all",
+        },
+    )
+    assert resp.status_code == 302
+
+
+@pytest.mark.django_db
+def test_staff_seo_snapshot_refresh_skips_without_website(monkeypatch):
+    called: list[bool] = []
+
+    def capture(*_a, **_k):
+        called.append(True)
+        return {}
+
+    monkeypatch.setattr(
+        "accounts.dataforseo_utils.get_or_refresh_seo_score_for_user", capture
+    )
+    client = Client()
+    staff = User.objects.create_user(
+        username="seonoweb",
+        email="seonoweb@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    owner = User.objects.create_user(username="seonowebu", email="seonowebu@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=owner,
+        is_main=True,
+        business_name="No Web",
+        website_url="",
+        selected_aeo_prompts=["a"],
+    )
+    client.force_login(staff)
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "seo_snapshot_refresh",
+            "seo_snapshot_refresh_profile_id": str(profile.id),
+            "redirect_run_id": "all",
+            "redirect_profile_id": str(profile.id),
+        },
+    )
+    assert resp.status_code == 302
     assert called == []

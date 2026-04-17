@@ -4604,21 +4604,15 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
 
     # Build fresh seo_data for this snapshot and forcibly regenerate next steps.
     from .openai_utils import generate_seo_next_steps
+    from .tasks import seo_data_dict_from_seo_overview_snapshot
 
-    seo_data = {
-        "seo_score": int(snapshot.search_performance_score or 0),
-        "missed_searches_monthly": int(getattr(snapshot, "missed_searches_monthly", 0) or 0),
-        "organic_visitors": int(snapshot.organic_visitors or 0),
-        "total_search_volume": int(getattr(snapshot, "total_search_volume", 0) or 0),
-        "search_visibility_percent": int(getattr(snapshot, "search_visibility_percent", 0) or 0),
-        "top_keywords": getattr(snapshot, "top_keywords", None) or [],
-        "business_name": getattr(profile, "business_name", "") or "",
-        "website_url": site_url,
-        "business_description": getattr(profile, "description", "") or "",
-    }
+    seo_data = seo_data_dict_from_seo_overview_snapshot(snapshot)
+    seo_data["business_name"] = getattr(profile, "business_name", "") or ""
+    seo_data["website_url"] = site_url
+    seo_data["business_description"] = getattr(profile, "description", "") or ""
 
     try:
-        steps = generate_seo_next_steps(seo_data)
+        steps = generate_seo_next_steps(seo_data, snapshot=snapshot)
     except Exception:
         return Response(
             {"detail": "Failed to generate SEO next steps. Please try again later."},

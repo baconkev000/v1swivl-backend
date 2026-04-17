@@ -1,6 +1,6 @@
 """top_keywords from DB snapshot when get_or_refresh returns empty (Keywords UI / seo profile)."""
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -128,3 +128,69 @@ def test_skip_heavy_top_keywords_branch_unchanged(monkeypatch):
     out = ser.data.get("top_keywords") or []
     assert len(out) == 1
     assert out[0].get("keyword") == "from_snap"
+
+
+@pytest.mark.django_db
+def test_skip_heavy_exposes_seo_next_steps_and_keyword_suggestions_from_latest_snapshot():
+    user = User.objects.create_user(
+        username="seo-act", email="seo-act@example.com", password="pw"
+    )
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://seo-act.example.com",
+    )
+    steps = [{"label": "Fix titles", "tag": "Quick win"}]
+    kw_sug = [{"keyword": "plumbing", "suggestion": "Add a service page"}]
+    now = timezone.now()
+    SEOOverviewSnapshot.objects.create(
+        user=user,
+        period_start=date(2026, 4, 1),
+        cached_domain="seo-act.example.com",
+        cached_location_mode="organic",
+        cached_location_code=0,
+        top_keywords=[{"keyword": "x", "search_volume": 1, "rank": 1}],
+        seo_next_steps=steps,
+        keyword_action_suggestions=kw_sug,
+        keywords_enriched_at=now,
+        seo_next_steps_refreshed_at=now,
+        keyword_action_suggestions_refreshed_at=now,
+    )
+    ser = BusinessProfileSerializer(
+        instance=profile,
+        context={"skip_heavy_profile_metrics": True},
+    )
+    assert ser.data.get("seo_next_steps") == steps
+    assert ser.data.get("keyword_action_suggestions") == kw_sug
+    assert ser.data.get("enrichment_status") == "complete"
+
+
+@pytest.mark.django_db
+def test_skip_heavy_enrichment_status_pending_until_all_async_fields_refreshed():
+    user = User.objects.create_user(
+        username="seo-pend", email="seo-pend@example.com", password="pw"
+    )
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://pend.example.com",
+    )
+    now = timezone.now()
+    SEOOverviewSnapshot.objects.create(
+        user=user,
+        period_start=date(2026, 4, 1),
+        cached_domain="pend.example.com",
+        cached_location_mode="organic",
+        cached_location_code=0,
+        top_keywords=[],
+        seo_next_steps=[],
+        keyword_action_suggestions=[],
+        keywords_enriched_at=now - timedelta(hours=1),
+        seo_next_steps_refreshed_at=None,
+        keyword_action_suggestions_refreshed_at=now,
+    )
+    ser = BusinessProfileSerializer(
+        instance=profile,
+        context={"skip_heavy_profile_metrics": True},
+    )
+    assert ser.data.get("enrichment_status") == "pending"
