@@ -17,7 +17,6 @@ from .base import env
 # GOOGLE_REDIRECT_URI=https://api.ripplerank.ai/accounts/google/login/callback/
 # Onboarding without real Stripe on staging (frontend auto-skips on staging host unless forced):
 # NEXT_PUBLIC_FORCE_ONBOARDING_STRIPE=true can still force real Stripe testing.
-ALLOW_ONBOARDING_BILLING_BYPASS = env.bool("ALLOW_ONBOARDING_BILLING_BYPASS", default=True)
 # (Google Cloud Console authorized redirect URI must match that callback exactly.)
 # To keep serving legacy getswivl.ai hosts, add them via DJANGO_ALLOWED_HOSTS (comma-separated).
 DEBUG_LOG_PATH = os.environ.get("DEBUG_LOG_PATH", str(BASE_DIR / "debug-e47e3c.log"))
@@ -233,3 +232,7 @@ GOOGLE_REDIRECT_URI = env(
 )
 # Your stuff...
 # ------------------------------------------------------------------------------
+ALLOW_ONBOARDING_BILLING_BYPASS = env.bool(
+    "ALLOW_ONBOARDING_BILLING_BYPASS",
+    default=True
+)
