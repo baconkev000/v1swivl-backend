@@ -1,0 +1,232 @@
+# ruff: noqa: E501
+import os
+
+from .base import *  # noqa: F403
+from .base import BASE_DIR
+from .base import DATABASES
+from .base import INSTALLED_APPS
+from .base import REDIS_URL
+from .base import SPECTACULAR_SETTINGS
+from .base import env
+
+# GENERAL
+# ------------------------------------------------------------------------------
+# Debug log path: writable in Docker (/app is owned by django user)
+# Deploy env (Ripple Rank): FRONTEND_BASE_URL=https://app.ripplerank.ai,
+# SESSION_COOKIE_DOMAIN=.ripplerank.ai, CSRF_COOKIE_DOMAIN=.ripplerank.ai,
+# GOOGLE_REDIRECT_URI=https://api.ripplerank.ai/accounts/google/login/callback/
+# (Google Cloud Console authorized redirect URI must match that callback exactly.)
+# To keep serving legacy getswivl.ai hosts, add them via DJANGO_ALLOWED_HOSTS (comma-separated).
+DEBUG_LOG_PATH = os.environ.get("DEBUG_LOG_PATH", str(BASE_DIR / "debug-e47e3c.log"))
+# https://docs.djangoproject.com/en/dev/ref/settings/#secret-key
+SECRET_KEY = env("DJANGO_SECRET_KEY")
+# https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
+ALLOWED_HOSTS = env.list(
+    "DJANGO_ALLOWED_HOSTS",
+    default=[
+        "ripplerank.ai",
+        "www.ripplerank.ai",
+        "staging-api.ripplerank.ai",
+        "staging.ripplerank.ai",
+    ],
+)
+# Always allow canonical Ripple Rank hosts even when DJANGO_ALLOWED_HOSTS is overridden in env.
+_required_hosts = [
+    "ripplerank.ai",
+    "www.ripplerank.ai",
+    "staging-api.ripplerank.ai",
+    "staging.ripplerank.ai",
+]
+for _h in _required_hosts:
+    if _h not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_h)
+
+# DATABASES
+# ------------------------------------------------------------------------------
+DATABASES["default"]["CONN_MAX_AGE"] = env.int("CONN_MAX_AGE", default=60)
+
+# CACHES
+# ------------------------------------------------------------------------------
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            # Mimicking memcache behavior.
+            # https://github.com/jazzband/django-redis#memcached-exceptions-behavior
+            "IGNORE_EXCEPTIONS": True,
+        },
+    },
+}
+
+# SECURITY
+# ------------------------------------------------------------------------------
+# https://docs.djangoproject.com/en/dev/ref/settings/#secure-proxy-ssl-header
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+# https://docs.djangoproject.com/en/dev/ref/settings/#secure-ssl-redirect
+SECURE_SSL_REDIRECT = env.bool("DJANGO_SECURE_SSL_REDIRECT", default=True)
+# https://docs.djangoproject.com/en/dev/ref/settings/#session-cookie-secure
+SESSION_COOKIE_SECURE = True
+# https://docs.djangoproject.com/en/dev/ref/settings/#session-cookie-name
+SESSION_COOKIE_NAME = "__Secure-sessionid"
+# Share session cookie with the web app origin (e.g. app.ripplerank.ai + api.ripplerank.ai).
+# Use a leading dot so the cookie is sent to all subdomains of that parent.
+SESSION_COOKIE_DOMAIN = env("SESSION_COOKIE_DOMAIN", default=".ripplerank.ai")
+# https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-secure
+CSRF_COOKIE_SECURE = True
+# https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-name
+CSRF_COOKIE_NAME = "__Secure-csrftoken"
+# Share CSRF cookie with the web app for cross-subdomain API requests (e.g. app → api).
+CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN", default=".ripplerank.ai")
+# https://docs.djangoproject.com/en/dev/topics/security/#ssl-https
+# https://docs.djangoproject.com/en/dev/ref/settings/#secure-hsts-seconds
+# TODO: set this to 60 seconds first and then to 518400 once you prove the former works
+SECURE_HSTS_SECONDS = 60
+# https://docs.djangoproject.com/en/dev/ref/settings/#secure-hsts-include-subdomains
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env.bool(
+    "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS",
+    default=True,
+)
+# https://docs.djangoproject.com/en/dev/ref/settings/#secure-hsts-preload
+SECURE_HSTS_PRELOAD = env.bool("DJANGO_SECURE_HSTS_PRELOAD", default=True)
+# https://docs.djangoproject.com/en/dev/ref/middleware/#x-content-type-options-nosniff
+SECURE_CONTENT_TYPE_NOSNIFF = env.bool(
+    "DJANGO_SECURE_CONTENT_TYPE_NOSNIFF",
+    default=True,
+)
+
+# STATIC & MEDIA
+# ------------------------
+# WhiteNoise (in base) serves static from STATIC_ROOT when DEBUG=False.
+# Using local filesystem storage (no S3). Media files from MEDIA_ROOT.
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
+
+# CORS & CSRF for production frontend and API
+# ------------------------------------------------------------------------------
+CORS_ALLOWED_ORIGINS = [
+    "https://ripplerank.ai",
+    "https://www.ripplerank.ai",
+    "https://staging.ripplerank.ai",
+    "https://staging-api.ripplerank.ai",
+    "http://localhost:3000",
+]
+CSRF_TRUSTED_ORIGINS = [
+    "https://staging-api.ripplerank.ai",
+    "https://ripplerank.ai",
+    "https://www.ripplerank.ai",
+    "https://staging.ripplerank.ai",
+    "http://localhost:3000",
+]
+
+# EMAIL
+# ------------------------------------------------------------------------------
+# https://docs.djangoproject.com/en/dev/ref/settings/#default-from-email
+DEFAULT_FROM_EMAIL = env(
+    "DJANGO_DEFAULT_FROM_EMAIL",
+    default="Ripple Rank <noreply@ripplerank.ai>",
+)
+# https://docs.djangoproject.com/en/dev/ref/settings/#server-email
+SERVER_EMAIL = env("DJANGO_SERVER_EMAIL", default=DEFAULT_FROM_EMAIL)
+# https://docs.djangoproject.com/en/dev/ref/settings/#email-subject-prefix
+EMAIL_SUBJECT_PREFIX = env(
+    "DJANGO_EMAIL_SUBJECT_PREFIX",
+    default="[Ripple Rank] ",
+)
+ACCOUNT_EMAIL_SUBJECT_PREFIX = EMAIL_SUBJECT_PREFIX
+
+# ADMIN
+# ------------------------------------------------------------------------------
+# Django Admin URL regex.
+ADMIN_URL = env("DJANGO_ADMIN_URL")
+
+# Anymail
+# ------------------------------------------------------------------------------
+# https://anymail.readthedocs.io/en/stable/installation/#installing-anymail
+INSTALLED_APPS += ["anymail"]
+# https://docs.djangoproject.com/en/dev/ref/settings/#email-backend
+# https://anymail.readthedocs.io/en/stable/installation/#anymail-settings-reference
+# https://anymail.readthedocs.io/en/stable/esps/mailgun/
+EMAIL_BACKEND = "anymail.backends.mailgun.EmailBackend"
+ANYMAIL = {
+    "MAILGUN_API_KEY": env("MAILGUN_API_KEY"),
+    "MAILGUN_SENDER_DOMAIN": env("MAILGUN_DOMAIN"),
+    "MAILGUN_API_URL": env("MAILGUN_API_URL", default="https://api.mailgun.net/v3"),
+}
+
+# LOGGING
+# ------------------------------------------------------------------------------
+# https://docs.djangoproject.com/en/dev/ref/settings/#logging
+# See https://docs.djangoproject.com/en/dev/topics/logging for
+# more details on how to customize your logging configuration.
+# A sample logging configuration. The only tangible logging
+# performed by this configuration is to send an email to
+# the site admins on every HTTP 500 error when DEBUG=False.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {"require_debug_false": {"()": "django.utils.log.RequireDebugFalse"}},
+    "formatters": {
+        "verbose": {
+            "format": "%(levelname)s %(asctime)s %(module)s %(process)d %(thread)d %(message)s",
+        },
+        "request_error": {
+            "format": "%(levelname)s %(asctime)s %(message)s",
+        },
+    },
+    "handlers": {
+        "mail_admins": {
+            "level": "ERROR",
+            "filters": ["require_debug_false"],
+            "class": "django.utils.log.AdminEmailHandler",
+        },
+        "console": {
+            "level": "DEBUG",
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+        "console_request": {
+            "level": "ERROR",
+            "class": "logging.StreamHandler",
+            "formatter": "request_error",
+        },
+    },
+    "root": {"level": "INFO", "handlers": ["console"]},
+    "loggers": {
+        "django.request": {
+            "handlers": ["console_request", "mail_admins"],
+            "level": "ERROR",
+            "propagate": False,
+        },
+        "django.security.DisallowedHost": {
+            "level": "ERROR",
+            "handlers": ["console", "mail_admins"],
+            "propagate": True,
+        },
+    },
+}
+
+# django-rest-framework
+# -------------------------------------------------------------------------------
+# Tools that generate code samples can use SERVERS to point to the correct domain
+SPECTACULAR_SETTINGS["TITLE"] = "Ripple Rank API"
+SPECTACULAR_SETTINGS["DESCRIPTION"] = "Documentation of API endpoints for Ripple Rank"
+SPECTACULAR_SETTINGS["SERVERS"] = [
+    {"url": "https://staging-api.ripplerank.ai", "description": "STAGING API"},
+]
+# SPA origin: google_login_redirect absolute ?next=, AccountAdapter.is_safe_url, OAuth returns.
+FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", default="https://staging.ripplerank.ai").rstrip("/")
+LOGIN_REDIRECT_URL = f"{FRONTEND_BASE_URL}/onboarding"
+GOOGLE_REDIRECT_URI = env(
+    "GOOGLE_REDIRECT_URI",
+    default="https://staging-api.ripplerank.ai/accounts/google/login/callback/",
+)
+# Your stuff...
+# ------------------------------------------------------------------------------
