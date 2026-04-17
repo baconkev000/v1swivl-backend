@@ -17,6 +17,8 @@ services:
       - redis
     env_file:
       - /home/deploy/app/backend/.env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.staging
     command: /start
 
   celery:
