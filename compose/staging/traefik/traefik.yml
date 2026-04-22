@@ -19,7 +19,7 @@ certificatesResolvers:
   letsencrypt:
     # https://doc.traefik.io/traefik/https/acme/#lets-encrypt
     acme:
-      email: 'support@ripplerank.ai'
+      email: 'support@amplerank.ai'
       storage: /etc/traefik/acme/acme.json
       # https://doc.traefik.io/traefik/https/acme/#httpchallenge
       httpChallenge:
@@ -28,7 +28,7 @@ certificatesResolvers:
 http:
   routers:
     web-secure-router:
-      rule: 'Host(`staging-api.ripplerank.ai`)'
+      rule: 'Host(`staging-api.amplerank.ai`)'
       entryPoints:
         - web-secure
       middlewares:

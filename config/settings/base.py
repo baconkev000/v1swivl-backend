@@ -240,7 +240,7 @@ EMAIL_TIMEOUT = 5
 # Django Admin URL.
 ADMIN_URL = "admin/"
 # https://docs.djangoproject.com/en/dev/ref/settings/#admins
-ADMINS = [("""Kevin Bacon""", "support@ripplerank.ai")]
+ADMINS = [("""Kevin Bacon""", "support@amplerank.ai")]
 # https://docs.djangoproject.com/en/dev/ref/settings/#managers
 MANAGERS = ADMINS
 # https://cookiecutter-django.readthedocs.io/en/latest/settings.html#other-environment-settings
@@ -385,7 +385,7 @@ SPECTACULAR_SETTINGS = {
     "SCHEMA_PATH_PREFIX": "/api/",
 }
 
-# Production: https://app.ripplerank.ai (see config.settings.production for defaults).
+# Production: https://app.amplerank.ai (see config.settings.production for defaults).
 FRONTEND_BASE_URL = os.environ.get(
     "FRONTEND_BASE_URL",
     "http://localhost:3000",

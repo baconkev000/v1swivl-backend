@@ -12,9 +12,9 @@ from .base import env
 # GENERAL
 # ------------------------------------------------------------------------------
 # Debug log path: writable in Docker (/app is owned by django user)
-# Deploy env (Ripple Rank): FRONTEND_BASE_URL=https://app.ripplerank.ai,
-# SESSION_COOKIE_DOMAIN=.ripplerank.ai, CSRF_COOKIE_DOMAIN=.ripplerank.ai,
-# GOOGLE_REDIRECT_URI=https://api.ripplerank.ai/accounts/google/login/callback/
+# Deploy env (Ripple Rank): FRONTEND_BASE_URL=https://app.amplerank.ai,
+# SESSION_COOKIE_DOMAIN=.amplerank.ai, CSRF_COOKIE_DOMAIN=.amplerank.ai,
+# GOOGLE_REDIRECT_URI=https://api.amplerank.ai/accounts/google/login/callback/
 # Onboarding without real Stripe on staging (frontend auto-skips on staging host unless forced):
 # NEXT_PUBLIC_FORCE_ONBOARDING_STRIPE=true can still force real Stripe testing.
 # (Google Cloud Console authorized redirect URI must match that callback exactly.)
@@ -26,18 +26,18 @@ SECRET_KEY = env("DJANGO_SECRET_KEY")
 ALLOWED_HOSTS = env.list(
     "DJANGO_ALLOWED_HOSTS",
     default=[
-        "ripplerank.ai",
-        "www.ripplerank.ai",
-        "staging-api.ripplerank.ai",
-        "staging.ripplerank.ai",
+        "amplerank.ai",
+        "www.amplerank.ai",
+        "staging-api.amplerank.ai",
+        "staging.amplerank.ai",
     ],
 )
 # Always allow canonical Ripple Rank hosts even when DJANGO_ALLOWED_HOSTS is overridden in env.
 _required_hosts = [
-    "ripplerank.ai",
-    "www.ripplerank.ai",
-    "staging-api.ripplerank.ai",
-    "staging.ripplerank.ai",
+    "amplerank.ai",
+    "www.amplerank.ai",
+    "staging-api.amplerank.ai",
+    "staging.amplerank.ai",
 ]
 for _h in _required_hosts:
     if _h not in ALLOWED_HOSTS:
@@ -72,15 +72,15 @@ SECURE_SSL_REDIRECT = env.bool("DJANGO_SECURE_SSL_REDIRECT", default=True)
 SESSION_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#session-cookie-name
 SESSION_COOKIE_NAME = "__Secure-sessionid"
-# Share session cookie with the web app origin (e.g. app.ripplerank.ai + api.ripplerank.ai).
+# Share session cookie with the web app origin (e.g. app.amplerank.ai + api.amplerank.ai).
 # Use a leading dot so the cookie is sent to all subdomains of that parent.
-SESSION_COOKIE_DOMAIN = env("SESSION_COOKIE_DOMAIN", default=".ripplerank.ai")
+SESSION_COOKIE_DOMAIN = env("SESSION_COOKIE_DOMAIN", default=".amplerank.ai")
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-secure
 CSRF_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-name
 CSRF_COOKIE_NAME = "__Secure-csrftoken"
 # Share CSRF cookie with the web app for cross-subdomain API requests (e.g. app → api).
-CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN", default=".ripplerank.ai")
+CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN", default=".amplerank.ai")
 # https://docs.djangoproject.com/en/dev/topics/security/#ssl-https
 # https://docs.djangoproject.com/en/dev/ref/settings/#secure-hsts-seconds
 # TODO: set this to 60 seconds first and then to 518400 once you prove the former works
@@ -114,17 +114,17 @@ STORAGES = {
 # CORS & CSRF for staging frontend and API
 # ------------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = [
-    "https://ripplerank.ai",
-    "https://www.ripplerank.ai",
-    "https://staging.ripplerank.ai",
-    "https://staging-api.ripplerank.ai",
+    "https://amplerank.ai",
+    "https://www.amplerank.ai",
+    "https://staging.amplerank.ai",
+    "https://staging-api.amplerank.ai",
     "http://localhost:3000",
 ]
 CSRF_TRUSTED_ORIGINS = [
-    "https://staging-api.ripplerank.ai",
-    "https://ripplerank.ai",
-    "https://www.ripplerank.ai",
-    "https://staging.ripplerank.ai",
+    "https://staging-api.amplerank.ai",
+    "https://amplerank.ai",
+    "https://www.amplerank.ai",
+    "https://staging.amplerank.ai",
     "http://localhost:3000",
 ]
 
@@ -133,7 +133,7 @@ CSRF_TRUSTED_ORIGINS = [
 # https://docs.djangoproject.com/en/dev/ref/settings/#default-from-email
 DEFAULT_FROM_EMAIL = env(
     "DJANGO_DEFAULT_FROM_EMAIL",
-    default="Ripple Rank <noreply@ripplerank.ai>",
+    default="Ripple Rank <noreply@amplerank.ai>",
 )
 # https://docs.djangoproject.com/en/dev/ref/settings/#server-email
 SERVER_EMAIL = env("DJANGO_SERVER_EMAIL", default=DEFAULT_FROM_EMAIL)
@@ -221,14 +221,14 @@ LOGGING = {
 SPECTACULAR_SETTINGS["TITLE"] = "Ripple Rank API"
 SPECTACULAR_SETTINGS["DESCRIPTION"] = "Documentation of API endpoints for Ripple Rank"
 SPECTACULAR_SETTINGS["SERVERS"] = [
-    {"url": "https://staging-api.ripplerank.ai", "description": "STAGING API"},
+    {"url": "https://staging-api.amplerank.ai", "description": "STAGING API"},
 ]
 # SPA origin: google_login_redirect absolute ?next=, AccountAdapter.is_safe_url, OAuth returns.
-FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", default="https://staging.ripplerank.ai").rstrip("/")
+FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", default="https://staging.amplerank.ai").rstrip("/")
 LOGIN_REDIRECT_URL = f"{FRONTEND_BASE_URL}/onboarding"
 GOOGLE_REDIRECT_URI = env(
     "GOOGLE_REDIRECT_URI",
-    default="https://staging-api.ripplerank.ai/accounts/google/login/callback/",
+    default="https://staging-api.amplerank.ai/accounts/google/login/callback/",
 )
 # Your stuff...
 # ------------------------------------------------------------------------------
