@@ -1,6 +1,6 @@
 # Translations for the Swivl project
 # Copyright (C) 2026 Kevin Bacon
-# Kevin Bacon <support@ripplerank.ai>, 2026.
+# Kevin Bacon <support@amplerank.ai>, 2026.
 #
 #, fuzzy
 msgid ""

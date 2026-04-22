@@ -12,9 +12,9 @@ from .base import env
 # GENERAL
 # ------------------------------------------------------------------------------
 # Debug log path: writable in Docker (/app is owned by django user)
-# Deploy env (Ripple Rank): FRONTEND_BASE_URL=https://app.ripplerank.ai,
-# SESSION_COOKIE_DOMAIN=.ripplerank.ai, CSRF_COOKIE_DOMAIN=.ripplerank.ai,
-# GOOGLE_REDIRECT_URI=https://api.ripplerank.ai/accounts/google/login/callback/
+# Deploy env (Ripple Rank): FRONTEND_BASE_URL=https://app.amplerank.ai,
+# SESSION_COOKIE_DOMAIN=.amplerank.ai, CSRF_COOKIE_DOMAIN=.amplerank.ai,
+# GOOGLE_REDIRECT_URI=https://api.amplerank.ai/accounts/google/login/callback/
 # (Google Cloud Console authorized redirect URI must match that callback exactly.)
 # To keep serving legacy getswivl.ai hosts, add them via DJANGO_ALLOWED_HOSTS (comma-separated).
 DEBUG_LOG_PATH = os.environ.get("DEBUG_LOG_PATH", str(BASE_DIR / "debug-e47e3c.log"))
@@ -24,18 +24,18 @@ SECRET_KEY = env("DJANGO_SECRET_KEY")
 ALLOWED_HOSTS = env.list(
     "DJANGO_ALLOWED_HOSTS",
     default=[
-        "ripplerank.ai",
-        "www.ripplerank.ai",
-        "api.ripplerank.ai",
-        "app.ripplerank.ai",
+        "amplerank.ai",
+        "www.amplerank.ai",
+        "api.amplerank.ai",
+        "app.amplerank.ai",
     ],
 )
 # Always allow canonical Ripple Rank hosts even when DJANGO_ALLOWED_HOSTS is overridden in env.
 _required_hosts = [
-    "ripplerank.ai",
-    "www.ripplerank.ai",
-    "api.ripplerank.ai",
-    "app.ripplerank.ai",
+    "amplerank.ai",
+    "www.amplerank.ai",
+    "api.amplerank.ai",
+    "app.amplerank.ai",
 ]
 for _h in _required_hosts:
     if _h not in ALLOWED_HOSTS:
@@ -70,15 +70,15 @@ SECURE_SSL_REDIRECT = env.bool("DJANGO_SECURE_SSL_REDIRECT", default=True)
 SESSION_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#session-cookie-name
 SESSION_COOKIE_NAME = "__Secure-sessionid"
-# Share session cookie with the web app origin (e.g. app.ripplerank.ai + api.ripplerank.ai).
+# Share session cookie with the web app origin (e.g. app.amplerank.ai + api.amplerank.ai).
 # Use a leading dot so the cookie is sent to all subdomains of that parent.
-SESSION_COOKIE_DOMAIN = env("SESSION_COOKIE_DOMAIN", default=".ripplerank.ai")
+SESSION_COOKIE_DOMAIN = env("SESSION_COOKIE_DOMAIN", default=".amplerank.ai")
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-secure
 CSRF_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-name
 CSRF_COOKIE_NAME = "__Secure-csrftoken"
 # Share CSRF cookie with the web app for cross-subdomain API requests (e.g. app → api).
-CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN", default=".ripplerank.ai")
+CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN", default=".amplerank.ai")
 # https://docs.djangoproject.com/en/dev/topics/security/#ssl-https
 # https://docs.djangoproject.com/en/dev/ref/settings/#secure-hsts-seconds
 # TODO: set this to 60 seconds first and then to 518400 once you prove the former works
@@ -112,17 +112,17 @@ STORAGES = {
 # CORS & CSRF for production frontend and API
 # ------------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = [
-    "https://ripplerank.ai",
-    "https://www.ripplerank.ai",
-    "https://app.ripplerank.ai",
-    "https://api.ripplerank.ai",
+    "https://amplerank.ai",
+    "https://www.amplerank.ai",
+    "https://app.amplerank.ai",
+    "https://api.amplerank.ai",
     "http://localhost:3000",
 ]
 CSRF_TRUSTED_ORIGINS = [
-    "https://api.ripplerank.ai",
-    "https://ripplerank.ai",
-    "https://www.ripplerank.ai",
-    "https://app.ripplerank.ai",
+    "https://api.amplerank.ai",
+    "https://amplerank.ai",
+    "https://www.amplerank.ai",
+    "https://app.amplerank.ai",
     "http://localhost:3000",
 ]
 
@@ -131,7 +131,7 @@ CSRF_TRUSTED_ORIGINS = [
 # https://docs.djangoproject.com/en/dev/ref/settings/#default-from-email
 DEFAULT_FROM_EMAIL = env(
     "DJANGO_DEFAULT_FROM_EMAIL",
-    default="Ripple Rank <noreply@ripplerank.ai>",
+    default="Ripple Rank <noreply@amplerank.ai>",
 )
 # https://docs.djangoproject.com/en/dev/ref/settings/#server-email
 SERVER_EMAIL = env("DJANGO_SERVER_EMAIL", default=DEFAULT_FROM_EMAIL)
@@ -219,14 +219,14 @@ LOGGING = {
 SPECTACULAR_SETTINGS["TITLE"] = "Ripple Rank API"
 SPECTACULAR_SETTINGS["DESCRIPTION"] = "Documentation of API endpoints for Ripple Rank"
 SPECTACULAR_SETTINGS["SERVERS"] = [
-    {"url": "https://api.ripplerank.ai", "description": "Production API"},
+    {"url": "https://api.amplerank.ai", "description": "Production API"},
 ]
 # SPA origin: google_login_redirect absolute ?next=, AccountAdapter.is_safe_url, OAuth returns.
-FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", default="https://app.ripplerank.ai").rstrip("/")
+FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", default="https://app.amplerank.ai").rstrip("/")
 LOGIN_REDIRECT_URL = f"{FRONTEND_BASE_URL}/onboarding"
 GOOGLE_REDIRECT_URI = env(
     "GOOGLE_REDIRECT_URI",
-    default="https://api.ripplerank.ai/accounts/google/login/callback/",
+    default="https://api.amplerank.ai/accounts/google/login/callback/",
 )
 # Your stuff...
 # ------------------------------------------------------------------------------
