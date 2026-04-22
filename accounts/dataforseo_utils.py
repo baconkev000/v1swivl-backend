@@ -2803,7 +2803,7 @@ def seo_snapshot_context_for_profile(
 
 
 def get_cached_seo_snapshot(
-    user,
+    business_profile: Optional[BusinessProfile],
     domain: str,
     period_start,
     cache_ttl: timedelta,
@@ -2812,12 +2812,14 @@ def get_cached_seo_snapshot(
     location_code: int = 0,
 ) -> Optional[Any]:
     """
-    Return a fresh SEOOverviewSnapshot for this user/period if cache is valid
+    Return a fresh SEOOverviewSnapshot for this business profile/period if cache is valid
     (refreshed within cache_ttl and cached_domain matches). Otherwise return None.
     """
+    if not business_profile:
+        return None
     try:
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=user,
+            business_profile=business_profile,
             period_start=period_start,
             cached_location_mode=str(location_mode or "organic"),
             cached_location_code=int(location_code or 0),
@@ -2831,7 +2833,10 @@ def get_cached_seo_snapshot(
             return None
         return snapshot
     except Exception:
-        logger.exception("[SEO score] Error reading keyword cache for user_id=%s", getattr(user, "id", None))
+        logger.exception(
+            "[SEO score] Error reading keyword cache for profile_id=%s",
+            getattr(business_profile, "id", None),
+        )
         return None
 
 
@@ -4100,20 +4105,23 @@ def seo_issue_aux_context_for_snapshot(snapshot: Any) -> Dict[str, Any]:
     if not domain:
         return {"on_page": out_on, "serp": out_serp}
 
-    uid = getattr(snapshot, "user_id", None)
-    if not uid:
-        return {"on_page": out_on, "serp": out_serp}
-
-    profile = None
-    for p in BusinessProfile.objects.filter(user_id=uid).only("id", "website_url", "is_main"):
-        if normalize_domain(getattr(p, "website_url", "") or "") == domain:
-            profile = p
-            break
-    if profile is None:
+    profile = getattr(snapshot, "business_profile", None)
+    if profile is not None:
         profile = (
-            BusinessProfile.objects.filter(user_id=uid, is_main=True).only("id", "website_url").first()
-            or BusinessProfile.objects.filter(user_id=uid).only("id", "website_url").first()
+            BusinessProfile.objects.filter(pk=profile.pk).only("id", "website_url", "is_main").first()
+            or profile
         )
+    uid = getattr(snapshot, "user_id", None)
+    if profile is None and uid:
+        for p in BusinessProfile.objects.filter(user_id=uid).only("id", "website_url", "is_main"):
+            if normalize_domain(getattr(p, "website_url", "") or "") == domain:
+                profile = p
+                break
+        if profile is None:
+            profile = (
+                BusinessProfile.objects.filter(user_id=uid, is_main=True).only("id", "website_url").first()
+                or BusinessProfile.objects.filter(user_id=uid).only("id", "website_url").first()
+            )
     if profile is None:
         return {"on_page": out_on, "serp": out_serp}
 
@@ -4151,7 +4159,7 @@ def seo_issue_aux_context_for_snapshot(snapshot: Any) -> Dict[str, Any]:
 
 
 def save_seo_snapshot(
-    user,
+    business_profile: BusinessProfile,
     period_start,
     domain: str,
     now_utc: datetime,
@@ -4174,13 +4182,23 @@ def save_seo_snapshot(
     Persist keyword list and search metrics to SEOOverviewSnapshot. Logs on failure.
     Returns the snapshot instance on success so callers can enqueue async tasks by snapshot.id; returns None on failure.
     """
+    user = getattr(business_profile, "user", None)
+    if user is None:
+        logger.warning(
+            "[SEO score] save_seo_snapshot: business_profile id=%s has no user",
+            getattr(business_profile, "id", None),
+        )
+        return None
     try:
         snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
-            user=user,
+            business_profile=business_profile,
             period_start=period_start,
             cached_location_mode=str(cached_location_mode or "organic"),
             cached_location_code=int(cached_location_code or 0),
+            defaults={"user": user},
         )
+        if getattr(snapshot, "user_id", None) != getattr(user, "id", None):
+            snapshot.user = user
         snapshot.organic_visitors = int(organic_visitors or 0)
         snapshot.keywords_ranking = int(keywords_ranking or 0)
         snapshot.top3_positions = int(top3_positions or 0)
@@ -4200,12 +4218,15 @@ def save_seo_snapshot(
         snapshot.save()
         return snapshot
     except Exception:
-        logger.exception("[SEO score] Failed to save keyword cache for user_id=%s", getattr(user, "id", None))
+        logger.exception(
+            "[SEO score] Failed to save keyword cache for profile_id=%s",
+            getattr(business_profile, "id", None),
+        )
         return None
 
 
 def generate_or_get_next_steps(
-    user,
+    business_profile: Optional[BusinessProfile],
     period_start,
     result: Dict[str, Any],
     now_utc: datetime,
@@ -4213,9 +4234,13 @@ def generate_or_get_next_steps(
     location_code: int = 0,
 ) -> None:
     """Fill result['seo_next_steps'] from cache (if fresh) or OpenAI; save to snapshot. Mutates result."""
+    if not business_profile:
+        result["seo_next_steps"] = []
+        return
+    user = business_profile.user
     steps_ttl = timedelta(days=7)
     snapshot_for_steps = SEOOverviewSnapshot.objects.filter(
-        user=user,
+        business_profile=business_profile,
         period_start=period_start,
         cached_location_mode=str(location_mode or "organic"),
         cached_location_code=int(location_code or 0),
@@ -4232,18 +4257,25 @@ def generate_or_get_next_steps(
             from .openai_utils import generate_seo_next_steps
 
             snap, _ = SEOOverviewSnapshot.objects.get_or_create(
-                user=user,
+                business_profile=business_profile,
                 period_start=period_start,
                 cached_location_mode=str(location_mode or "organic"),
                 cached_location_code=int(location_code or 0),
+                defaults={"user": user},
             )
+            if getattr(snap, "user_id", None) != getattr(user, "id", None):
+                snap.user = user
+                snap.save(update_fields=["user"])
             steps = generate_seo_next_steps(result, snapshot=snap)
             result["seo_next_steps"] = steps if steps else []
             snap.seo_next_steps = result.get("seo_next_steps") or []
             snap.seo_next_steps_refreshed_at = now_utc
             snap.save(update_fields=["seo_next_steps", "seo_next_steps_refreshed_at"])
         except Exception:
-            logger.exception("[SEO score] Failed to generate seo_next_steps for user_id=%s", getattr(user, "id", None))
+            logger.exception(
+                "[SEO score] Failed to generate seo_next_steps for profile_id=%s",
+                getattr(business_profile, "id", None),
+            )
             result["seo_next_steps"] = []
 
 
@@ -4357,6 +4389,7 @@ def get_or_refresh_seo_score_for_user(
     *,
     site_url: str | None,
     force_refresh: bool = False,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> Dict[str, Any] | None:
     """
     Fetch a cached, professional-grade SEO score + core metrics for the given user,
@@ -4375,6 +4408,9 @@ def get_or_refresh_seo_score_for_user(
     - keywords_ranking
     - top3_positions
     or None if no website is configured / domain cannot be derived.
+
+    When ``business_profile`` is provided, snapshot cache reads/writes are scoped to that
+    profile so multi-company accounts do not clobber each other's monthly rows.
     """
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
@@ -4392,7 +4428,11 @@ def get_or_refresh_seo_score_for_user(
 
     default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
-    profile = _resolve_profile_for_rank_enrichment(user)
+    profile = business_profile or _resolve_profile_for_rank_enrichment(user)
+    if profile is None:
+        _log_seo_skip_and_return_none("No business profile for SEO snapshot scope", user)
+        return None
+    api_user = getattr(profile, "user", None) or user
     snapshot_context = resolve_snapshot_location_context(
         profile=profile,
         default_location_code=default_location_code,
@@ -4405,7 +4445,7 @@ def get_or_refresh_seo_score_for_user(
         ranking_location_code = int(default_location_code)
 
     snapshot = get_cached_seo_snapshot(
-        user,
+        profile,
         domain,
         start_current,
         cache_ttl,
@@ -4576,7 +4616,7 @@ def get_or_refresh_seo_score_for_user(
             domain,
             ranking_location_code,
             language_code,
-            user,
+            api_user,
             limit=ranked_kw_limit,
             business_profile=profile,
         )
@@ -4630,7 +4670,10 @@ def get_or_refresh_seo_score_for_user(
             )
 
         snapshot = save_seo_snapshot(
-            user, start_current, domain, now_utc,
+            profile,
+            start_current,
+            domain,
+            now_utc,
             organic_visitors=int(agg["estimated_traffic"] or 0),
             keywords_ranking=int(agg["keywords_ranking"] or 0),
             top3_positions=int(agg["top3_positions"] or 0),

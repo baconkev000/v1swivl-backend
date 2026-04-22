@@ -2,6 +2,8 @@ import pytest
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
 
+from accounts.aeo.aeo_prompts import AEOPromptType
+from accounts.aeo.aeo_utils import prompt_record
 from accounts.models import BusinessProfile
 
 User = get_user_model()
@@ -35,33 +37,41 @@ def test_pro_plan_allows_custom_append_beyond_50_total(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_advanced_custom_cap_is_50(monkeypatch):
+def test_advanced_plan_blocks_when_at_total_prompt_limit(monkeypatch):
+    """Advanced: 150 total monitored = 150 custom cap; 151st append hits total limit."""
     user = User.objects.create_user(username="advcap@example.com", email="advcap@example.com", password="pw")
-    base = [f"Base Prompt {i}" for i in range(99)]
-    custom = [
-        {
-            "prompt": f"Custom Prompt {i}",
-            "type": "transactional",
-            "weight": 1.0,
-            "dynamic": True,
-            "is_custom": True,
-        }
-        for i in range(50)
+    custom_rows = [
+        prompt_record(
+            f"Custom prompt {i} for advanced cap test",
+            prompt_type=AEOPromptType.TRANSACTIONAL,
+            weight=1.0,
+            dynamic=True,
+            is_custom=True,
+        )
+        for i in range(149)
     ]
     BusinessProfile.objects.create(
         user=user,
         is_main=True,
         plan=BusinessProfile.PLAN_ADVANCED,
-        selected_aeo_prompts=base + custom,
+        selected_aeo_prompts=custom_rows,
     )
     monkeypatch.setattr("accounts.tasks.run_aeo_phase1_execution_task.delay", lambda *a, **k: None)
 
     client = APIClient()
     client.force_authenticate(user=user)
+    res_ok = client.post(
+        "/api/aeo/monitored-prompts/",
+        {"prompt": "One hundred fiftieth unique custom prompt for limit test"},
+        format="json",
+    )
+    assert res_ok.status_code == 202
+
     res = client.post(
         "/api/aeo/monitored-prompts/",
-        {"prompt": "One more custom prompt"},
+        {"prompt": "One hundred fifty first should be rejected"},
         format="json",
     )
     assert res.status_code == 400
-    assert "at most 50 custom prompts" in res.json().get("error", "").lower()
+    err = res.json().get("error", "").lower()
+    assert "at most 150" in err

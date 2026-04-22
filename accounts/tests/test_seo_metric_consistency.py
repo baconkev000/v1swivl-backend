@@ -48,9 +48,12 @@ def test_recompute_metrics_all_rank_null_visibility_zero():
 @pytest.mark.django_db
 def test_refresh_snapshot_updates_metrics_consistently_with_ranks(monkeypatch):
     user = User.objects.create_user(username="seo-u", email="seo-u@example.com", password="pw")
-    BusinessProfile.objects.create(user=user, is_main=True, website_url="https://whitepinedentalcare.com")
+    profile = BusinessProfile.objects.create(
+        user=user, is_main=True, website_url="https://whitepinedentalcare.com"
+    )
     snapshot = SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=date.today().replace(day=1),
         cached_domain="whitepinedentalcare.com",
         top_keywords=[

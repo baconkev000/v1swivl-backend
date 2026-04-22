@@ -12,7 +12,12 @@ User = get_user_model()
 def test_seo_refresh_does_not_call_aeo_helper(monkeypatch):
     user = User.objects.create_user(username="u-dec-seo", email="u-dec-seo@example.com", password="pw")
     profile = BusinessProfile.objects.create(user=user, is_main=True, website_url="https://whitepinedentalcare.com")
-    SEOOverviewSnapshot.objects.create(user=user, period_start=__import__("datetime").date.today().replace(day=1), cached_domain="whitepinedentalcare.com")
+    SEOOverviewSnapshot.objects.create(
+        user=user,
+        business_profile=profile,
+        period_start=__import__("datetime").date.today().replace(day=1),
+        cached_domain="whitepinedentalcare.com",
+    )
 
     monkeypatch.setattr(
         "accounts.serializers.get_aeo_content_readiness_for_site",

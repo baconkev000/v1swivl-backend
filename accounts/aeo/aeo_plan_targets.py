@@ -1,16 +1,18 @@
 """
 Plan-derived monitored AEO prompt targets (production).
 
-Starter: 10 | Pro: 75 | Advanced: 150 — total monitored prompts per plan.
+Total monitored prompts (generated + onboarding seed) per plan:
+  Starter: 25 | Pro: 75 | Advanced: 150
 
-Custom prompts (user-added) caps: Starter 10 | Pro 25 | Advanced 50.
+User-authored custom monitored prompt caps match those totals:
+  Starter: 25 | Pro: 75 | Advanced: 150
+
+Onboarding still delivers ``AEO_ONBOARDING_BASELINE_MONITORED_PROMPT_COUNT`` (10) prompts;
+completion gates use that baseline, not the full plan cap.
 
 PLAN_NONE and starter both use the starter caps.
 
 Testing: AEO_TESTING_MODE + AEO_TEST_PROMPT_COUNT override plan (keeps tests small).
-
-Onboarding completion allows the baseline (10) while Pro/Advanced expansion fills toward cap
-(see accounts.onboarding_completion).
 """
 from __future__ import annotations
 
@@ -20,13 +22,16 @@ from django.conf import settings
 
 from accounts.models import BusinessProfile
 
-AEO_PLAN_CAP_STARTER: int = 10
+AEO_PLAN_CAP_STARTER: int = 25
 AEO_PLAN_CAP_PRO: int = 75
 AEO_PLAN_CAP_ADVANCED: int = 150
 
-AEO_CUSTOM_PROMPT_CAP_STARTER: int = 10
-AEO_CUSTOM_PROMPT_CAP_PRO: int = 25
-AEO_CUSTOM_PROMPT_CAP_ADVANCED: int = 50
+AEO_CUSTOM_PROMPT_CAP_STARTER: int = 25
+AEO_CUSTOM_PROMPT_CAP_PRO: int = 75
+AEO_CUSTOM_PROMPT_CAP_ADVANCED: int = 150
+
+# Delivered in onboarding; used for ``business_profile_fully_onboarded`` / serializer min, not plan cap.
+AEO_ONBOARDING_BASELINE_MONITORED_PROMPT_COUNT: int = 10
 
 
 def aeo_monitored_prompt_cap_for_plan_slug(plan: str) -> int:
@@ -92,12 +97,12 @@ def aeo_effective_custom_prompt_cap_for_profile(profile: BusinessProfile | None)
 def aeo_onboarding_complete_min_prompts(profile: BusinessProfile) -> int:
     """
     Minimum prompts required for business_profile_fully_onboarded.
-    Production: baseline 10 (or cap if plan cap < 10). Testing: full test target.
+    Production: onboarding baseline (10) or plan cap if lower. Testing: full test target.
     """
     cap = aeo_effective_monitored_target_for_profile(profile)
     if aeo_testing_mode():
         return cap
-    return min(AEO_PLAN_CAP_STARTER, cap)
+    return min(AEO_ONBOARDING_BASELINE_MONITORED_PROMPT_COUNT, cap)
 
 
 def aeo_effective_cap_for_validation(instance: BusinessProfile | None, attrs: dict[str, Any]) -> int:
@@ -116,7 +121,7 @@ def aeo_onboarding_min_for_validation(instance: BusinessProfile | None, attrs: d
     if aeo_testing_mode():
         return aeo_effective_cap_for_validation(instance, attrs)
     cap = aeo_effective_cap_for_validation(instance, attrs)
-    return min(AEO_PLAN_CAP_STARTER, cap)
+    return min(AEO_ONBOARDING_BASELINE_MONITORED_PROMPT_COUNT, cap)
 
 
 def aeo_should_run_post_payment_expansion(profile: BusinessProfile) -> bool:

@@ -101,7 +101,7 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
 
     snapshot = (
         SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
@@ -111,10 +111,14 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
     )
 
     if not snapshot:
-        get_or_refresh_seo_score_for_user(data_user, site_url=site_url)
+        get_or_refresh_seo_score_for_user(
+            data_user,
+            site_url=site_url,
+            business_profile=profile,
+        )
         snapshot = (
             SEOOverviewSnapshot.objects.filter(
-                user=data_user,
+                business_profile=profile,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,

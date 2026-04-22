@@ -16,7 +16,6 @@ from django.db import transaction
 from django.utils import timezone as django_tz
 
 from .aeo.aeo_plan_targets import (
-    AEO_PLAN_CAP_STARTER,
     aeo_effective_monitored_target_for_profile,
     aeo_http_call_bounds_for_monitoring,
     aeo_should_run_post_payment_expansion,
@@ -68,6 +67,7 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
             data_user,
             site_url=site,
             force_refresh=True,
+            business_profile=profile,
         )
         logger.info(
             "[stripe->SEO] refresh_done profile_id=%s user_id=%s has_bundle=%s",
@@ -197,7 +197,19 @@ def _seo_snapshot_corpus_newer_than_keyword_suggestions(snapshot: Any) -> bool:
 
 
 def _is_onboarding_sample_size_profile(profile) -> bool:
-    return aeo_effective_monitored_target_for_profile(profile) <= AEO_PLAN_CAP_STARTER
+    """Starter / unpaid: lighter monitored set. Pro+ get full pipeline staging."""
+    from .models import BusinessProfile
+
+    slug = str(getattr(profile, "plan", "") or "").strip().lower()
+    if slug in (
+        BusinessProfile.PLAN_PRO,
+        "professional",
+        BusinessProfile.PLAN_ADVANCED,
+        "enterprise",
+        "scale",
+    ):
+        return False
+    return True
 
 
 def _aeo_recommendation_stage_enabled() -> bool:
@@ -435,10 +447,12 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         outranking_competitor_pct,
     )
 
-    profile_for_metrics = (
-        snapshot.user.business_profiles.filter(is_main=True).first()
-        or snapshot.user.business_profiles.first()
-    )
+    profile_for_metrics = getattr(snapshot, "business_profile", None)
+    if profile_for_metrics is None:
+        profile_for_metrics = (
+            snapshot.user.business_profiles.filter(is_main=True).first()
+            or snapshot.user.business_profiles.first()
+        )
     from .dataforseo_utils import resolve_snapshot_location_context as _resolve_snap_ctx
 
     snapshot_context = _resolve_snap_ctx(
@@ -2060,6 +2074,7 @@ def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
             run.profile.user,
             site_url=website,
             force_refresh=False,
+            business_profile=run.profile,
         )
         run.seo_triggered_at = django_tz.now()
         run.seo_trigger_status = "success"

@@ -16,7 +16,7 @@ def test_seo_overview_uses_snapshot_cache_for_up_to_7_days(monkeypatch):
         email="seo_cache@example.com",
         password="pw",
     )
-    BusinessProfile.objects.create(
+    profile = BusinessProfile.objects.create(
         user=user,
         is_main=True,
         business_name="Cache Co",
@@ -26,6 +26,7 @@ def test_seo_overview_uses_snapshot_cache_for_up_to_7_days(monkeypatch):
     start_current = today.replace(day=1)
     snap = SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=start_current,
         cached_location_mode="organic",
         cached_location_code=0,

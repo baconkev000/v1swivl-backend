@@ -188,6 +188,7 @@ def aeo_pass_count_staff_page(request):
                                     data_user,
                                     site_url=site_url,
                                     force_refresh=True,
+                                    business_profile=profile,
                                 )
                             except Exception:
                                 logger.exception(

@@ -413,7 +413,7 @@ SEO_TOP_KEYWORDS_MAX_PERSISTED = env.int("SEO_TOP_KEYWORDS_MAX_PERSISTED", defau
 AEO_TESTING_MODE = env.bool("AEO_TESTING_MODE", default=False)
 AEO_TEST_PROMPT_COUNT = env.int("AEO_TEST_PROMPT_COUNT", default=10)
 AEO_PROD_PROMPT_COUNT = env.int("AEO_PROD_PROMPT_COUNT", default=50)
-# OpenAI prompt-batch generation: output max_tokens by combined target (starter ≤10, pro ≤50, else advanced).
+# OpenAI prompt-batch generation: output max_tokens by combined target (starter ≤25, pro ≤75, else advanced).
 # Larger values reduce truncated JSON / failed_empty for long prompt lists; TPM/RPM are account-level limits.
 AEO_OPENAI_MAX_TOKENS_STARTER = env.int("AEO_OPENAI_MAX_TOKENS_STARTER", default=1024)
 AEO_OPENAI_MAX_TOKENS_PRO = env.int("AEO_OPENAI_MAX_TOKENS_PRO", default=4096)

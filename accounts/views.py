@@ -1342,6 +1342,11 @@ def seo_overview(request: HttpRequest) -> Response:
     force_refresh = request.GET.get("refresh") == "1"
 
     profile = resolve_main_business_profile_for_user(request.user)
+    if not profile:
+        return Response(
+            {"detail": "No active business profile."},
+            status=400,
+        )
     profile_for_context = profile
     data_user = workspace_data_user(profile) or request.user
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile_for_context)
@@ -1350,7 +1355,7 @@ def seo_overview(request: HttpRequest) -> Response:
     if not force_refresh:
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
-                user=data_user,
+                business_profile=profile,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
@@ -1412,7 +1417,7 @@ def seo_overview(request: HttpRequest) -> Response:
 
         # If the website domain has changed since the last fetch, force a fresh
         # DataForSEO call instead of using cached snapshots.
-        domain_cache_key = f"seo_overview_domain:{data_user.id}"
+        domain_cache_key = f"seo_overview_domain:{profile.pk}"
         previous_domain = cache.get(domain_cache_key)
         if previous_domain and previous_domain != domain:
             force_refresh = True
@@ -1452,7 +1457,7 @@ def seo_overview(request: HttpRequest) -> Response:
             )
             try:
                 snapshot = SEOOverviewSnapshot.objects.get(
-                    user=data_user,
+                    business_profile=profile,
                     period_start=start_current,
                     cached_location_mode=snapshot_mode,
                     cached_location_code=snapshot_location_code,
@@ -1486,7 +1491,7 @@ def seo_overview(request: HttpRequest) -> Response:
         # Compute growth vs previous snapshot visibility (stored in organic_visitors).
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
-                user=data_user,
+                business_profile=profile,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
@@ -1501,11 +1506,15 @@ def seo_overview(request: HttpRequest) -> Response:
             organic_growth_pct = ((current_visibility - prev_vis) / prev_vis) * 100.0
 
         snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
+            defaults={"user": profile.user},
         )
+        if snapshot.user_id != profile.user_id:
+            snapshot.user = profile.user
+            snapshot.save(update_fields=["user"])
         snapshot.organic_visitors = current_visibility
         snapshot.prev_organic_visitors = prev_vis
         snapshot.keywords_ranking = keywords_ranking
@@ -1566,7 +1575,7 @@ def seo_keywords(request: HttpRequest) -> Response:
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
     snapshot = (
         SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -1589,10 +1598,11 @@ def seo_keywords(request: HttpRequest) -> Response:
             data_user,
             site_url=site_url,
             force_refresh=force_refresh,
+            business_profile=profile,
         )
         snapshot = (
             SEOOverviewSnapshot.objects.filter(
-                user=data_user,
+                business_profile=profile,
                 period_start=start_current,
                 cached_domain__iexact=domain,
                 cached_location_mode=snapshot_mode,
@@ -1679,12 +1689,13 @@ def seo_keyword_debug(request: HttpRequest) -> Response:
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
     profile = resolve_main_business_profile_for_user(request.user)
-    data_user = workspace_data_user(profile) or request.user
+    if not profile:
+        return Response({"detail": "No active business profile."}, status=404)
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
 
     snapshot = (
         SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
@@ -1693,7 +1704,7 @@ def seo_keyword_debug(request: HttpRequest) -> Response:
         .first()
     )
     if not snapshot:
-        return Response({"detail": "No SEOOverviewSnapshot for this user this month."}, status=404)
+        return Response({"detail": "No SEOOverviewSnapshot for this profile this month."}, status=404)
 
     top_keywords = getattr(snapshot, "top_keywords", None) or []
     matches: list[dict] = []
@@ -1875,6 +1886,7 @@ def business_profile(request: HttpRequest) -> Response:
             get_or_refresh_seo_score_for_user(
                 workspace_data_user(serializer.instance) or request.user,
                 site_url=new_site_url,
+                business_profile=serializer.instance,
             )
         except Exception:
             # Never block profile saves on DataForSEO errors.
@@ -2311,9 +2323,7 @@ def seo_profile_data(request: HttpRequest) -> Response:
     website = str(getattr(profile, "website_url", "") or "").strip()
     parsed_domain = normalize_domain(website) if website else ""
 
-    snapshots_qs = SEOOverviewSnapshot.objects.filter(
-        user=data_user,
-    )
+    snapshots_qs = SEOOverviewSnapshot.objects.filter(business_profile=profile)
     if parsed_domain:
         snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
 
@@ -2354,6 +2364,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
                 data_user,
                 site_url=website,
                 force_refresh=False,
+                business_profile=profile,
             )
         except Exception:
             logger.exception(
@@ -2362,9 +2373,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
                 website,
             )
 
-    snapshots_qs = SEOOverviewSnapshot.objects.filter(
-        user=data_user,
-    )
+    snapshots_qs = SEOOverviewSnapshot.objects.filter(business_profile=profile)
     if parsed_domain:
         snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
 
@@ -2386,6 +2395,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
                 data_user,
                 site_url=website,
                 force_refresh=False,
+                business_profile=profile,
             ) or {}
             current_score = current_bundle.get("seo_score")
             if current_score is not None:
@@ -4648,6 +4658,25 @@ def business_profile_list(request: HttpRequest) -> Response:
     if profile.is_main:
         existing_qs.exclude(pk=profile.pk).update(is_main=False)
 
+    # Bootstrap SEO snapshot when the profile already has a site URL (add-company flow sets URL on POST).
+    # Without this, PATCH finalize only updates prompts and never hits the "website changed" refresh path.
+    # Mirrors staff ``seo_snapshot_refresh``: force DataForSEO once + enqueue enrichment / next-steps tasks.
+    site_url = str(getattr(profile, "website_url", "") or "").strip()
+    if site_url and normalize_domain(site_url):
+        data_user = workspace_data_user(profile) or request.user
+        try:
+            get_or_refresh_seo_score_for_user(
+                data_user,
+                site_url=site_url,
+                force_refresh=True,
+                business_profile=profile,
+            )
+        except Exception:
+            logger.exception(
+                "[business_profile_list] SEO snapshot bootstrap failed profile_id=%s",
+                getattr(profile, "id", None),
+            )
+
     return Response(serializer.data, status=201)
 
 
@@ -4688,7 +4717,7 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
     try:
         snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -4702,9 +4731,13 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
         # which will create one and enqueue enrichment tasks; then try again.
         from .dataforseo_utils import get_or_refresh_seo_score_for_user
 
-        get_or_refresh_seo_score_for_user(data_user, site_url=site_url)
+        get_or_refresh_seo_score_for_user(
+            data_user,
+            site_url=site_url,
+            business_profile=profile,
+        )
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -4874,6 +4907,7 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
                 get_or_refresh_seo_score_for_user(
                     request.user,
                     site_url=new_site_url,
+                    business_profile=profile,
                 )
             except Exception:
                 pass

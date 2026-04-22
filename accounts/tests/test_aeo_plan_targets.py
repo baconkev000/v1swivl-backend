@@ -5,6 +5,7 @@ from accounts.aeo.aeo_plan_targets import (
     AEO_CUSTOM_PROMPT_CAP_ADVANCED,
     AEO_CUSTOM_PROMPT_CAP_PRO,
     AEO_CUSTOM_PROMPT_CAP_STARTER,
+    AEO_ONBOARDING_BASELINE_MONITORED_PROMPT_COUNT,
     AEO_PLAN_CAP_ADVANCED,
     AEO_PLAN_CAP_PRO,
     AEO_PLAN_CAP_STARTER,
@@ -22,6 +23,7 @@ User = get_user_model()
 
 @pytest.mark.django_db
 def test_cap_by_plan_slug():
+    assert AEO_PLAN_CAP_STARTER == 25
     assert AEO_PLAN_CAP_PRO == 75
     assert AEO_PLAN_CAP_ADVANCED == 150
     assert aeo_monitored_prompt_cap_for_plan_slug("") == AEO_PLAN_CAP_STARTER
@@ -32,8 +34,9 @@ def test_cap_by_plan_slug():
 
 @pytest.mark.django_db
 def test_custom_cap_by_plan_slug():
-    assert AEO_CUSTOM_PROMPT_CAP_PRO == 25
-    assert AEO_CUSTOM_PROMPT_CAP_ADVANCED == 50
+    assert AEO_CUSTOM_PROMPT_CAP_STARTER == 25
+    assert AEO_CUSTOM_PROMPT_CAP_PRO == 75
+    assert AEO_CUSTOM_PROMPT_CAP_ADVANCED == 150
     assert aeo_custom_monitored_prompt_cap_for_plan_slug("") == AEO_CUSTOM_PROMPT_CAP_STARTER
     assert aeo_custom_monitored_prompt_cap_for_plan_slug("starter") == AEO_CUSTOM_PROMPT_CAP_STARTER
     assert aeo_custom_monitored_prompt_cap_for_plan_slug("pro") == AEO_CUSTOM_PROMPT_CAP_PRO
@@ -73,4 +76,4 @@ def test_onboarding_min_production_baseline(settings):
     user = User.objects.create_user(username="t2@example.com", email="t2@example.com", password="x")
     profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="B", plan=BusinessProfile.PLAN_PRO)
     assert aeo_effective_monitored_target_for_profile(profile) == AEO_PLAN_CAP_PRO
-    assert aeo_onboarding_complete_min_prompts(profile) == AEO_PLAN_CAP_STARTER
+    assert aeo_onboarding_complete_min_prompts(profile) == AEO_ONBOARDING_BASELINE_MONITORED_PROMPT_COUNT

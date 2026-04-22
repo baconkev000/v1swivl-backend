@@ -8,7 +8,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.utils import timezone as django_tz
 
-from accounts.models import SEOOverviewSnapshot
+from accounts.models import BusinessProfile, SEOOverviewSnapshot
 from accounts.tasks import (
     _seo_snapshot_corpus_newer_than_next_steps,
     seo_data_dict_from_seo_overview_snapshot,
@@ -20,8 +20,14 @@ User = get_user_model()
 @pytest.mark.django_db
 def test_seo_data_dict_includes_snapshot_metrics_and_context():
     user = User.objects.create_user(username="sd1", email="sd1@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://example.com",
+    )
     snap = SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=date(2026, 2, 1),
         cached_domain="example.com",
         cached_location_mode="organic",
@@ -58,8 +64,14 @@ def test_generate_snapshot_next_steps_uses_rich_seo_data(monkeypatch):
     from accounts.tasks import generate_snapshot_next_steps_task
 
     user = User.objects.create_user(username="sd2", email="sd2@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://co.example",
+    )
     snap = SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=date(2026, 3, 1),
         cached_domain="co.example",
         cached_location_mode="organic",

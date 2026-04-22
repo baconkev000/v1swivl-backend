@@ -5,7 +5,7 @@ from datetime import date
 import pytest
 from django.contrib.auth import get_user_model
 
-from accounts.models import SEOOverviewSnapshot
+from accounts.models import BusinessProfile, SEOOverviewSnapshot
 from accounts.openai_utils import generate_seo_next_steps
 from accounts.seo.seo_issue_engine import build_structured_issues
 from accounts.seo.seo_issue_engine import build_structured_recommendations
@@ -87,8 +87,14 @@ def test_generate_seo_next_steps_persists_structured_issues_on_snapshot(monkeypa
     monkeypatch.setattr("accounts.openai_utils._rewrite_structured_seo_recommendation", fake_rewrite)
 
     user = User.objects.create_user(username="seoiss", email="seoiss@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://example.com",
+    )
     snap = SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=date(2026, 1, 1),
         cached_domain="example.com",
         cached_location_mode="organic",

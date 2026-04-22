@@ -247,14 +247,19 @@ class BusinessProfileMembership(models.Model):
 
 class SEOOverviewSnapshot(models.Model):
     """
-    Stores monthly SEO overview metrics for a user
+    Stores monthly SEO overview metrics per business profile
     (first day of the month + last time data was fetched).
     Keyword list and search metrics are cached and only refreshed once per hour
-    or when the user changes their business profile website URL (domain).
+    or when the profile's website URL (domain) changes.
     """
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="seo_overview_snapshots",
+    )
+    business_profile = models.ForeignKey(
+        "BusinessProfile",
         on_delete=models.CASCADE,
         related_name="seo_overview_snapshots",
     )
@@ -292,12 +297,20 @@ class SEOOverviewSnapshot(models.Model):
     seo_structured_issues_refreshed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        unique_together = ("user", "period_start", "cached_location_mode", "cached_location_code")
+        unique_together = (
+            "business_profile",
+            "period_start",
+            "cached_location_mode",
+            "cached_location_code",
+        )
         verbose_name = "SEO overview snapshot"
         verbose_name_plural = "SEO overview snapshots"
 
     def __str__(self) -> str:
-        return f"SEOOverviewSnapshot(user={self.user!s}, period_start={self.period_start})"
+        return (
+            f"SEOOverviewSnapshot(profile_id={getattr(self, 'business_profile_id', None)}, "
+            f"period_start={self.period_start})"
+        )
 
     def save(self, *args, **kwargs):
         """

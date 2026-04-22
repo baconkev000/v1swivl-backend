@@ -74,7 +74,7 @@ def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> li
     loc_mode, loc_code = seo_snapshot_context_for_profile(profile)
     qs = (
         SEOOverviewSnapshot.objects.filter(
-            user=profile.user,
+            business_profile=profile,
             cached_domain__iexact=domain,
             cached_location_mode=str(loc_mode or "organic"),
             cached_location_code=int(loc_code or 0),
@@ -89,13 +89,13 @@ def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> li
     return []
 
 
-def _skip_heavy_latest_seo_snapshot_actions_payload(user) -> dict:
+def _skip_heavy_latest_seo_snapshot_actions_payload(profile: BusinessProfile) -> dict:
     """
     When ``skip_heavy_profile_metrics`` avoids calling DataForSEO, still expose stored
-    SEO overview actions from the latest ``SEOOverviewSnapshot`` for this user (same
-    ordering as ``get_top_keywords`` skip-heavy branch: ``-last_fetched_at``, ``-id``).
+    SEO overview actions from the latest ``SEOOverviewSnapshot`` for this business profile
+    (same ordering as ``get_top_keywords`` skip-heavy branch: ``-last_fetched_at``, ``-id``).
     """
-    if not user:
+    if not profile:
         return {
             "seo_next_steps": [],
             "keyword_action_suggestions": [],
@@ -103,7 +103,7 @@ def _skip_heavy_latest_seo_snapshot_actions_payload(user) -> dict:
             "enrichment_status": "complete",
         }
     snap = (
-        SEOOverviewSnapshot.objects.filter(user=user)
+        SEOOverviewSnapshot.objects.filter(business_profile=profile)
         .order_by("-last_fetched_at", "-id")
         .only(
             "seo_next_steps",
@@ -572,7 +572,11 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 getattr(user, "id", None),
                 site_url,
             )
-            data = get_or_refresh_seo_score_for_user(user, site_url=site_url or None)
+            data = get_or_refresh_seo_score_for_user(
+                user,
+                site_url=site_url or None,
+                business_profile=obj,
+            )
             if not data:
                 logger.info(
                     "[BusinessProfileSerializer] get_seo_score: no data returned for user_id=%s",
@@ -651,7 +655,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if context.get("skip_heavy_profile_metrics"):
             # Cached snapshot only — lets onboarding hydrate keyword topics without DataForSEO.
             snap = (
-                SEOOverviewSnapshot.objects.filter(user=obj.user)
+                SEOOverviewSnapshot.objects.filter(business_profile=obj)
                 .order_by("-last_fetched_at", "-id")
                 .only("top_keywords")
                 .first()
@@ -676,8 +680,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         pid = getattr(obj, "id", None)
         if isinstance(cache_map, dict) and pid in cache_map:
             return cache_map[pid]
-        user = getattr(obj, "user", None)
-        payload = _skip_heavy_latest_seo_snapshot_actions_payload(user)
+        payload = _skip_heavy_latest_seo_snapshot_actions_payload(obj)
         if not isinstance(cache_map, dict):
             cache_map = {}
         cache_map[pid] = payload

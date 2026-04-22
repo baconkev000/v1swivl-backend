@@ -26,6 +26,7 @@ def test_get_top_keywords_falls_back_to_stored_snapshot_when_bundle_empty(monkey
     stored = [{"keyword": "widgets", "search_volume": 900, "rank": 4}]
     SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=timezone.now().date().replace(day=1),
         cached_domain="acme.example.com",
         cached_location_mode="organic",
@@ -35,7 +36,7 @@ def test_get_top_keywords_falls_back_to_stored_snapshot_when_bundle_empty(monkey
 
     monkeypatch.setattr(
         "accounts.serializers.get_or_refresh_seo_score_for_user",
-        lambda user, site_url=None: {"seo_score": 0, "top_keywords": []},
+        lambda *args, site_url=None, **kwargs: {"seo_score": 0, "top_keywords": []},
     )
 
     ser = BusinessProfileSerializer(instance=profile)
@@ -54,6 +55,7 @@ def test_get_top_keywords_no_cross_domain_leak(monkeypatch):
     )
     SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=timezone.now().date().replace(day=1),
         cached_domain="other-site.com",
         cached_location_mode="organic",
@@ -63,7 +65,7 @@ def test_get_top_keywords_no_cross_domain_leak(monkeypatch):
 
     monkeypatch.setattr(
         "accounts.serializers.get_or_refresh_seo_score_for_user",
-        lambda user, site_url=None: {"seo_score": 0, "top_keywords": []},
+        lambda *args, site_url=None, **kwargs: {"seo_score": 0, "top_keywords": []},
     )
 
     ser = BusinessProfileSerializer(instance=profile)
@@ -75,7 +77,7 @@ def test_seo_profile_api_returns_snapshot_top_keywords_when_bundle_empty(monkeyp
     user = User.objects.create_user(
         username="kw-api-u", email="kw-api@example.com", password="pw"
     )
-    BusinessProfile.objects.create(
+    profile = BusinessProfile.objects.create(
         user=user,
         is_main=True,
         website_url="https://shop.example.net",
@@ -83,6 +85,7 @@ def test_seo_profile_api_returns_snapshot_top_keywords_when_bundle_empty(monkeyp
     stored = [{"keyword": "buy shoes", "search_volume": 1200, "rank": 8}]
     SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=date(2026, 4, 1),
         cached_domain="shop.example.net",
         cached_location_mode="organic",
@@ -92,7 +95,7 @@ def test_seo_profile_api_returns_snapshot_top_keywords_when_bundle_empty(monkeyp
 
     monkeypatch.setattr(
         "accounts.serializers.get_or_refresh_seo_score_for_user",
-        lambda user, site_url=None: {"seo_score": 0, "top_keywords": []},
+        lambda *args, site_url=None, **kwargs: {"seo_score": 0, "top_keywords": []},
     )
 
     client = APIClient()
@@ -116,6 +119,7 @@ def test_skip_heavy_top_keywords_branch_unchanged(monkeypatch):
     )
     SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=timezone.now().date().replace(day=1),
         cached_domain="a.com",
         top_keywords=[{"keyword": "from_snap", "search_volume": 1, "rank": 2}],
@@ -145,6 +149,7 @@ def test_skip_heavy_exposes_seo_next_steps_and_keyword_suggestions_from_latest_s
     now = timezone.now()
     SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=date(2026, 4, 1),
         cached_domain="seo-act.example.com",
         cached_location_mode="organic",
@@ -178,6 +183,7 @@ def test_skip_heavy_enrichment_status_pending_until_all_async_fields_refreshed()
     now = timezone.now()
     SEOOverviewSnapshot.objects.create(
         user=user,
+        business_profile=profile,
         period_start=date(2026, 4, 1),
         cached_domain="pend.example.com",
         cached_location_mode="organic",
@@ -194,3 +200,52 @@ def test_skip_heavy_enrichment_status_pending_until_all_async_fields_refreshed()
         context={"skip_heavy_profile_metrics": True},
     )
     assert ser.data.get("enrichment_status") == "pending"
+
+
+@pytest.mark.django_db
+def test_skip_heavy_uses_snapshot_for_correct_profile_not_sibling_company(monkeypatch):
+    """Each company profile reads its own SEOOverviewSnapshot row."""
+    user = User.objects.create_user(
+        username="kw-multi", email="kw-multi@example.com", password="pw"
+    )
+    main = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        website_url="https://alpha.example.com",
+    )
+    secondary = BusinessProfile.objects.create(
+        user=user,
+        is_main=False,
+        website_url="https://beta.example.com",
+    )
+    SEOOverviewSnapshot.objects.create(
+        user=user,
+        business_profile=main,
+        period_start=date(2026, 4, 1),
+        cached_domain="alpha.example.com",
+        cached_location_mode="organic",
+        cached_location_code=0,
+        top_keywords=[{"keyword": "alpha-kw", "search_volume": 10, "rank": 1}],
+        last_fetched_at=timezone.now(),
+    )
+    SEOOverviewSnapshot.objects.create(
+        user=user,
+        business_profile=secondary,
+        period_start=date(2026, 4, 1),
+        cached_domain="beta.example.com",
+        cached_location_mode="organic",
+        cached_location_code=0,
+        top_keywords=[{"keyword": "beta-kw", "search_volume": 20, "rank": 2}],
+        last_fetched_at=timezone.now(),
+    )
+
+    ser_main = BusinessProfileSerializer(
+        instance=main,
+        context={"skip_heavy_profile_metrics": True},
+    )
+    ser_sec = BusinessProfileSerializer(
+        instance=secondary,
+        context={"skip_heavy_profile_metrics": True},
+    )
+    assert (ser_main.data.get("top_keywords") or [{}])[0].get("keyword") == "alpha-kw"
+    assert (ser_sec.data.get("top_keywords") or [{}])[0].get("keyword") == "beta-kw"

@@ -548,6 +548,7 @@ class SEOOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "user",
+        "business_profile",
         "period_start",
         "organic_visitors",
         "keywords_ranking",
@@ -556,7 +557,12 @@ class SEOOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "seo_structured_issues_refreshed_at",
         "last_fetched_at",
     )
-    search_fields = ("user__email", "user__username")
+    search_fields = (
+        "user__email",
+        "user__username",
+        "business_profile__business_name",
+    )
+    raw_id_fields = ("user", "business_profile")
     readonly_fields = (
         "last_fetched_at",
         "seo_structured_issues_refreshed_at",
@@ -568,6 +574,7 @@ class SEOOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
             {
                 "fields": (
                     "user",
+                    "business_profile",
                     "period_start",
                     "last_fetched_at",
                     "refreshed_at",

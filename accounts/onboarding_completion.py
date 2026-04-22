@@ -86,7 +86,7 @@ def profile_has_ranked_keywords(profile: BusinessProfile) -> bool:
             if isinstance(rk, list) and len(rk) > 0:
                 return True
     snap = (
-        SEOOverviewSnapshot.objects.filter(user=profile.user)
+        SEOOverviewSnapshot.objects.filter(business_profile=profile)
         .order_by("-last_fetched_at", "-id")
         .only("top_keywords")
         .first()
@@ -134,8 +134,9 @@ def business_profile_fully_onboarded(profile: BusinessProfile | None) -> bool:
     Full onboarding: active subscription, profile fields, keywords, and AEO pipeline artifacts.
 
     Monitored prompts: must be at least the onboarding baseline (10 in production) and at most
-    the plan cap. Pro/Advanced may still be expanding toward 50/100 in the background; users
-    with 10 prompts and an active paid plan still qualify once the rest of the gates pass.
+    the plan cap. Pro/Advanced may still be expanding toward their plan totals in the background;
+    users with 10 prompts from onboarding and an active paid plan still qualify once the rest of
+    the gates pass.
     """
     if profile is None:
         return False
