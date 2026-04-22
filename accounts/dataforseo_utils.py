@@ -4455,6 +4455,7 @@ def get_or_refresh_seo_score_for_user(
     site_url: str | None,
     force_refresh: bool = False,
     business_profile: Optional[BusinessProfile] = None,
+    skip_keyword_enrichment_enqueue: bool = False,
 ) -> Dict[str, Any] | None:
     """
     Fetch a cached, professional-grade SEO score + core metrics for the given user,
@@ -4476,6 +4477,12 @@ def get_or_refresh_seo_score_for_user(
 
     When ``business_profile`` is provided, snapshot cache reads/writes are scoped to that
     profile so multi-company accounts do not clobber each other's monthly rows.
+
+    When ``skip_keyword_enrichment_enqueue`` is True, the live ranked-keyword save path does not
+    enqueue ``enrich_snapshot_keywords_task`` / next-steps / keyword-action Celery jobs. Callers
+    that immediately run ``sync_enrich_current_period_seo_snapshot_for_profile`` (or enqueue
+    ``sync_enrich_seo_snapshot_for_profile_task``) should set this to avoid duplicate work and API
+    calls.
     """
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
@@ -4762,7 +4769,7 @@ def get_or_refresh_seo_score_for_user(
             ),
         )
 
-        if snapshot:
+        if snapshot and not skip_keyword_enrichment_enqueue:
             try:
                 from .tasks import (
                     enrich_snapshot_keywords_task,

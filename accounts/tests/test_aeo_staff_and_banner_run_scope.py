@@ -330,15 +330,16 @@ def test_aeo_scheduled_tick_skips_when_disabled(monkeypatch, settings):
 
 
 @pytest.mark.django_db
-def test_staff_seo_snapshot_refresh_post_calls_get_or_refresh(monkeypatch):
-    calls: list[tuple[int | None, str | None, bool]] = []
+def test_staff_seo_snapshot_refresh_post_calls_run_full(monkeypatch):
+    full_calls: list[int] = []
 
-    def capture(user, *, site_url=None, force_refresh=False):
-        calls.append((getattr(user, "id", None), site_url, bool(force_refresh)))
-        return {"seo_score": 50}
+    def fake_run_full(profile, **kwargs):
+        full_calls.append(int(profile.pk))
+        return {"ok": True, "persisted": True}
 
     monkeypatch.setattr(
-        "accounts.dataforseo_utils.get_or_refresh_seo_score_for_user", capture
+        "accounts.seo_snapshot_refresh.run_full_seo_snapshot_for_profile",
+        fake_run_full,
     )
 
     client = Client()
@@ -367,10 +368,7 @@ def test_staff_seo_snapshot_refresh_post_calls_get_or_refresh(monkeypatch):
         },
     )
     assert resp.status_code == 302
-    assert len(calls) == 1
-    assert calls[0][0] == owner.id
-    assert calls[0][1] == "https://seo-co.example.com"
-    assert calls[0][2] is True
+    assert full_calls == [profile.id]
 
 
 @pytest.mark.django_db

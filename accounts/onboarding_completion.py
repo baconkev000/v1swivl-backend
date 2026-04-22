@@ -85,6 +85,9 @@ def profile_has_ranked_keywords(profile: BusinessProfile) -> bool:
             rk = crawl.ranked_keywords
             if isinstance(rk, list) and len(rk) > 0:
                 return True
+            rt = crawl.review_topics
+            if isinstance(rt, list) and len(rt) > 0:
+                return True
     snap = (
         SEOOverviewSnapshot.objects.filter(business_profile=profile)
         .order_by("-last_fetched_at", "-id")

@@ -47,22 +47,13 @@ def test_post_second_business_profile_allowed_with_advanced_plan(monkeypatch):
         plan=BusinessProfile.PLAN_ADVANCED,
         stripe_subscription_status="active",
     )
-    seo_calls: list[dict] = []
-    sync_enrich_delay_pids: list[int] = []
+    full_calls: list[int] = []
 
-    def _capture_seo_refresh(*args, **kwargs):
-        seo_calls.append(dict(kwargs))
-        return {"seo_score": 0}
+    def _capture_full(profile, **kwargs):
+        full_calls.append(int(profile.pk))
+        return {"ok": True, "persisted": True}
 
-    def _immediate_on_commit(fn):
-        fn()
-
-    monkeypatch.setattr("accounts.views.get_or_refresh_seo_score_for_user", _capture_seo_refresh)
-    monkeypatch.setattr("accounts.views.transaction.on_commit", _immediate_on_commit)
-    monkeypatch.setattr(
-        "accounts.tasks.sync_enrich_seo_snapshot_for_profile_task.delay",
-        lambda pid, *a, **k: sync_enrich_delay_pids.append(int(pid)),
-    )
+    monkeypatch.setattr("accounts.views.run_full_seo_snapshot_for_profile", _capture_full)
     client = APIClient()
     client.force_authenticate(user=user)
     resp = client.post(
@@ -76,9 +67,4 @@ def test_post_second_business_profile_allowed_with_advanced_plan(monkeypatch):
     )
     assert resp.status_code == 201
     assert BusinessProfile.objects.filter(user=user).count() == 2
-    assert len(seo_calls) == 1
-    assert seo_calls[0].get("force_refresh") is True
-    assert seo_calls[0].get("site_url") == "https://second.example"
-    bp = seo_calls[0].get("business_profile")
-    assert bp is not None and int(bp.pk) == int(resp.data["id"])
-    assert sync_enrich_delay_pids == [int(resp.data["id"])]
+    assert full_calls == [int(resp.data["id"])]

@@ -115,6 +115,7 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
             data_user,
             site_url=site_url,
             business_profile=profile,
+            skip_keyword_enrichment_enqueue=True,
         )
         snapshot = (
             SEOOverviewSnapshot.objects.filter(
@@ -363,3 +364,78 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
         "detail": None,
         "rank_coverage_percent": round(coverage * 100.0, 2) if total > 0 else None,
     }
+
+
+def run_full_seo_snapshot_for_profile(
+    profile: BusinessProfile,
+    *,
+    data_user_fallback: Optional[Any] = None,
+    force_refresh: bool = True,
+    abort_on_low_coverage: bool = True,
+) -> dict[str, Any]:
+    """
+    One-shot SEO pipeline for a profile: ranked Labs snapshot (``get_or_refresh_seo_score_for_user``)
+    then ``sync_enrich_current_period_seo_snapshot_for_profile`` (gap + LLM seeds + Labs rank fill,
+    metrics persist, next-steps + keyword-action tasks enqueued).
+
+    Used after onboarding billing bypass, new company profile creation, staff snapshot refresh, and
+    post-payment Celery follow-up so ``top_keywords`` includes ranked and enrichment rows without
+    relying on a separate async ``enrich_snapshot_keywords_task`` from the ranked-only path.
+    """
+    from .business_profile_access import workspace_data_user
+    from .dataforseo_utils import get_or_refresh_seo_score_for_user, normalize_domain
+
+    site_url = str(getattr(profile, "website_url", "") or "").strip()
+    if not site_url:
+        return {
+            "ok": True,
+            "persisted": False,
+            "external_api_called": False,
+            "aborted_low_coverage": False,
+            "snapshot_id": None,
+            "detail": "no_website_url",
+            "rank_coverage_percent": None,
+        }
+    if not (normalize_domain(site_url) or "").strip():
+        return {
+            "ok": False,
+            "persisted": False,
+            "external_api_called": False,
+            "aborted_low_coverage": False,
+            "snapshot_id": None,
+            "detail": "domain_normalize_failed",
+            "rank_coverage_percent": None,
+        }
+    data_user = data_user_fallback or workspace_data_user(profile) or getattr(profile, "user", None)
+    if data_user is None:
+        return {
+            "ok": False,
+            "persisted": False,
+            "external_api_called": False,
+            "aborted_low_coverage": False,
+            "snapshot_id": None,
+            "detail": "no_data_user",
+            "rank_coverage_percent": None,
+        }
+    bundle = get_or_refresh_seo_score_for_user(
+        data_user,
+        site_url=site_url,
+        force_refresh=force_refresh,
+        business_profile=profile,
+        skip_keyword_enrichment_enqueue=True,
+    )
+    if bundle is None:
+        return {
+            "ok": False,
+            "persisted": False,
+            "external_api_called": False,
+            "aborted_low_coverage": False,
+            "snapshot_id": None,
+            "detail": "ranked_refresh_unavailable",
+            "rank_coverage_percent": None,
+        }
+    return sync_enrich_current_period_seo_snapshot_for_profile(
+        profile,
+        data_user_fallback=data_user,
+        abort_on_low_coverage=abort_on_low_coverage,
+    )

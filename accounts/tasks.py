@@ -41,13 +41,13 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
     Stripe webhook follow-up: run a full SEO overview refresh for the workspace.
 
     Invoked from ``transaction.on_commit`` in ``apply_subscription_payload_to_profile`` only (never
-    inline in the webhook). Uses ``force_refresh=True`` so post-payment users get a fresh snapshot
-    and the existing pipeline can enqueue enrichment / ``generate_snapshot_next_steps_task`` /
-    ``generate_keyword_action_suggestions_task``.
+    inline in the webhook). Uses ``force_refresh=True`` for a fresh ranked snapshot, skips duplicate
+    Celery enqueue from that call, then runs ``sync_enrich_current_period_seo_snapshot_for_profile``
+    (gap + LLM + metrics) which enqueues next-steps and keyword-action tasks.
     """
     from .business_profile_access import workspace_data_user
-    from .dataforseo_utils import get_or_refresh_seo_score_for_user
     from .models import BusinessProfile
+    from .seo_snapshot_refresh import run_full_seo_snapshot_for_profile
 
     pid = int(profile_id)
     profile = BusinessProfile.objects.filter(pk=pid).select_related("user").first()
@@ -63,23 +63,16 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
         logger.warning("[stripe->SEO] skip_no_data_user profile_id=%s", pid)
         return
     try:
-        bundle = get_or_refresh_seo_score_for_user(
-            data_user,
-            site_url=site,
-            force_refresh=True,
-            business_profile=profile,
+        sync_result = run_full_seo_snapshot_for_profile(
+            profile,
+            data_user_fallback=data_user,
+            abort_on_low_coverage=True,
         )
         logger.info(
-            "[stripe->SEO] refresh_done profile_id=%s user_id=%s has_bundle=%s",
+            "[stripe->SEO] refresh_done profile_id=%s user_id=%s persisted=%s",
             pid,
             getattr(data_user, "id", None),
-            bundle is not None,
-        )
-        from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
-
-        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
-            profile,
-            abort_on_low_coverage=True,
+            bool(sync_result.get("persisted")),
         )
         if sync_result.get("aborted_low_coverage"):
             logger.warning(
@@ -108,14 +101,14 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=30, ignore_result=True)
 def sync_enrich_seo_snapshot_for_profile_task(self, profile_id: int) -> None:
     """
-    Synchronously enrich the current-period SEO snapshot (gap + LLM + Labs ranks, metrics persist).
+    Full SEO snapshot refresh (ranked Labs + gap/LLM sync enrich) for one profile.
 
-    Call after ``get_or_refresh_seo_score_for_user`` has created/updated the ranked-keyword row
-    (e.g. new business profile POST). Mirrors the second half of ``post_payment_seo_snapshot_task``.
+    Prefer ``run_full_seo_snapshot_for_profile`` inline at HTTP boundaries; this task remains for
+    any deferred ``on_commit`` callers that still enqueue by profile id.
     """
     from .business_profile_access import workspace_data_user
     from .models import BusinessProfile
-    from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+    from .seo_snapshot_refresh import run_full_seo_snapshot_for_profile
 
     pid = int(profile_id)
     profile = BusinessProfile.objects.filter(pk=pid).select_related("user").first()
@@ -127,7 +120,7 @@ def sync_enrich_seo_snapshot_for_profile_task(self, profile_id: int) -> None:
         logger.warning("[SEO sync enrich task] skip_no_data_user profile_id=%s", pid)
         return
     try:
-        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
+        sync_result = run_full_seo_snapshot_for_profile(
             profile,
             data_user_fallback=data_user,
             abort_on_low_coverage=True,
@@ -2146,7 +2139,24 @@ def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
             site_url=website,
             force_refresh=False,
             business_profile=run.profile,
+            skip_keyword_enrichment_enqueue=True,
         )
+        from .business_profile_access import workspace_data_user
+        from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+
+        ws_user = workspace_data_user(run.profile) or run.profile.user
+        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
+            run.profile,
+            data_user_fallback=ws_user,
+            abort_on_low_coverage=True,
+        )
+        if sync_result.get("aborted_low_coverage"):
+            logger.warning(
+                "[AEO->SEO] sync_enrich aborted_low_coverage aeo_run_id=%s profile_id=%s detail=%s",
+                run.id,
+                run.profile_id,
+                sync_result.get("detail"),
+            )
         run.seo_triggered_at = django_tz.now()
         run.seo_trigger_status = "success"
         run.save(update_fields=["seo_triggered_at", "seo_trigger_status", "updated_at"])
@@ -2665,6 +2675,14 @@ def onboarding_onpage_crawl_task(self, crawl_id: int) -> None:
     from .onboarding_onpage import execute_onboarding_onpage_crawl
 
     execute_onboarding_onpage_crawl(int(crawl_id))
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def onboarding_ranked_keywords_fetch_task(self, crawl_id: int) -> None:
+    """DataForSEO Labs ranked_keywords + clustering after onboarding crawl pages + review topics."""
+    from .onboarding_onpage import execute_onboarding_ranked_keywords_fetch
+
+    execute_onboarding_ranked_keywords_fetch(int(crawl_id))
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)

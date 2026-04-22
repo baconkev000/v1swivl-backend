@@ -148,6 +148,26 @@ def test_checkout_session_success_has_updated_fields():
 
 
 @pytest.mark.django_db
+def test_checkout_session_client_reference_promotes_profile_to_main():
+    user = User.objects.create_user(username="promo@example.com", email="promo@example.com", password="x")
+    main_profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Main")
+    new_profile = BusinessProfile.objects.create(user=user, is_main=False, business_name="NewCo")
+    payload = {
+        "object": {
+            "client_reference_id": str(new_profile.id),
+            "customer": "cus_promo",
+            "subscription": "sub_promo",
+        }
+    }
+    result = sync_from_checkout_session(payload, event_id="evt_promo")
+    assert result.handled is True
+    new_profile.refresh_from_db()
+    main_profile.refresh_from_db()
+    assert new_profile.is_main is True
+    assert main_profile.is_main is False
+
+
+@pytest.mark.django_db
 def test_checkout_session_sets_plan_from_expanded_subscription_price(settings):
     settings.STRIPE_PRICE_ID_STARTER_MONTHLY = "price_from_sub"
     user = User.objects.create_user(username="expsub@example.com", email="expsub@example.com", password="x")
@@ -674,27 +694,18 @@ def test_post_payment_seo_webhook_enqueue_deduped_within_ttl(
 
 
 @pytest.mark.django_db
-def test_post_payment_seo_snapshot_task_calls_get_or_refresh_with_force(monkeypatch):
+def test_post_payment_seo_snapshot_task_calls_run_full_with_abort_on_low_coverage(monkeypatch):
     from accounts.tasks import post_payment_seo_snapshot_task
 
-    calls: list[tuple] = []
-    sync_calls: list[tuple] = []
+    full_calls: list[tuple[int, dict]] = []
 
-    def _fake_get(user, *, site_url=None, force_refresh=False):
-        calls.append((getattr(user, "id", None), site_url, force_refresh))
-        return {"seo_score": 50}
-
-    def _fake_sync(*args, **kwargs):
-        sync_calls.append((args, kwargs))
+    def _fake_run_full(profile, **kwargs):
+        full_calls.append((int(profile.id), dict(kwargs)))
         return {"ok": True, "persisted": False, "external_api_called": False}
 
     monkeypatch.setattr(
-        "accounts.dataforseo_utils.get_or_refresh_seo_score_for_user",
-        _fake_get,
-    )
-    monkeypatch.setattr(
-        "accounts.seo_snapshot_refresh.sync_enrich_current_period_seo_snapshot_for_profile",
-        _fake_sync,
+        "accounts.seo_snapshot_refresh.run_full_seo_snapshot_for_profile",
+        _fake_run_full,
     )
     user = User.objects.create_user(username="seotask@example.com", email="seotask@example.com", password="x")
     profile = BusinessProfile.objects.create(
@@ -703,13 +714,9 @@ def test_post_payment_seo_snapshot_task_calls_get_or_refresh_with_force(monkeypa
         website_url="https://seotask.example.com",
     )
     post_payment_seo_snapshot_task.run(profile.id)
-    assert len(calls) == 1
-    assert calls[0][0] == user.id
-    assert calls[0][1] == "https://seotask.example.com"
-    assert calls[0][2] is True
-    assert len(sync_calls) == 1
-    assert sync_calls[0][0][0].id == profile.id
-    assert sync_calls[0][1].get("abort_on_low_coverage") is True
+    assert len(full_calls) == 1
+    assert full_calls[0][0] == profile.id
+    assert full_calls[0][1].get("abort_on_low_coverage") is True
 
 
 def test_infer_sync_failure_reason_invoice_does_not_use_invoice_id_as_subscription():

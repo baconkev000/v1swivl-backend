@@ -61,7 +61,10 @@ from .dataforseo_utils import (
     seo_snapshot_context_for_profile,
     sort_top_keywords_for_display,
 )
-from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+from .seo_snapshot_refresh import (
+    run_full_seo_snapshot_for_profile,
+    sync_enrich_current_period_seo_snapshot_for_profile,
+)
 from .constants import SEO_SNAPSHOT_TTL
 from .onboarding_completion import (
     user_has_completed_full_onboarding,
@@ -763,6 +766,11 @@ def _clone_onboarding_crawl_for_profile(
         topic_clusters=source.topic_clusters or {},
         crawl_topic_seeds=source.crawl_topic_seeds or [],
         ranked_keywords_error=source.ranked_keywords_error or "",
+        ranked_keywords_fetch_status=(
+            OnboardingOnPageCrawl.RANKED_FETCH_COMPLETE
+            if (source.ranked_keywords or [])
+            else getattr(source, "ranked_keywords_fetch_status", "") or ""
+        ),
         review_topics=source.review_topics or [],
         review_topics_error=source.review_topics_error or "",
         context=context,
@@ -1010,6 +1018,10 @@ def onboarding_crawl_latest(request: HttpRequest) -> Response:
             "review_topics_error": crawl.review_topics_error or "",
             "exit_reason": crawl.exit_reason,
             "ranked_keywords_error": crawl.ranked_keywords_error or "",
+            "ranked_keywords_pending": getattr(
+                crawl, "ranked_keywords_fetch_status", ""
+            )
+            == OnboardingOnPageCrawl.RANKED_FETCH_PENDING,
             "prompt_plan_status": crawl.prompt_plan_status,
             "prompt_plan_prompt_count": int(crawl.prompt_plan_prompt_count or 0),
             "prompt_plan_error": crawl.prompt_plan_error or "",
@@ -1883,10 +1895,12 @@ def business_profile(request: HttpRequest) -> Response:
     new_site_url = serializer.instance.website_url
     if new_site_url and new_site_url != old_site_url:
         try:
-            get_or_refresh_seo_score_for_user(
-                workspace_data_user(serializer.instance) or request.user,
-                site_url=new_site_url,
-                business_profile=serializer.instance,
+            inst = serializer.instance
+            data_user = workspace_data_user(inst) or request.user
+            run_full_seo_snapshot_for_profile(
+                inst,
+                data_user_fallback=data_user,
+                abort_on_low_coverage=True,
             )
         except Exception:
             # Never block profile saves on DataForSEO errors.
@@ -2245,9 +2259,23 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
     if not (settings.DEBUG or settings.ALLOW_ONBOARDING_BILLING_BYPASS):
         return Response(status=404)
 
-    profile = resolve_main_business_profile_for_user(request.user)
-    if profile is None:
-        return Response({"error": "No active business profile."}, status=404)
+    raw_profile_id = None
+    if isinstance(request.data, dict):
+        raw_profile_id = request.data.get("profile_id")
+    target_profile = None
+    if raw_profile_id is not None and str(raw_profile_id).strip() != "":
+        try:
+            pk = int(raw_profile_id)
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid profile_id."}, status=400)
+        target_profile = BusinessProfile.objects.filter(pk=pk, user=request.user).first()
+        if target_profile is None:
+            return Response({"error": "Business profile not found."}, status=404)
+        profile = target_profile
+    else:
+        profile = resolve_main_business_profile_for_user(request.user)
+        if profile is None:
+            return Response({"error": "No active business profile."}, status=404)
     access = viewer_team_access(request.user, profile)
     if not access["viewer_can_access_billing"]:
         return Response({"error": "Billing is not available for this account."}, status=403)
@@ -2278,12 +2306,18 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
     )
     site = str(getattr(profile, "website_url", "") or "").strip()
     if site:
-        from .tasks import post_payment_seo_snapshot_task
-
-        def _enqueue_post_payment_seo() -> None:
-            post_payment_seo_snapshot_task.delay(profile.id)
-
-        transaction.on_commit(_enqueue_post_payment_seo)
+        data_user = workspace_data_user(profile) or request.user
+        try:
+            run_full_seo_snapshot_for_profile(
+                profile,
+                data_user_fallback=data_user,
+                abort_on_low_coverage=True,
+            )
+        except Exception:
+            logger.exception(
+                "[onboarding_local_dev_billing_complete] full SEO snapshot failed profile_id=%s",
+                profile.id,
+            )
     return Response({"ok": True, "plan": plan})
 
 
@@ -3543,9 +3577,19 @@ def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
     """
     from .aeo.aeo_scoring_utils import aeo_onboarding_competitors_visibility
 
-    profile = resolve_main_business_profile_for_user(request.user)
-    if not profile:
-        return Response({"has_data": False, "total_prompts": 0, "rows": []})
+    pid_raw = (request.GET.get("profile_id") or "").strip()
+    if pid_raw:
+        try:
+            pk = int(pid_raw)
+        except ValueError:
+            return Response({"has_data": False, "total_prompts": 0, "rows": []}, status=400)
+        profile = BusinessProfile.objects.filter(pk=pk, user=request.user).first()
+        if profile is None:
+            return Response({"has_data": False, "total_prompts": 0, "rows": []}, status=404)
+    else:
+        profile = resolve_main_business_profile_for_user(request.user)
+        if not profile:
+            return Response({"has_data": False, "total_prompts": 0, "rows": []})
     return Response(aeo_onboarding_competitors_visibility(profile))
 
 
@@ -4665,19 +4709,10 @@ def business_profile_list(request: HttpRequest) -> Response:
     if site_url and normalize_domain(site_url):
         data_user = workspace_data_user(profile) or request.user
         try:
-            # Ranked snapshot row (sync) so the client can read basic metrics immediately.
-            get_or_refresh_seo_score_for_user(
-                data_user,
-                site_url=site_url,
-                force_refresh=True,
-                business_profile=profile,
-            )
-            # Full enrichment + metrics (same pipeline as post-payment / refresh-seo-snapshot API),
-            # off the request thread so the add-company modal does not block on DataForSEO.
-            from .tasks import sync_enrich_seo_snapshot_for_profile_task
-
-            transaction.on_commit(
-                lambda pid=profile.pk: sync_enrich_seo_snapshot_for_profile_task.delay(pid)
+            run_full_seo_snapshot_for_profile(
+                profile,
+                data_user_fallback=data_user,
+                abort_on_low_coverage=True,
             )
         except Exception:
             logger.exception(
@@ -4912,10 +4947,11 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
         new_site_url = profile.website_url
         if new_site_url and new_site_url != old_site_url:
             try:
-                get_or_refresh_seo_score_for_user(
-                    request.user,
-                    site_url=new_site_url,
-                    business_profile=profile,
+                data_user = workspace_data_user(profile) or request.user
+                run_full_seo_snapshot_for_profile(
+                    profile,
+                    data_user_fallback=data_user,
+                    abort_on_low_coverage=True,
                 )
             except Exception:
                 pass

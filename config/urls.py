@@ -11,6 +11,7 @@ from drf_spectacular.views import SpectacularAPIView
 from drf_spectacular.views import SpectacularSwaggerView
 from rest_framework.authtoken.views import obtain_auth_token
 
+from swivl.users.oauth_callback_views import google_oauth_callback_view, microsoft_oauth_callback_view
 from swivl.users.views import google_login_redirect_view, microsoft_login_redirect_view
 from accounts import views as accounts_views
 
@@ -28,6 +29,10 @@ urlpatterns = [
     path("users/", include("swivl.users.urls", namespace="users")),
     path("auth/google/login/", google_login_redirect_view, name="google-login"),
     path("auth/microsoft/login/", microsoft_login_redirect_view, name="microsoft-login"),
+    # Shadow allauth OAuth callbacks so successful SPA redirects use ``location.replace``
+    # (avoids Back landing on ``/accounts/.../callback/``).
+    path("accounts/google/login/callback/", google_oauth_callback_view),
+    path("accounts/microsoft/login/callback/", microsoft_oauth_callback_view),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
     # ...

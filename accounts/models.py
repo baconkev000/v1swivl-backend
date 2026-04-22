@@ -1084,6 +1084,22 @@ class OnboardingOnPageCrawl(models.Model):
         default="",
         help_text="Set when Labs ranked_keywords call fails (crawl may still succeed).",
     )
+    # Labs ranked_keywords fetch runs in a separate Celery task after review_topics are ready.
+    RANKED_FETCH_LEGACY = ""
+    RANKED_FETCH_PENDING = "pending"
+    RANKED_FETCH_COMPLETE = "complete"
+    RANKED_FETCH_STATUS_CHOICES = [
+        (RANKED_FETCH_LEGACY, "Legacy / not applicable"),
+        (RANKED_FETCH_PENDING, "Pending background fetch"),
+        (RANKED_FETCH_COMPLETE, "Complete"),
+    ]
+    ranked_keywords_fetch_status = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        choices=RANKED_FETCH_STATUS_CHOICES,
+        help_text="pending=background Labs fetch in flight; complete=done or skipped; empty=pre-async rows.",
+    )
     # Gemini (or future LLM) review topics for onboarding Step 2 — independent of ranked_keywords.
     review_topics = models.JSONField(
         default=list,

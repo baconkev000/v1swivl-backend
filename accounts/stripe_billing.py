@@ -599,6 +599,17 @@ def apply_subscription_payload_to_profile(
     return True, list(updates.keys())
 
 
+def _promote_profile_to_main_after_checkout(profile: BusinessProfile) -> None:
+    """
+    When checkout is tied to a specific profile via ``client_reference_id`` (e.g. add-company),
+    make that profile the account's main profile so /api/business-profile/ returns it after payment.
+    """
+    uid = profile.user_id
+    BusinessProfile.objects.filter(user_id=uid).exclude(pk=profile.pk).update(is_main=False)
+    if not profile.is_main:
+        BusinessProfile.objects.filter(pk=profile.pk).update(is_main=True)
+
+
 def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSyncResult:
     payload = normalize_stripe_payload(payload)
     profile, resolver = _resolve_profile_for_event(payload)
@@ -685,6 +696,8 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
             updated_fields=[],
             reason_code="empty_update_payload",
         )
+    if resolver == "client_reference_id":
+        _promote_profile_to_main_after_checkout(profile)
     return StripeSyncResult(
         handled=True,
         did_update=True,

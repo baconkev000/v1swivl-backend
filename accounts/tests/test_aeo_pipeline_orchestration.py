@@ -647,6 +647,10 @@ def test_seo_trigger_task_is_idempotent_on_replay(monkeypatch):
         return {"seo_score": 42}
 
     monkeypatch.setattr("accounts.dataforseo_utils.get_or_refresh_seo_score_for_user", fake_refresh)
+    monkeypatch.setattr(
+        "accounts.seo_snapshot_refresh.sync_enrich_current_period_seo_snapshot_for_profile",
+        lambda *a, **k: {"ok": True, "persisted": True},
+    )
     trigger_seo_warmup_after_aeo_task(run.id)
     trigger_seo_warmup_after_aeo_task(run.id)
     run.refresh_from_db()

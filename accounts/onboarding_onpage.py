@@ -264,8 +264,100 @@ def extract_onboarding_page_record(
     }
 
 
+def _persist_crawl_ranked_and_clusters(
+    crawl: OnboardingOnPageCrawl,
+    extracted: List[Dict[str, Any]],
+    ranked_items: List[Dict[str, Any]],
+) -> None:
+    """Build clusters from extracted pages + ranked items; write ranked + cluster fields on crawl."""
+    context = crawl.context if isinstance(crawl.context, dict) else {}
+    bundle = build_topic_clusters(extracted, ranked_items)
+    filtered_ranked = apply_aeo_keyword_pipeline(
+        bundle["ranked_keywords_normalized"],
+        context=context,
+        seeds=bundle["crawl_topic_seeds"],
+    )
+    logger.info(
+        "[onboarding onpage] aeo_keyword_filter crawl_id=%s raw=%s filtered=%s",
+        crawl.id,
+        len(bundle["ranked_keywords_normalized"]),
+        len(filtered_ranked),
+    )
+    rebuild_items = ranked_rows_as_labs_api_shape(filtered_ranked)
+    bundle_filtered = build_topic_clusters(extracted, rebuild_items)
+    crawl.crawl_topic_seeds = bundle_filtered["crawl_topic_seeds"]
+    crawl.topic_clusters = bundle_filtered["topic_clusters"]
+    crawl.ranked_keywords = compact_ranked_for_storage(
+        filtered_ranked,
+        cap=ONBOARDING_RANKED_KEYWORDS_LIMIT,
+    )
+
+
+def execute_onboarding_ranked_keywords_fetch(crawl_id: int) -> None:
+    """
+    DataForSEO Labs ranked_keywords + clustering (Celery). Runs after review_topics in the main crawl.
+    """
+    crawl = (
+        OnboardingOnPageCrawl.objects.select_related("business_profile", "user")
+        .filter(pk=crawl_id)
+        .first()
+    )
+    if not crawl:
+        logger.warning("[onboarding ranked fetch] crawl id=%s not found", crawl_id)
+        return
+    if crawl.ranked_keywords_fetch_status != OnboardingOnPageCrawl.RANKED_FETCH_PENDING:
+        return
+    if crawl.status != OnboardingOnPageCrawl.STATUS_COMPLETED:
+        return
+    extracted = crawl.pages if isinstance(crawl.pages, list) else []
+    if not extracted:
+        crawl.ranked_keywords_fetch_status = OnboardingOnPageCrawl.RANKED_FETCH_COMPLETE
+        crawl.save(update_fields=["ranked_keywords_fetch_status", "updated_at"])
+        return
+
+    context = crawl.context if isinstance(crawl.context, dict) else {}
+    location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+    language_code = str(getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en") or "en")
+    ranked_items: List[Dict[str, Any]] = []
+    crawl.ranked_keywords_error = ""
+    try:
+        with usage_profile_context(crawl.business_profile):
+            try:
+                ranked_items = fetch_ranked_keyword_items(
+                    crawl.domain,
+                    location_code,
+                    language_code,
+                    user=crawl.user,
+                    limit=ONBOARDING_RANKED_KEYWORDS_LIMIT,
+                    business_profile=crawl.business_profile,
+                )
+            except Exception as exc:
+                logger.exception("[onboarding ranked fetch] ranked_keywords fetch crawl_id=%s", crawl_id)
+                crawl.ranked_keywords_error = str(exc)[:2000]
+        _persist_crawl_ranked_and_clusters(crawl, extracted, ranked_items)
+    except Exception as exc:
+        logger.exception("[onboarding ranked fetch] crawl id=%s failed", crawl_id)
+        crawl.ranked_keywords_error = (crawl.ranked_keywords_error or str(exc))[:2000]
+    crawl.ranked_keywords_fetch_status = OnboardingOnPageCrawl.RANKED_FETCH_COMPLETE
+    crawl.save(
+        update_fields=[
+            "crawl_topic_seeds",
+            "topic_clusters",
+            "ranked_keywords",
+            "ranked_keywords_error",
+            "ranked_keywords_fetch_status",
+            "updated_at",
+        ],
+    )
+    logger.info(
+        "[onboarding ranked fetch] crawl id=%s done ranked_count=%s",
+        crawl_id,
+        len(crawl.ranked_keywords or []),
+    )
+
+
 def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
-    """Run crawl + extraction and persist (called from Celery)."""
+    """Run crawl + extraction, review topics, then enqueue Labs ranked_keywords in the background."""
     crawl = OnboardingOnPageCrawl.objects.filter(pk=crawl_id).first()
     if not crawl:
         logger.warning("[onboarding onpage] crawl id=%s not found", crawl_id)
@@ -301,43 +393,25 @@ def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
                     or "no_pages"
                 )[:2000]
 
-            location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
-            language_code = str(getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en") or "en")
-            ranked_items: List[Dict[str, Any]] = []
-            crawl.ranked_keywords_error = ""
-            try:
-                ranked_items = fetch_ranked_keyword_items(
-                    crawl.domain,
-                    location_code,
-                    language_code,
-                    user=crawl.user,
-                    limit=ONBOARDING_RANKED_KEYWORDS_LIMIT,
-                    business_profile=crawl.business_profile,
-                )
-            except Exception as exc:
-                logger.exception("[onboarding onpage] ranked_keywords fetch crawl_id=%s", crawl_id)
-                crawl.ranked_keywords_error = str(exc)[:2000]
+        if not extracted:
+            crawl.ranked_keywords_fetch_status = OnboardingOnPageCrawl.RANKED_FETCH_LEGACY
+            crawl.save(
+                update_fields=[
+                    "pages",
+                    "task_id",
+                    "exit_reason",
+                    "status",
+                    "error_message",
+                    "ranked_keywords_fetch_status",
+                    "updated_at",
+                ],
+            )
+            return
 
-        bundle = build_topic_clusters(extracted, ranked_items)
-        filtered_ranked = apply_aeo_keyword_pipeline(
-            bundle["ranked_keywords_normalized"],
-            context=context,
-            seeds=bundle["crawl_topic_seeds"],
-        )
-        logger.info(
-            "[onboarding onpage] aeo_keyword_filter crawl_id=%s raw=%s filtered=%s",
-            crawl_id,
-            len(bundle["ranked_keywords_normalized"]),
-            len(filtered_ranked),
-        )
-        rebuild_items = ranked_rows_as_labs_api_shape(filtered_ranked)
-        bundle_filtered = build_topic_clusters(extracted, rebuild_items)
-        crawl.crawl_topic_seeds = bundle_filtered["crawl_topic_seeds"]
-        crawl.topic_clusters = bundle_filtered["topic_clusters"]
-        crawl.ranked_keywords = compact_ranked_for_storage(
-            filtered_ranked,
-            cap=ONBOARDING_RANKED_KEYWORDS_LIMIT,
-        )
+        # Crawl-only seeds/clusters (no Labs yet); ranked_keywords filled by background task.
+        crawl.ranked_keywords_error = ""
+        _persist_crawl_ranked_and_clusters(crawl, extracted, [])
+        crawl.ranked_keywords_fetch_status = OnboardingOnPageCrawl.RANKED_FETCH_PENDING
 
         save_fields = [
             "pages",
@@ -349,11 +423,11 @@ def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
             "topic_clusters",
             "ranked_keywords",
             "ranked_keywords_error",
+            "ranked_keywords_fetch_status",
             "updated_at",
         ]
         crawl.save(update_fields=save_fields)
 
-        # AEO Step 2 topics: Gemini from root domain only (SEO ranked keywords stay separate above).
         from .onboarding_review_topics import generate_review_topics_for_domain
 
         rt_list, rt_err = generate_review_topics_for_domain(
@@ -364,11 +438,18 @@ def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
         crawl.review_topics_error = (rt_err or "")[:2000]
         crawl.save(update_fields=["review_topics", "review_topics_error", "updated_at"])
 
-        # AEO prompts are generated only when the client POSTs ``/api/aeo/onboarding-prompt-plan/`` with
-        # ``onboarding_step2_prompt_plan`` and the user's ``selected_topics`` (including custom topics),
-        # not automatically from every inferred review topic row.
+        from .tasks import onboarding_ranked_keywords_fetch_task
+
+        try:
+            onboarding_ranked_keywords_fetch_task.delay(crawl.id)
+        except Exception:
+            logger.exception(
+                "[onboarding onpage] ranked_keywords fetch enqueue failed crawl_id=%s",
+                crawl.id,
+            )
+
         logger.info(
-            "[onboarding onpage] crawl id=%s status=%s pages=%s",
+            "[onboarding onpage] crawl id=%s status=%s pages=%s ranked_fetch=enqueued",
             crawl_id,
             crawl.status,
             len(extracted),

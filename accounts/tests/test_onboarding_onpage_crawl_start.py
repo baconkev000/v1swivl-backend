@@ -205,6 +205,33 @@ def test_onboarding_crawl_latest_filters_by_domain():
     assert r_a.data["domain"] == "a.com"
     assert (r_a.data["ranked_keywords"] or [{}])[0].get("keyword") == "a"
     assert r_a.data.get("review_topics") == []
+    assert r_a.data.get("ranked_keywords_pending") is False
+
+
+@pytest.mark.django_db
+def test_onboarding_crawl_latest_ranked_keywords_pending():
+    user = User.objects.create_user(
+        username="pending-u",
+        email="pending-u@example.com",
+        password="pw",
+    )
+    profile = BusinessProfile.objects.create(user=user, is_main=True)
+    OnboardingOnPageCrawl.objects.create(
+        user=user,
+        business_profile=profile,
+        domain="pending.test",
+        status=OnboardingOnPageCrawl.STATUS_COMPLETED,
+        ranked_keywords=[],
+        ranked_keywords_fetch_status=OnboardingOnPageCrawl.RANKED_FETCH_PENDING,
+        review_topics=[{"topic": "Services", "category": "general"}],
+    )
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    r = client.get("/api/onboarding/crawl/latest/", {"domain": "pending.test"})
+    assert r.status_code == 200
+    assert r.data.get("ranked_keywords_pending") is True
+    assert len(r.data.get("review_topics") or []) == 1
 
 
 @pytest.mark.django_db
@@ -247,3 +274,4 @@ def test_onpage_crawl_reuses_completed_crawl_from_sibling_profile_for_same_domai
     cloned = OnboardingOnPageCrawl.objects.filter(user=user, business_profile=target_profile).first()
     assert cloned is not None
     assert (cloned.ranked_keywords or [{}])[0].get("keyword") == "cached"
+    assert cloned.ranked_keywords_fetch_status == OnboardingOnPageCrawl.RANKED_FETCH_COMPLETE

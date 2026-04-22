@@ -180,15 +180,14 @@ def aeo_pass_count_staff_page(request):
                             )
                         else:
                             from accounts.business_profile_access import workspace_data_user
-                            from accounts.dataforseo_utils import get_or_refresh_seo_score_for_user
+                            from accounts.seo_snapshot_refresh import run_full_seo_snapshot_for_profile
 
                             data_user = workspace_data_user(profile) or profile.user
                             try:
-                                result = get_or_refresh_seo_score_for_user(
-                                    data_user,
-                                    site_url=site_url,
-                                    force_refresh=True,
-                                    business_profile=profile,
+                                sync_result = run_full_seo_snapshot_for_profile(
+                                    profile,
+                                    data_user_fallback=data_user,
+                                    abort_on_low_coverage=True,
                                 )
                             except Exception:
                                 logger.exception(
@@ -201,18 +200,31 @@ def aeo_pass_count_staff_page(request):
                                     "Check server logs.",
                                 )
                             else:
-                                if result is None:
+                                detail = sync_result.get("detail")
+                                if detail in ("ranked_refresh_unavailable", "domain_normalize_failed"):
                                     messages.error(
                                         request,
-                                        "SEO snapshot refresh did not return data "
-                                        "(domain could not be resolved or configuration issue).",
+                                        "SEO snapshot refresh did not return ranked keyword data "
+                                        "(domain could not be resolved, configuration issue, or Labs returned no data).",
                                     )
-                                else:
+                                elif sync_result.get("aborted_low_coverage"):
+                                    messages.warning(
+                                        request,
+                                        "Ranked keywords were refreshed; keyword enrichment was skipped "
+                                        "because rank coverage was below the safety threshold. "
+                                        f"({detail or 'low coverage'})",
+                                    )
+                                elif sync_result.get("persisted"):
                                     messages.success(
                                         request,
-                                        "SEO snapshot refresh ran for this profile’s site (DataForSEO). "
-                                        "Keyword enrichment and next-steps tasks may still be running; "
-                                        "structured SEO issues appear after those Celery jobs complete.",
+                                        "SEO snapshot refreshed: ranked keywords plus gap/suggested "
+                                        "enrichment and metrics were saved. Next-step and keyword-action "
+                                        "tasks were queued.",
+                                    )
+                                else:
+                                    messages.info(
+                                        request,
+                                        f"SEO snapshot refresh finished with status: {detail or 'unknown'}.",
                                     )
         else:
             messages.error(request, "Unknown action.")
