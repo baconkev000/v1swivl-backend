@@ -93,6 +93,34 @@ def test_onboarding_business_input_uses_local_city_state_when_reach_is_local():
     assert out.city == "Austin, TX"
 
 
+def test_onboarding_local_appends_state_when_infer_is_city_only():
+    out = aeo_business_input_from_onboarding_payload(
+        business_name="Local Co",
+        website_url="https://local.example.com",
+        location="Los Angeles",
+        language="English",
+        selected_topics=["plumbing"],
+        customer_reach="local",
+        customer_reach_state="CA",
+        customer_reach_city="",
+    )
+    assert out.city == "Los Angeles, CA"
+
+
+def test_onboarding_local_does_not_duplicate_state_when_city_has_abbrev():
+    out = aeo_business_input_from_onboarding_payload(
+        business_name="Local Co",
+        website_url="https://local.example.com",
+        location="United States",
+        language="English",
+        selected_topics=["plumbing"],
+        customer_reach="local",
+        customer_reach_state="Texas",
+        customer_reach_city="Austin, TX",
+    )
+    assert out.city == "Austin, TX"
+
+
 def test_onboarding_business_input_keeps_existing_online_location_behavior():
     out = aeo_business_input_from_onboarding_payload(
         business_name="Online Co",

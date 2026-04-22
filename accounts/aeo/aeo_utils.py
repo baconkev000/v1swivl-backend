@@ -109,20 +109,24 @@ def aeo_business_input_from_onboarding_payload(
 
     ``industry`` is a short hint derived from selected topic labels so OpenAI has vertical
     context without relying on BusinessProfile.industry mid-onboarding.
+
+    When ``customer_reach`` is ``local``, the ``city`` field pairs city + state (from explicit
+    fields and/or inferred address) so generated prompts stay geographically consistent.
     """
     topics = [str(t).strip() for t in selected_topics if str(t).strip()]
     loc = (location or "").strip()
     reach = str(customer_reach or "online").strip().lower()
     state = _normalize_city(str(customer_reach_state or ""))
     city = _normalize_city(str(customer_reach_city or ""))
-    city_guess = infer_city_from_address(loc) or _normalize_city(loc[:200])
+    inferred = infer_city_from_address(loc) or _normalize_city(loc[:200])
     if reach == "local":
-        if city and state:
-            city_guess = f"{city}, {state}" if state.lower() not in city.lower() else city
-        elif city:
-            city_guess = city
-        elif state:
-            city_guess = state
+        city_guess = _compose_locality_for_local_business(
+            inferred_city=inferred,
+            explicit_city=city,
+            explicit_state=state,
+        )
+    else:
+        city_guess = inferred
     industry_hint = ", ".join(topics[:6]) if topics else ""
     return AEOPromptBusinessInput(
         industry=industry_hint[:500],
@@ -184,6 +188,128 @@ def _strip_code_fence(text: str) -> str:
 def _normalize_city(city: str) -> str:
     c = (city or "").strip()
     return re.sub(r"\s+", " ", c)
+
+
+# Lowercase US state / DC full name → postal abbrev (for deduping "City, TX" vs state "Texas").
+_US_STATE_FULL_LOWER_TO_ABB: Final[dict[str, str]] = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "district of columbia": "DC",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "new hampshire": "NH",
+    "new jersey": "NJ",
+    "new mexico": "NM",
+    "new york": "NY",
+    "north carolina": "NC",
+    "north dakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhode island": "RI",
+    "south carolina": "SC",
+    "south dakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "west virginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+}
+
+
+def _state_in_locality(locality: str, state: str) -> bool:
+    """
+    True if ``state`` (full name or 2-letter US code) is already represented in ``locality``.
+
+    Avoids appending a second state fragment when the city string already ends with ``City, ST``
+    or contains the full state name.
+    """
+    loc_n = _normalize_city(locality)
+    st = _normalize_city(state)
+    if not loc_n or not st:
+        return False
+    loc_l = loc_n.lower()
+    st_l = st.lower()
+    if len(st) > 2 and st_l in loc_l:
+        return True
+    parts = [p.strip() for p in loc_n.split(",") if p.strip()]
+    if not parts:
+        return False
+    tail = parts[-1]
+    tail_l = tail.lower()
+    tail_is_abbrev = len(tail) == 2 and tail.isalpha()
+    tail_u = tail.upper() if tail_is_abbrev else ""
+
+    if len(st) == 2 and st.isalpha():
+        st_u = st.upper()
+        if tail_is_abbrev and tail_u == st_u:
+            return True
+        if _US_STATE_FULL_LOWER_TO_ABB.get(tail_l) == st_u:
+            return True
+        if re.search(rf"(^|,\s*|\s){re.escape(st_u)}(\s*,|\s*$)", loc_n, re.IGNORECASE):
+            return True
+    if len(st) > 2:
+        abb = _US_STATE_FULL_LOWER_TO_ABB.get(st_l)
+        if abb and tail_is_abbrev and tail_u == abb:
+            return True
+        if tail_l == st_l:
+            return True
+    return False
+
+
+def _compose_locality_for_local_business(
+    *,
+    inferred_city: str,
+    explicit_city: str,
+    explicit_state: str,
+) -> str:
+    """
+    Build the single ``city`` string for templates + OpenAI batch context when reach is local.
+
+    Prefer explicit onboarding/profile city, then inferred address fragment. When a state is
+    known and not already reflected next to the city, append ``", {state}"`` so prompts stay
+    consistent (city-only localities are ambiguous across regions).
+    """
+    inferred = _normalize_city(inferred_city)
+    city_ex = _normalize_city(explicit_city)
+    state = _normalize_city(explicit_state)
+    city_base = city_ex or inferred
+    if not city_base and state:
+        return state
+    if not state:
+        return city_base
+    if _state_in_locality(city_base, state):
+        return city_base
+    return f"{city_base}, {state}" if city_base else state
 
 
 def _website_domain_from_url(url: str) -> str:
@@ -457,7 +583,22 @@ def aeo_business_input_from_profile(
     Optional kwargs override inferred values (recommended until services live on the model).
     """
     addr = getattr(profile, "business_address", "") or ""
-    resolved_city = _normalize_city(city) if city else infer_city_from_address(addr)
+    inferred = infer_city_from_address(addr)
+    reach = str(getattr(profile, "customer_reach", None) or "online").strip().lower()
+    state_f = _normalize_city(str(getattr(profile, "customer_reach_state", "") or ""))
+    profile_city = _normalize_city(str(getattr(profile, "customer_reach_city", "") or ""))
+    explicit_override = _normalize_city(city) if city else ""
+
+    if reach == "local":
+        explicit_city = explicit_override or profile_city
+        resolved_city = _compose_locality_for_local_business(
+            inferred_city=inferred,
+            explicit_city=explicit_city,
+            explicit_state=state_f,
+        )
+    else:
+        resolved_city = explicit_override or inferred
+
     if industry is not None:
         ind = str(industry).strip()
     else:
@@ -470,6 +611,9 @@ def aeo_business_input_from_profile(
         services=list(services) if services is not None else [],
         niche_modifiers=list(niche_modifiers) if niche_modifiers is not None else [],
         differentiators=list(differentiators) if differentiators is not None else [],
+        customer_reach=reach,
+        customer_reach_state=state_f,
+        customer_reach_city=explicit_override or profile_city,
     )
 
 
@@ -743,6 +887,14 @@ def build_openai_batch_user_content(
         "\n\nSeed prompts (JSON array, may be empty):\n",
         json.dumps(list(seed_prompts or []), ensure_ascii=False),
     ]
+    if str(biz_for_llm.get("customer_reach") or "").strip().lower() == "local":
+        lines.append(
+            "\n\nLocal geography rule: customer_reach is \"local\". Whenever a generated prompt "
+            "names a place (city, metro, neighborhood, or service area), include BOTH city and state "
+            "in the wording exactly as reflected by the combined `city` string in business context "
+            "(that field already pairs city with state when both are known). Do not use city-only "
+            "place names when the state is present in context — keep geography consistent for the model.\n",
+        )
     if onboarding_topic_details:
         sanitized_rows: list[dict[str, Any]] = []
         for row in onboarding_topic_details:
