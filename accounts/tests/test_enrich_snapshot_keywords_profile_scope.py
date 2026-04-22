@@ -48,11 +48,15 @@ def test_enrich_snapshot_keywords_task_passes_snapshots_business_profile_to_labs
     )
 
     bp_seen: list[int | None] = []
+    gap_bp_seen: list[int | None] = []
+    llm_bp_seen: list[int | None] = []
 
-    def _stub_gap(domain, location_code, language_code, user, top_keywords):
+    def _stub_gap(domain, location_code, language_code, user, top_keywords, **kwargs):
+        gap_bp_seen.append(getattr(kwargs.get("business_profile"), "pk", None))
         return None
 
-    def _stub_llm(user, location_code, top_keywords):
+    def _stub_llm(user, location_code, top_keywords, **kwargs):
+        llm_bp_seen.append(getattr(kwargs.get("business_profile"), "pk", None))
         return None
 
     def _stub_rank(
@@ -86,4 +90,6 @@ def test_enrich_snapshot_keywords_task_passes_snapshots_business_profile_to_labs
     accounts_tasks.enrich_snapshot_keywords_task.apply(args=(snap.pk,))
 
     assert bp_seen == [secondary.pk]
+    assert gap_bp_seen == [secondary.pk]
+    assert llm_bp_seen == [secondary.pk]
     assert main.is_main is True and secondary.is_main is False

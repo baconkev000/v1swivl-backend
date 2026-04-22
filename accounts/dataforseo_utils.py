@@ -120,6 +120,7 @@ _EXCLUDED_COMPETITOR_DOMAIN_ROOTS = frozenset({
     "x.com",
     "pinterest.com",
     "linkedin.com",
+    "youtube.com",
     # Directories / review aggregators
     "yelp.com",
     "thumbtack.com",
@@ -832,6 +833,39 @@ def _post(
         return None
 
     data = parsed_json
+    try:
+        response_log_max_chars = int(getattr(settings, "DATAFORSEO_RESPONSE_LOG_MAX_CHARS", 12000))
+    except (TypeError, ValueError):
+        response_log_max_chars = 12000
+    response_log_max_chars = max(1000, response_log_max_chars)
+    try:
+        body_json = json.dumps(data, ensure_ascii=False, default=str)
+    except Exception:
+        body_json = str(data)
+    body_preview = body_json[:response_log_max_chars]
+    body_truncated = len(body_json) > response_log_max_chars
+    tasks = data.get("tasks") if isinstance(data, dict) else []
+    task_statuses: List[int] = []
+    if isinstance(tasks, list):
+        for t in tasks[:5]:
+            if not isinstance(t, dict):
+                continue
+            try:
+                task_statuses.append(int(t.get("status_code") or 0))
+            except (TypeError, ValueError):
+                task_statuses.append(0)
+    logger.info(
+        "[DataForSEO] response path=%s http_status=%s top_status_code=%s top_status_message=%s tasks_count=%s tasks_error=%s task_statuses=%s body=%s%s",
+        path,
+        resp.status_code,
+        (data or {}).get("status_code"),
+        (data or {}).get("status_message"),
+        (data or {}).get("tasks_count"),
+        (data or {}).get("tasks_error"),
+        task_statuses,
+        body_preview,
+        " …[truncated]" if body_truncated else "",
+    )
     # DataForSEO wraps results in tasks / result; callers will unpack further.
     # #region agent log
     try:
@@ -1200,8 +1234,9 @@ def get_ranked_keywords_visibility(
         keywords_count = len(items)
 
         top3 = sum(
-            1 for item in items
-            if item.get("rank_absolute") and item["rank_absolute"] <= 3
+            1
+            for item in items
+            if (r := _rank_from_ranked_keywords_item(item)) is not None and r <= 3
         )
 
         # crude visibility proxy
@@ -2840,6 +2875,35 @@ def get_cached_seo_snapshot(
         return None
 
 
+def _rank_from_ranked_keywords_item(item: Optional[Dict[str, Any]]) -> Optional[int]:
+    """
+    Best-effort rank for a ranked_keywords/live ``items[]`` row.
+
+    DataForSEO often nests position under ``ranked_serp_element`` / ``serp_item`` rather than
+    top-level ``rank_absolute`` / ``rank_group``. Prefer ``rank_absolute`` over ``rank_group``
+    within each object layer (item → ranked_serp_element → serp_item).
+    """
+    if not item or not isinstance(item, dict):
+        return None
+    layers: List[Dict[str, Any]] = [item]
+    rse = item.get("ranked_serp_element")
+    if isinstance(rse, dict):
+        layers.append(rse)
+        serp_item = rse.get("serp_item")
+        if isinstance(serp_item, dict):
+            layers.append(serp_item)
+    for layer in layers:
+        for key in ("rank_absolute", "rank_group"):
+            raw = layer.get(key)
+            try:
+                rank_int = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                continue
+            if rank_int is not None and rank_int > 0:
+                return rank_int
+    return None
+
+
 def fetch_ranked_keyword_items(
     domain: str,
     location_code: int,
@@ -2962,14 +3026,16 @@ def fetch_ranked_keyword_items(
             len(items),
         )
         if items:
+            first_item = items[0]
             preview = {
-                "rank_absolute": items[0].get("rank_absolute"),
-                "rank_group": items[0].get("rank_group"),
+                "rank_absolute": first_item.get("rank_absolute"),
+                "rank_group": first_item.get("rank_group"),
+                "resolved_rank": _rank_from_ranked_keywords_item(first_item),
                 "search_volume": (
-                    ((items[0].get("keyword_data") or {}).get("keyword_info") or {}).get("search_volume")
-                    or items[0].get("search_volume")
+                    ((first_item.get("keyword_data") or {}).get("keyword_info") or {}).get("search_volume")
+                    or first_item.get("search_volume")
                 ),
-                "keyword": (items[0].get("keyword_data") or {}).get("keyword") or items[0].get("keyword"),
+                "keyword": (first_item.get("keyword_data") or {}).get("keyword") or first_item.get("keyword"),
             }
             logger.info(
                 "[SEO score] ranked_keywords first_item_preview user_id=%s domain=%s preview=%s",
@@ -2987,13 +3053,14 @@ def fetch_ranked_keyword_items(
                     "domain": domain,
                     "total_items": len(items),
                     "first_item": {
-                        "rank_absolute": items[0].get("rank_absolute"),
-                        "rank_group": items[0].get("rank_group"),
-                        "keyword": (items[0].get("keyword_data") or {}).get("keyword")
-                        or items[0].get("keyword"),
+                        "rank_absolute": first_item.get("rank_absolute"),
+                        "rank_group": first_item.get("rank_group"),
+                        "resolved_rank": _rank_from_ranked_keywords_item(first_item),
+                        "keyword": (first_item.get("keyword_data") or {}).get("keyword")
+                        or first_item.get("keyword"),
                         "search_volume": (
-                            ((items[0].get("keyword_data") or {}).get("keyword_info") or {}).get("search_volume")
-                            or items[0].get("search_volume")
+                            ((first_item.get("keyword_data") or {}).get("keyword_info") or {}).get("search_volume")
+                            or first_item.get("search_volume")
                         ),
                     },
                 },
@@ -3074,11 +3141,7 @@ def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     rank_int_other_count = 0
 
     for item in items:
-        rank = item.get("rank_absolute") or item.get("rank_group")
-        try:
-            rank_int = int(rank) if rank is not None else None
-        except (TypeError, ValueError):
-            rank_int = None
+        rank_int = _rank_from_ranked_keywords_item(item)
 
         if rank_int is None:
             rank_int_none_count += 1
@@ -3188,16 +3251,19 @@ def enrich_with_gap_keywords(
     user,
     top_keywords: List[Dict[str, Any]],
     force_refresh: bool = False,
+    business_profile: Optional[BusinessProfile] = None,
 ) -> None:
     """Append gap keywords (vs competitors) to top_keywords in place. Preserves logging on error."""
     rank_non_null_before = sum(1 for k in top_keywords if k.get("rank") is not None)
-    try:
-        _profile = (
-            BusinessProfile.objects.filter(user=user, is_main=True).first()
-            or BusinessProfile.objects.filter(user=user).first()
-        )
-    except Exception:
-        _profile = None
+    _profile = business_profile
+    if _profile is None:
+        try:
+            _profile = (
+                BusinessProfile.objects.filter(user=user, is_main=True).first()
+                or BusinessProfile.objects.filter(user=user).first()
+            )
+        except Exception:
+            _profile = None
     competitor_selection = get_competitors_for_domain_intersection(
         domain=domain,
         location_code=location_code,
@@ -3381,12 +3447,8 @@ def _best_rank_from_ranked_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
         keyword_text = (keyword_data.get("keyword") or item.get("keyword") or "").strip()
         if not keyword_text:
             continue
-        raw_rank = item.get("rank_absolute") or item.get("rank_group")
-        try:
-            rank_int = int(raw_rank) if raw_rank is not None else None
-        except (TypeError, ValueError):
-            rank_int = None
-        if rank_int is None or rank_int <= 0:
+        rank_int = _rank_from_ranked_keywords_item(item)
+        if rank_int is None:
             continue
         key = keyword_text.lower()
         prev = ranked_map.get(key)
@@ -3594,7 +3656,7 @@ def enrich_keyword_ranks_from_labs(
 ) -> Dict[str, int]:
     """
     Enrich existing top_keywords rank values using Labs APIs:
-    - ranked_keywords/live (rank_absolute/rank_group)
+    - ranked_keywords/live (rank_absolute / rank_group, including nested ranked_serp_element)
     - domain_intersection/live (your_rank via first_domain_serp_element)
 
     Keeps search_volume source unchanged; only fills/updates rank + missed searches.
@@ -3764,16 +3826,19 @@ def enrich_with_llm_keywords(
     user,
     location_code: int,
     top_keywords: List[Dict[str, Any]],
+    business_profile: Optional[BusinessProfile] = None,
 ) -> None:
     """Append validated LLM seed keywords to top_keywords in place. Preserves logging on error."""
     existing_keys = {str(k.get("keyword", "")).lower() for k in top_keywords if k.get("keyword")}
-    try:
-        _profile = (
-            BusinessProfile.objects.filter(user=user, is_main=True).first()
-            or BusinessProfile.objects.filter(user=user).first()
-        )
-    except Exception:
-        _profile = None
+    _profile = business_profile
+    if _profile is None:
+        try:
+            _profile = (
+                BusinessProfile.objects.filter(user=user, is_main=True).first()
+                or BusinessProfile.objects.filter(user=user).first()
+            )
+        except Exception:
+            _profile = None
     homepage_meta: Optional[str] = None
     try:
         if _profile and getattr(_profile, "website_url", None):

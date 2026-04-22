@@ -152,12 +152,14 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
             user=user,
             top_keywords=top_keywords,
             force_refresh=force_domain_intersection,
+            business_profile=profile,
         )
         external_api_called = True
         enrich_with_llm_keywords(
             user=user,
             location_code=location_code,
             top_keywords=top_keywords,
+            business_profile=profile,
         )
         rank_stats = enrich_keyword_ranks_from_labs(
             domain=domain,

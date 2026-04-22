@@ -411,8 +411,20 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         )
 
         with usage_profile_context(profile_for_usage):
-            enrich_with_gap_keywords(domain, location_code, language_code, user, top_keywords)
-            enrich_with_llm_keywords(user, location_code, top_keywords)
+            enrich_with_gap_keywords(
+                domain,
+                location_code,
+                language_code,
+                user,
+                top_keywords,
+                business_profile=profile_for_usage,
+            )
+            enrich_with_llm_keywords(
+                user,
+                location_code,
+                top_keywords,
+                business_profile=profile_for_usage,
+            )
             rank_stats = enrich_keyword_ranks_from_labs(
                 domain=domain,
                 location_code=location_code,
