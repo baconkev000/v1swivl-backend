@@ -4983,28 +4983,6 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
             except Exception:
                 pass
 
-        # For add-company onboarding, selected prompts are initially the interactive baseline.
-        # If this account is Pro/Advanced, enqueue background expansion to full monitored cap
-        # even when this profile's own plan field is still blank.
-        selected_prompts_in_payload = "selected_aeo_prompts" in request.data
-        if selected_prompts_in_payload and list(profile.selected_aeo_prompts or []):
-            try:
-                if aeo_should_run_post_payment_expansion(profile):
-                    from .tasks import schedule_aeo_prompt_plan_expansion
-
-                    cap = int(aeo_effective_monitored_target_for_profile(profile))
-                    transaction.on_commit(
-                        lambda pid=int(profile.id), expansion_cap=cap: schedule_aeo_prompt_plan_expansion.delay(
-                            pid,
-                            expansion_cap=expansion_cap,
-                        )
-                    )
-            except Exception:
-                logger.exception(
-                    "[business_profile_detail] enqueue prompt expansion failed profile_id=%s",
-                    getattr(profile, "id", None),
-                )
-
         # Default PATCH/PUT response to lightweight metrics so profile saves never block on
         # live DataForSEO calls (can exceed worker timeout during external crawl requests).
         skip_heavy_raw = str(request.GET.get("skip_heavy", "")).strip().lower()

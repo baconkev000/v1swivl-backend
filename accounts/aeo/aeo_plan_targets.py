@@ -174,6 +174,9 @@ def aeo_onboarding_min_for_validation(instance: BusinessProfile | None, attrs: d
 def aeo_should_run_post_payment_expansion(profile: BusinessProfile) -> bool:
     if aeo_testing_mode():
         return False
+    status = str(getattr(profile, "stripe_subscription_status", "") or "").strip().lower()
+    if status not in _ACTIVE_SUBSCRIPTION_STATUSES:
+        return False
     return _effective_plan_slug_for_profile(profile) in {
         BusinessProfile.PLAN_PRO,
         BusinessProfile.PLAN_ADVANCED,
