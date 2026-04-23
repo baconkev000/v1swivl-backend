@@ -4652,7 +4652,17 @@ def business_profile_list(request: HttpRequest) -> Response:
             .prefetch_related("tracked_competitors")
             .order_by("-is_main", "created_at", "id")
         )
-        serializer = BusinessProfileSerializer(profiles, many=True)
+        # Never run live DataForSEO / AEO readiness per row here — it blocks workers and can
+        # exceed Gunicorn timeout (see BusinessProfileSerializer._get_aeo_bundle). Same pattern as
+        # GET /api/business-profile/?skip_heavy=1 used by the app shell.
+        serializer = BusinessProfileSerializer(
+            profiles,
+            many=True,
+            context={
+                "request": request,
+                "skip_heavy_profile_metrics": True,
+            },
+        )
         return Response(serializer.data)
 
     # POST: create a new profile under this user
@@ -4681,7 +4691,11 @@ def business_profile_list(request: HttpRequest) -> Response:
                 access = viewer_team_access(request.user, row)
                 serializer = BusinessProfileSerializer(
                     row,
-                    context={"request": request, "viewer_access": access},
+                    context={
+                        "request": request,
+                        "viewer_access": access,
+                        "skip_heavy_profile_metrics": True,
+                    },
                 )
                 return Response(serializer.data, status=200)
 
@@ -4720,7 +4734,16 @@ def business_profile_list(request: HttpRequest) -> Response:
                 getattr(profile, "id", None),
             )
 
-    return Response(serializer.data, status=201)
+    access = viewer_team_access(request.user, profile)
+    out_serializer = BusinessProfileSerializer(
+        profile,
+        context={
+            "request": request,
+            "viewer_access": access,
+            "skip_heavy_profile_metrics": True,
+        },
+    )
+    return Response(out_serializer.data, status=201)
 
 
 @csrf_exempt
