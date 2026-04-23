@@ -82,6 +82,7 @@ from .aeo.aeo_plan_targets import (
     aeo_effective_monitored_target_for_profile,
     aeo_fallback_global_target_count,
     aeo_monitored_prompt_cap_for_plan_slug,
+    aeo_onboarding_complete_min_prompts,
     aeo_should_run_post_payment_expansion,
 )
 from .aeo.aeo_utils import (
@@ -4429,7 +4430,9 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     onboarding_step2 = bool(body.get("onboarding_step2_prompt_plan"))
     selected_topics_raw = body.get("selected_topics")
 
-    target_prompt_count = aeo_effective_monitored_target_for_profile(profile)
+    # Full monitored cap for profile (plan target after expansion).
+    profile_prompt_cap = aeo_effective_monitored_target_for_profile(profile)
+    target_prompt_count = profile_prompt_cap
     saved_raw = list(profile.selected_aeo_prompts or [])
 
     selected_topics: list[str] = []
@@ -4445,6 +4448,10 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                 {"error": "selected_topics must be a non-empty list when onboarding_step2_prompt_plan is set."},
                 status=400,
             )
+        # Step-2 prompt generation should stay fast/interactive (owner selects prompts),
+        # so avoid generating the full post-expansion plan cap (75/150) inline.
+        onboarding_min = int(aeo_onboarding_complete_min_prompts(profile))
+        target_prompt_count = min(profile_prompt_cap, max(onboarding_min, len(selected_topics)))
         oc_early = body.get("onboarding_context") if isinstance(body.get("onboarding_context"), dict) else {}
         website_url_ctx = str(oc_early.get("website_url") or "").strip()
         prompt_texts = _saved_prompt_texts_for_profile_domain(
