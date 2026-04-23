@@ -1781,7 +1781,6 @@ def crawl_pages_for_onboarding(
                     "language_code": language_code,
                     "limit": cap,
                     "offset": 0,
-                    "order_by": ["page_rank,desc"],
                 },
             ],
             business_profile=business_profile,
