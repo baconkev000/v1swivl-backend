@@ -419,6 +419,22 @@ def _resolve_profile_for_event(data: dict) -> tuple[BusinessProfile | None, str]
         if p is not None:
             return p, "client_reference_id"
 
+    # Prefer explicit subscription linkage before customer-level fallback.
+    # One Stripe customer may own multiple business profiles, but a subscription id
+    # should map to exactly one profile once checkout.session.completed runs.
+    sub_raw = _get_scalar(obj, "subscription")
+    sub_id, _sub_dict = _subscription_id_and_dict(sub_raw)
+    if not sub_id and str(_get_scalar(obj, "object") or "").strip() == "subscription":
+        sub_id = str(_get_scalar(obj, "id") or "").strip()
+    if sub_id:
+        by_sub = (
+            BusinessProfile.objects.filter(stripe_subscription_id=sub_id)
+            .order_by("-is_main", "-updated_at")
+            .first()
+        )
+        if by_sub is not None:
+            return by_sub, "subscription_id"
+
     customer_id = str(_get_scalar(obj, "customer") or "").strip()
     if customer_id:
         profile = (
@@ -613,6 +629,15 @@ def _promote_profile_to_main_after_checkout(profile: BusinessProfile) -> None:
 def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSyncResult:
     payload = normalize_stripe_payload(payload)
     profile, resolver = _resolve_profile_for_event(payload)
+    obj = _object_payload(payload)
+    client_ref = str(_get_scalar(obj, "client_reference_id") or "").strip()
+    # checkout.session.completed includes client_reference_id from our checkout route;
+    # use it as authoritative target to avoid customer-id ambiguity across profiles.
+    if client_ref.isdigit():
+        explicit = BusinessProfile.objects.filter(id=int(client_ref)).first()
+        if explicit is not None:
+            profile = explicit
+            resolver = "client_reference_id"
     if profile is None:
         dbg = extract_match_debug_fields(payload)
         logger.error(
@@ -632,8 +657,6 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
             updated_fields=[],
             reason_code="missing_profile_match",
         )
-    obj = _object_payload(payload)
-    client_ref = str(_get_scalar(obj, "client_reference_id") or "").strip()
     details = _as_dict(_get_scalar(obj, "customer_details"))
     checkout_email = str(_get_scalar(details, "email") or _get_scalar(obj, "customer_email") or "").strip().lower()
     if client_ref.isdigit():
@@ -779,15 +802,17 @@ def sync_from_subscription(payload: dict, *, event_id: str = "") -> StripeSyncRe
     customer = str(_get_scalar(obj, "customer") or "").strip()
     subscription = str(_get_scalar(obj, "id") or "").strip()
     profile = None
-    if customer:
+    # Prefer subscription id over customer id to avoid cross-profile misrouting
+    # when one Stripe customer is associated with multiple BusinessProfiles.
+    if subscription:
         profile = (
-            BusinessProfile.objects.filter(stripe_customer_id=customer)
+            BusinessProfile.objects.filter(stripe_subscription_id=subscription)
             .order_by("-is_main", "-updated_at")
             .first()
         )
-    if profile is None and subscription:
+    if profile is None and customer:
         profile = (
-            BusinessProfile.objects.filter(stripe_subscription_id=subscription)
+            BusinessProfile.objects.filter(stripe_customer_id=customer)
             .order_by("-is_main", "-updated_at")
             .first()
         )
