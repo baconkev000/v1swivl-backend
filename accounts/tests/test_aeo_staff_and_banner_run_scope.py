@@ -330,16 +330,12 @@ def test_aeo_scheduled_tick_skips_when_disabled(monkeypatch, settings):
 
 
 @pytest.mark.django_db
-def test_staff_seo_snapshot_refresh_post_calls_run_full(monkeypatch):
-    full_calls: list[int] = []
-
-    def fake_run_full(profile, **kwargs):
-        full_calls.append(int(profile.pk))
-        return {"ok": True, "persisted": True}
+def test_staff_seo_snapshot_refresh_post_queues_full_seo_celery_task(monkeypatch):
+    queued: list[int] = []
 
     monkeypatch.setattr(
-        "accounts.seo_snapshot_refresh.run_full_seo_snapshot_for_profile",
-        fake_run_full,
+        "accounts.home_views.sync_enrich_seo_snapshot_for_profile_task.delay",
+        lambda pid: queued.append(int(pid)),
     )
 
     client = Client()
@@ -368,7 +364,7 @@ def test_staff_seo_snapshot_refresh_post_calls_run_full(monkeypatch):
         },
     )
     assert resp.status_code == 302
-    assert full_calls == [profile.id]
+    assert queued == [profile.id]
 
 
 @pytest.mark.django_db

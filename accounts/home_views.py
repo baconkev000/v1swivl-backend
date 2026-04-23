@@ -14,6 +14,7 @@ from django.urls import reverse
 from django.utils.translation import gettext as _
 
 from accounts.models import AEOExecutionRun, BusinessProfile
+from accounts.tasks import sync_enrich_seo_snapshot_for_profile_task
 from accounts.third_party_usage import (
     build_aeo_pass_count_analytics_context,
     build_monthly_aeo_visibility_chart_context,
@@ -179,53 +180,27 @@ def aeo_pass_count_staff_page(request):
                                 "Profile has no website URL; SEO snapshot cannot run.",
                             )
                         else:
-                            from accounts.business_profile_access import workspace_data_user
-                            from accounts.seo_snapshot_refresh import run_full_seo_snapshot_for_profile
-
-                            data_user = workspace_data_user(profile) or profile.user
+                            # Run full ranked + enrich pipeline in Celery so this HTTP request does not block
+                            # on DataForSEO (avoids Gunicorn worker abort / SystemExit on long calls or disconnects).
                             try:
-                                sync_result = run_full_seo_snapshot_for_profile(
-                                    profile,
-                                    data_user_fallback=data_user,
-                                    abort_on_low_coverage=True,
-                                )
+                                sync_enrich_seo_snapshot_for_profile_task.delay(int(profile.pk))
                             except Exception:
                                 logger.exception(
-                                    "[staff aeo pass counts] SEO snapshot refresh failed profile_id=%s",
+                                    "[staff aeo pass counts] SEO snapshot refresh queue failed profile_id=%s",
                                     pid,
                                 )
                                 messages.error(
                                     request,
-                                    "SEO snapshot refresh failed due to an unexpected error. "
+                                    "Could not queue SEO snapshot refresh (Celery broker unreachable or misconfigured). "
                                     "Check server logs.",
                                 )
                             else:
-                                detail = sync_result.get("detail")
-                                if detail in ("ranked_refresh_unavailable", "domain_normalize_failed"):
-                                    messages.error(
-                                        request,
-                                        "SEO snapshot refresh did not return ranked keyword data "
-                                        "(domain could not be resolved, configuration issue, or Labs returned no data).",
-                                    )
-                                elif sync_result.get("aborted_low_coverage"):
-                                    messages.warning(
-                                        request,
-                                        "Ranked keywords were refreshed; keyword enrichment was skipped "
-                                        "because rank coverage was below the safety threshold. "
-                                        f"({detail or 'low coverage'})",
-                                    )
-                                elif sync_result.get("persisted"):
-                                    messages.success(
-                                        request,
-                                        "SEO snapshot refreshed: ranked keywords plus gap/suggested "
-                                        "enrichment and metrics were saved. Next-step and keyword-action "
-                                        "tasks were queued.",
-                                    )
-                                else:
-                                    messages.info(
-                                        request,
-                                        f"SEO snapshot refresh finished with status: {detail or 'unknown'}.",
-                                    )
+                                messages.success(
+                                    request,
+                                    "SEO snapshot refresh queued: ranked keywords plus gap/suggested enrichment "
+                                    "will run in the background (usually a few minutes). Refresh Keywords or Actions "
+                                    "after it completes.",
+                                )
         else:
             messages.error(request, "Unknown action.")
 
