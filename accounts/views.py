@@ -4945,9 +4945,17 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
 
     if request.method == "GET":
         access = viewer_team_access(request.user, profile)
+        force_aeo_refresh = str(request.GET.get("refresh_aeo", "")).strip().lower() in {"1", "true", "yes"}
+        skip_heavy = str(request.GET.get("skip_heavy", "")).strip().lower() in {"1", "true", "yes"}
         serializer = BusinessProfileSerializer(
             profile,
-            context={"request": request, "viewer_access": access},
+            context={
+                "request": request,
+                "viewer_access": access,
+                "force_aeo_refresh": force_aeo_refresh,
+                "disable_seo_context_for_aeo": True,
+                "skip_heavy_profile_metrics": skip_heavy,
+            },
         )
         return Response(serializer.data)
 
@@ -4985,7 +4993,20 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
             except Exception:
                 pass
 
-        return Response(serializer.data)
+        # Default PATCH/PUT response to lightweight metrics so profile saves never block on
+        # live DataForSEO calls (can exceed worker timeout during external crawl requests).
+        skip_heavy_raw = str(request.GET.get("skip_heavy", "")).strip().lower()
+        skip_heavy = True if skip_heavy_raw == "" else skip_heavy_raw in {"1", "true", "yes"}
+        out = BusinessProfileSerializer(
+            profile,
+            context={
+                "request": request,
+                "viewer_access": access,
+                "disable_seo_context_for_aeo": True,
+                "skip_heavy_profile_metrics": skip_heavy,
+            },
+        )
+        return Response(out.data)
 
     # DELETE
     profile.delete()
