@@ -136,9 +136,11 @@ def aeo_effective_custom_prompt_cap_for_profile(profile: BusinessProfile | None)
     )
     if profile is None:
         return base
+    bonus = int(getattr(profile, "aeo_custom_prompt_cap_bonus", 0) or 0)
+    with_bonus = max(0, base + max(0, bonus))
     if aeo_testing_mode():
-        return min(base, aeo_effective_monitored_target_for_profile(profile))
-    return base
+        return min(with_bonus, aeo_effective_monitored_target_for_profile(profile))
+    return with_bonus
 
 
 def aeo_onboarding_complete_min_prompts(profile: BusinessProfile) -> int:

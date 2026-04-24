@@ -177,6 +177,13 @@ class BusinessProfile(models.Model):
     )
     aeo_prompt_expansion_last_error = models.TextField(blank=True, default="")
     aeo_prompt_expansion_updated_at = models.DateTimeField(null=True, blank=True)
+    aeo_custom_prompt_cap_bonus = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Extra custom-prompt slots earned by deleting non-custom suggested prompts; "
+            "applies on top of plan custom cap."
+        ),
+    )
     aeo_full_phase_eta_state = models.JSONField(
         default=dict,
         blank=True,

@@ -10,6 +10,7 @@ from .constants import AEO_RECOMMENDATIONS_TTL, AEO_SNAPSHOT_TTL, SEO_SNAPSHOT_T
 from .domain_utils import normalize_tracked_competitor_domain
 from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot, TrackedCompetitor
 from .aeo.aeo_plan_targets import (
+    aeo_effective_custom_prompt_cap_for_profile,
     aeo_effective_cap_for_validation,
     aeo_effective_monitored_target_for_profile,
     aeo_fallback_global_target_count,
@@ -208,6 +209,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         allow_empty=True,
     )
     aeo_onboarding_prompt_target_count = serializers.SerializerMethodField()
+    aeo_custom_prompt_cap = serializers.SerializerMethodField()
     viewer_team_role = serializers.SerializerMethodField()
     viewer_is_main_account_owner = serializers.SerializerMethodField()
     viewer_can_edit_company_profile = serializers.SerializerMethodField()
@@ -233,6 +235,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "website_url",
             "selected_aeo_prompts",
             "aeo_onboarding_prompt_target_count",
+            "aeo_custom_prompt_cap",
             "aeo_prompt_expansion_status",
             "aeo_prompt_expansion_target",
             "aeo_prompt_expansion_progress",
@@ -291,6 +294,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "id",
             "email",
             "aeo_onboarding_prompt_target_count",
+            "aeo_custom_prompt_cap",
             "aeo_prompt_expansion_status",
             "aeo_prompt_expansion_target",
             "aeo_prompt_expansion_progress",
@@ -355,6 +359,9 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
 
     def get_aeo_onboarding_prompt_target_count(self, obj: BusinessProfile) -> int:
         return aeo_effective_monitored_target_for_profile(obj)
+
+    def get_aeo_custom_prompt_cap(self, obj: BusinessProfile) -> int:
+        return aeo_effective_custom_prompt_cap_for_profile(obj)
 
     def get_tracked_competitors(self, obj: BusinessProfile) -> list[dict]:
         return [

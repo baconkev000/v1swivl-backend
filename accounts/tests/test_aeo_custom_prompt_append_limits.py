@@ -3,6 +3,7 @@ from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
 
 from accounts.aeo.aeo_prompts import AEOPromptType
+from accounts.aeo.aeo_plan_targets import aeo_effective_custom_prompt_cap_for_profile
 from accounts.aeo.aeo_utils import prompt_record
 from accounts.models import BusinessProfile
 
@@ -75,3 +76,73 @@ def test_advanced_plan_blocks_when_at_total_prompt_limit(monkeypatch):
     assert res.status_code == 400
     err = res.json().get("error", "").lower()
     assert "at most 150" in err
+
+
+@pytest.mark.django_db
+def test_delete_suggested_prompt_increments_custom_cap_bonus():
+    user = User.objects.create_user(username="del-suggested@example.com", email="del-suggested@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        plan=BusinessProfile.PLAN_STARTER,
+        selected_aeo_prompts=[
+            prompt_record(
+                "Best accounting software for agencies",
+                prompt_type=AEOPromptType.TRANSACTIONAL,
+                dynamic=True,
+                is_custom=False,
+            ),
+            prompt_record(
+                "What is the best payroll software for startups?",
+                prompt_type=AEOPromptType.TRANSACTIONAL,
+                dynamic=True,
+                is_custom=True,
+            ),
+        ],
+    )
+    before_cap = aeo_effective_custom_prompt_cap_for_profile(profile)
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.delete(
+        "/api/aeo/monitored-prompts/",
+        {"prompt": "Best accounting software for agencies"},
+        format="json",
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["custom_prompt_bonus"] == 1
+    profile.refresh_from_db()
+    assert int(profile.aeo_custom_prompt_cap_bonus or 0) == 1
+    assert aeo_effective_custom_prompt_cap_for_profile(profile) == before_cap + 1
+    saved = list(profile.selected_aeo_prompts or [])
+    assert all("Best accounting software for agencies" != str((x or {}).get("prompt") if isinstance(x, dict) else x) for x in saved)
+
+
+@pytest.mark.django_db
+def test_delete_custom_prompt_is_rejected():
+    user = User.objects.create_user(username="del-custom@example.com", email="del-custom@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        plan=BusinessProfile.PLAN_STARTER,
+        selected_aeo_prompts=[
+            prompt_record(
+                "Custom prompt to keep",
+                prompt_type=AEOPromptType.TRANSACTIONAL,
+                dynamic=True,
+                is_custom=True,
+            ),
+        ],
+    )
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.delete(
+        "/api/aeo/monitored-prompts/",
+        {"prompt": "Custom prompt to keep"},
+        format="json",
+    )
+    assert res.status_code == 400
+    assert "cannot be deleted" in (res.json().get("error") or "").lower()
+    profile.refresh_from_db()
+    assert int(profile.aeo_custom_prompt_cap_bonus or 0) == 0
