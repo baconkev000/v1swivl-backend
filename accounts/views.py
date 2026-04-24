@@ -3225,7 +3225,7 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
 
 
 @csrf_exempt
-@api_view(["POST"])
+@api_view(["POST", "DELETE"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
@@ -3235,13 +3235,17 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     """
     import re
 
-    from .aeo.aeo_plan_targets import aeo_effective_monitored_target_for_profile
+    from .aeo.aeo_plan_targets import (
+        aeo_effective_custom_prompt_cap_for_profile,
+        aeo_effective_monitored_target_for_profile,
+    )
     from .aeo.aeo_prompts import AEOPromptType
     from .aeo.aeo_utils import prompt_record
     from .aeo.prompt_storage import (
         count_custom_prompts_in_selected,
         monitored_prompt_keys_in_order,
         prompt_text_from_storage_row,
+        row_is_custom,
     )
     from .models import AEODashboardBundleCache, AEOExecutionRun
     from .tasks import run_aeo_phase1_execution_task
@@ -3255,6 +3259,56 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
 
     body = request.data if isinstance(request.data, dict) else {}
     prompt_raw = str(body.get("prompt") or "").strip()
+
+    if request.method == "DELETE":
+        if not prompt_raw:
+            return Response({"error": "prompt is required."}, status=400)
+
+        removed = False
+        removed_custom = False
+        with transaction.atomic():
+            locked = BusinessProfile.objects.select_for_update().get(pk=profile.pk)
+            cur = list(locked.selected_aeo_prompts or [])
+            nxt = []
+            for raw in cur:
+                t = prompt_text_from_storage_row(raw)
+                if t and t.casefold() == prompt_raw.casefold():
+                    removed = True
+                    removed_custom = bool(row_is_custom(raw))
+                    continue
+                nxt.append(raw)
+            if not removed:
+                return Response({"error": "Prompt not found on monitored list."}, status=404)
+            if removed_custom:
+                return Response({"error": "Custom prompts cannot be deleted."}, status=400)
+            locked.selected_aeo_prompts = nxt
+            locked.aeo_custom_prompt_cap_bonus = int(
+                max(0, int(locked.aeo_custom_prompt_cap_bonus or 0)) + 1
+            )
+            locked.save(
+                update_fields=[
+                    "selected_aeo_prompts",
+                    "aeo_custom_prompt_cap_bonus",
+                    "updated_at",
+                ]
+            )
+            profile = locked
+
+        profile.refresh_from_db(
+            fields=["selected_aeo_prompts", "aeo_custom_prompt_cap_bonus", "updated_at"]
+        )
+        AEODashboardBundleCache.objects.filter(profile=profile).delete()
+        return Response(
+            {
+                "ok": True,
+                "deleted_prompt": prompt_raw,
+                "monitored_count": len(monitored_prompt_keys_in_order(profile.selected_aeo_prompts)),
+                "custom_prompt_cap": aeo_effective_custom_prompt_cap_for_profile(profile),
+                "custom_prompt_bonus": int(profile.aeo_custom_prompt_cap_bonus or 0),
+            },
+            status=200,
+        )
+
     if not prompt_raw or len(prompt_raw) > 2000:
         return Response({"error": "A non-empty prompt under 2000 characters is required."}, status=400)
 
