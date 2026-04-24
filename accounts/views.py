@@ -3036,6 +3036,27 @@ def _maybe_enqueue_aeo_dashboard_bundle_refresh(
         )
 
 
+def _sanitize_prompt_coverage_monitored_flags(profile: BusinessProfile, payload: dict) -> None:
+    """
+    Recompute ``monitored`` from ``selected_aeo_prompts`` so legacy cached bundles cannot mark
+    snapshot-only rows as monitored (which would make DELETE / append UX hit 404).
+    """
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order, normalize_aeo_prompt_for_match
+
+    monitored_ns = {
+        normalize_aeo_prompt_for_match(k)
+        for k in monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
+    }
+    pl = payload.get("prompts")
+    if not isinstance(pl, list):
+        return
+    for row in pl:
+        if not isinstance(row, dict):
+            continue
+        ns = normalize_aeo_prompt_for_match(str(row.get("prompt") or ""))
+        row["monitored"] = bool(ns) and ns in monitored_ns
+
+
 def _aeo_prompt_coverage_payload_for_api(
     profile: BusinessProfile, *, ready_only: bool, force_refresh: bool
 ) -> dict:
@@ -3054,6 +3075,7 @@ def _aeo_prompt_coverage_payload_for_api(
             profile=profile,
             defaults={"payload_json": payload},
         )
+    _sanitize_prompt_coverage_monitored_flags(profile, payload)
     if ready_only:
         pl = payload.get("prompts") or []
         payload = {
@@ -3244,6 +3266,7 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     from .aeo.prompt_storage import (
         count_custom_prompts_in_selected,
         monitored_prompt_keys_in_order,
+        normalize_aeo_prompt_for_match,
         prompt_text_from_storage_row,
         row_is_custom,
     )
@@ -3272,7 +3295,7 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
             nxt = []
             for raw in cur:
                 t = prompt_text_from_storage_row(raw)
-                if t and t.casefold() == prompt_raw.casefold():
+                if t and normalize_aeo_prompt_for_match(t) == normalize_aeo_prompt_for_match(prompt_raw):
                     removed = True
                     removed_custom = bool(row_is_custom(raw))
                     continue
@@ -3317,13 +3340,22 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     current = list(profile.selected_aeo_prompts or [])
     keys = monitored_prompt_keys_in_order(current)
     custom_n = count_custom_prompts_in_selected(current)
-    if prompt_raw.casefold() in {k.casefold() for k in keys}:
+    new_match_key = normalize_aeo_prompt_for_match(prompt_raw)
+    if new_match_key in {normalize_aeo_prompt_for_match(k) for k in keys}:
         return Response({"error": "That prompt is already on your monitored list."}, status=400)
-    if len(keys) >= cap:
-        return Response({"error": f"You can track at most {cap} prompts on your current plan."}, status=400)
     if custom_n >= custom_cap:
         return Response(
             {"error": f"You can add at most {custom_cap} custom prompts on your current plan."},
+            status=400,
+        )
+    if len(keys) >= cap:
+        return Response(
+            {
+                "error": (
+                    f"You are tracking the maximum of {cap} prompts for your plan. "
+                    "Delete a suggested prompt to free a slot before adding a custom prompt."
+                ),
+            },
             status=400,
         )
 
@@ -3339,14 +3371,28 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     with transaction.atomic():
         locked = BusinessProfile.objects.select_for_update().get(pk=profile.pk)
         cur = list(locked.selected_aeo_prompts or [])
-        kset = {prompt_text_from_storage_row(x).casefold() for x in cur if prompt_text_from_storage_row(x)}
-        if normalized_text.casefold() in kset:
+        kset = {
+            normalize_aeo_prompt_for_match(prompt_text_from_storage_row(x))
+            for x in cur
+            if prompt_text_from_storage_row(x)
+        }
+        if normalize_aeo_prompt_for_match(normalized_text) in kset:
             return Response({"error": "That prompt is already on your monitored list."}, status=400)
-        if len(monitored_prompt_keys_in_order(cur)) >= cap:
-            return Response({"error": f"You can track at most {cap} prompts on your current plan."}, status=400)
-        if count_custom_prompts_in_selected(cur) >= custom_cap:
+        cur_keys = monitored_prompt_keys_in_order(cur)
+        cur_custom_n = count_custom_prompts_in_selected(cur)
+        if cur_custom_n >= custom_cap:
             return Response(
                 {"error": f"You can add at most {custom_cap} custom prompts on your current plan."},
+                status=400,
+            )
+        if len(cur_keys) >= cap:
+            return Response(
+                {
+                    "error": (
+                        f"You are tracking the maximum of {cap} prompts for your plan. "
+                        "Delete a suggested prompt to free a slot before adding a custom prompt."
+                    ),
+                },
                 status=400,
             )
         cur.append(dict(new_row))

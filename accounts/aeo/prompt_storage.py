@@ -8,9 +8,17 @@ Stored rows may be:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Sequence
 
 from .aeo_prompts import AEOPromptType
+
+
+def normalize_aeo_prompt_for_match(text: str) -> str:
+    """
+    Collapse internal whitespace for comparisons (matches how POST append stores custom rows).
+    """
+    return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
 
 
 def prompt_text_from_storage_row(raw: Any) -> str:

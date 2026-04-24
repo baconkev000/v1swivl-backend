@@ -120,6 +120,50 @@ def test_delete_suggested_prompt_increments_custom_cap_bonus():
 
 
 @pytest.mark.django_db
+def test_delete_suggested_matches_whitespace_normalized():
+    """DELETE body collapses whitespace to match legacy string rows (not only dict records)."""
+    user = User.objects.create_user(username="del-ws@example.com", email="del-ws@example.com", password="pw")
+    BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        plan=BusinessProfile.PLAN_STARTER,
+        selected_aeo_prompts=["Best  accounting\nsoftware\tfor agencies"],
+    )
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.delete(
+        "/api/aeo/monitored-prompts/",
+        {"prompt": "Best accounting software for agencies"},
+        format="json",
+    )
+    assert res.status_code == 200
+    assert res.json().get("ok") is True
+
+
+@pytest.mark.django_db
+def test_sanitize_prompt_coverage_monitored_flags_clears_false_monitored():
+    from accounts.views import _sanitize_prompt_coverage_monitored_flags
+
+    user = User.objects.create_user(username="san-mon@example.com", email="san-mon@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        plan=BusinessProfile.PLAN_STARTER,
+        selected_aeo_prompts=["Stored prompt alpha"],
+    )
+    payload = {
+        "prompts": [
+            {"prompt": "Stored prompt alpha", "monitored": True},
+            {"prompt": "Snapshot only beta", "monitored": True},
+        ]
+    }
+    _sanitize_prompt_coverage_monitored_flags(profile, payload)
+    rows = payload["prompts"]
+    assert rows[0]["monitored"] is True
+    assert rows[1]["monitored"] is False
+
+
+@pytest.mark.django_db
 def test_delete_custom_prompt_is_rejected():
     user = User.objects.create_user(username="del-custom@example.com", email="del-custom@example.com", password="pw")
     profile = BusinessProfile.objects.create(

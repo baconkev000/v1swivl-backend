@@ -3,10 +3,11 @@ import json
 from datetime import datetime
 
 from django import forms
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.core.exceptions import ValidationError
 from django.forms.models import BaseInlineFormSet
 from django.http import HttpResponse
+from django.urls import reverse
 from django.utils.html import escape, format_html
 
 from .models import (
@@ -201,6 +202,11 @@ class AEOResponseSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 
 @admin.register(AEOExecutionRun)
 class AEOExecutionRunAdmin(CsvExportAdminMixin, admin.ModelAdmin):
+    actions = (
+        "export_as_csv",
+        "queue_retry_missing_phase3_extractions",
+        "queue_retry_missing_phase3_extractions_perplexity",
+    )
     list_display = (
         "id",
         "profile",
@@ -221,6 +227,34 @@ class AEOExecutionRunAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_filter = ("status", "fetch_mode", "background_status", "extraction_status", "scoring_status", "created_at")
     search_fields = ("profile__business_name", "profile__user__email")
     raw_id_fields = ("profile",)
+
+    @admin.action(description="AEO: queue Phase-3 retry for snapshots missing extractions (slow / 1 worker)")
+    def queue_retry_missing_phase3_extractions(self, request, queryset):
+        from .tasks import retry_aeo_missing_extractions_for_run_task
+
+        n = 0
+        for run in queryset:
+            retry_aeo_missing_extractions_for_run_task.delay(run.id, None, 1)
+            n += 1
+        self.message_user(
+            request,
+            f"Queued Phase-3 extraction retry for {n} run(s) (all platforms missing extractions, max 1 worker).",
+            messages.SUCCESS,
+        )
+
+    @admin.action(description="AEO: queue Phase-3 retry — Perplexity only (rate-limit friendly)")
+    def queue_retry_missing_phase3_extractions_perplexity(self, request, queryset):
+        from .tasks import retry_aeo_missing_extractions_for_run_task
+
+        n = 0
+        for run in queryset:
+            retry_aeo_missing_extractions_for_run_task.delay(run.id, "perplexity", 1)
+            n += 1
+        self.message_user(
+            request,
+            f"Queued Perplexity-only Phase-3 retry for {n} run(s).",
+            messages.SUCCESS,
+        )
 
 
 @admin.register(AEOPromptExecutionAggregate)
@@ -401,6 +435,11 @@ class ThirdPartyApiErrorLogInline(admin.TabularInline):
 
 @admin.register(BusinessProfile)
 class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
+    actions = (
+        "export_as_csv",
+        "queue_aeo_latest_run_phase3_retry_missing",
+        "queue_aeo_latest_run_phase3_retry_missing_perplexity",
+    )
     list_display = (
         "id",
         "user",
@@ -420,7 +459,11 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         BusinessProfileMembershipInline,
         ThirdPartyApiErrorLogInline,
     )
-    readonly_fields = ("created_at", "updated_at")
+    readonly_fields = (
+        "created_at",
+        "updated_at",
+        "aeo_latest_run_missing_extractions_display",
+    )
     fieldsets = (
         (
             None,
@@ -468,7 +511,10 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         (
             "AEO monitored prompts",
             {
-                "fields": ("selected_aeo_prompts",),
+                "fields": (
+                    "selected_aeo_prompts",
+                    "aeo_latest_run_missing_extractions_display",
+                ),
             },
         ),
         (
@@ -502,6 +548,74 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         if t is not None:
             return f"{p} / {t}"
         return str(p)
+
+    @admin.display(description="Latest AEO run — response snapshots missing Phase-3 extraction")
+    def aeo_latest_run_missing_extractions_display(self, obj: BusinessProfile) -> str:
+        if not obj.pk:
+            return "—"
+        from .aeo.extraction_retry import list_aeo_response_snapshot_ids_missing_extractions
+
+        run = AEOExecutionRun.objects.filter(profile=obj).order_by("-created_at", "-id").first()
+        if run is None:
+            return "No AEO execution runs for this profile."
+        missing = list_aeo_response_snapshot_ids_missing_extractions(run.id)
+        missing_p = list_aeo_response_snapshot_ids_missing_extractions(run.id, platform="perplexity")
+        url = reverse("admin:accounts_aeoexecutionrun_change", args=[run.id])
+        if not missing:
+            return format_html(
+                'None missing on latest run <a href="{}">#{}</a>.',
+                url,
+                run.id,
+            )
+        return format_html(
+            '<strong>{}</strong> snapshot(s) missing any extraction on run <a href="{}">#{}</a> '
+            "({} Perplexity). On the changelist, use action "
+            "<em>AEO: queue Phase-3 retry on latest run (missing extractions)</em>.",
+            len(missing),
+            url,
+            run.id,
+            len(missing_p),
+        )
+
+    @admin.action(description="AEO: queue Phase-3 retry on latest run (missing extractions, slow)")
+    def queue_aeo_latest_run_phase3_retry_missing(self, request, queryset):
+        from .tasks import retry_aeo_missing_extractions_for_run_task
+
+        queued = 0
+        skipped = 0
+        for profile in queryset:
+            run = AEOExecutionRun.objects.filter(profile=profile).order_by("-created_at", "-id").first()
+            if run is None:
+                skipped += 1
+                continue
+            retry_aeo_missing_extractions_for_run_task.delay(run.id, None, 1)
+            queued += 1
+        self.message_user(
+            request,
+            f"Queued Phase-3 extraction retry for latest run on {queued} profile(s). "
+            f"Skipped profiles with no runs: {skipped}.",
+            messages.SUCCESS,
+        )
+
+    @admin.action(description="AEO: queue Phase-3 retry on latest run — Perplexity missing only")
+    def queue_aeo_latest_run_phase3_retry_missing_perplexity(self, request, queryset):
+        from .tasks import retry_aeo_missing_extractions_for_run_task
+
+        queued = 0
+        skipped = 0
+        for profile in queryset:
+            run = AEOExecutionRun.objects.filter(profile=profile).order_by("-created_at", "-id").first()
+            if run is None:
+                skipped += 1
+                continue
+            retry_aeo_missing_extractions_for_run_task.delay(run.id, "perplexity", 1)
+            queued += 1
+        self.message_user(
+            request,
+            f"Queued Perplexity-only Phase-3 retry for latest run on {queued} profile(s). "
+            f"Skipped: {skipped}.",
+            messages.SUCCESS,
+        )
 
 
 @admin.register(TrackedCompetitor)

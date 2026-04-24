@@ -1583,6 +1583,87 @@ def run_aeo_phase3_extraction_task(
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def retry_aeo_missing_extractions_for_run_task(
+    self,
+    execution_run_id: int,
+    platform: str | None = None,
+    max_workers_cap: int | None = 1,
+) -> None:
+    """
+    Re-run Phase-3 extraction for response snapshots on one execution run that have
+    no ``AEOExtractionSnapshot`` rows (e.g. after rate limits caused silent skips).
+
+    Does not flip ``AEOExecutionRun.extraction_status`` or re-chain Phase 2/4/5, so it is
+    safe after a run has already completed orchestration. Refreshes dashboard bundle cache.
+    """
+    from .aeo.extraction_retry import list_aeo_response_snapshot_ids_missing_extractions
+    from .aeo.worker_limits import aeo_execution_max_workers
+    from .models import AEOExecutionRun
+
+    rid = int(execution_run_id)
+    run = AEOExecutionRun.objects.select_related("profile").filter(pk=rid).first()
+    if not run:
+        logger.warning("[AEO phase3 retry] run not found run_id=%s", rid)
+        return
+
+    plat_filter: str | None = None
+    if platform is not None:
+        p = str(platform).strip().lower()
+        plat_filter = p or None
+    snapshot_ids = list_aeo_response_snapshot_ids_missing_extractions(rid, platform=plat_filter)
+    if not snapshot_ids:
+        logger.info(
+            "[AEO phase3 retry] nothing to do run_id=%s profile_id=%s platform=%s",
+            rid,
+            run.profile_id,
+            plat_filter or "all",
+        )
+        return
+
+    cap = max_workers_cap if max_workers_cap is not None else 1
+    max_workers = max(1, min(aeo_execution_max_workers(), int(cap)))
+    started_at = run.started_at
+    created_count = 0
+    failed_count = 0
+
+    logger.info(
+        "[AEO phase3 retry] start run_id=%s profile_id=%s snapshots=%s max_workers=%s platform=%s",
+        rid,
+        run.profile_id,
+        len(snapshot_ids),
+        max_workers,
+        plat_filter or "all",
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(_aeo_phase3_extract_one_snapshot, sid, started_at) for sid in snapshot_ids
+            ]
+            for fut in as_completed(futures):
+                c_inc, f_inc = fut.result()
+                created_count += c_inc
+                failed_count += f_inc
+    except Exception:
+        logger.exception(
+            "[AEO phase3 retry] batch failed run_id=%s profile_id=%s",
+            rid,
+            run.profile_id,
+        )
+        raise
+
+    logger.info(
+        "[AEO phase3 retry] done run_id=%s profile_id=%s created=%s failed=%s",
+        rid,
+        run.profile_id,
+        created_count,
+        failed_count,
+    )
+    refresh_competitor_snapshot_for_profile_task.delay(run.profile_id)
+    refresh_aeo_dashboard_bundle_cache_task.delay(run.profile_id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def refresh_competitor_snapshot_for_profile_task(self, profile_id: int) -> None:
     from .aeo.competitor_snapshots import compute_and_save_competitor_snapshot
     from .models import BusinessProfile
