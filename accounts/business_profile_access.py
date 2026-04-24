@@ -14,8 +14,12 @@ from typing import Any
 
 from django.contrib.auth.models import AnonymousUser
 from django.db.models import Q
+from django.http import HttpRequest
 
 from .models import BusinessProfile, BusinessProfileMembership, OrganizationMembership
+
+# Persisted per Django session: which BusinessProfile the shell should open.
+ACTIVE_BUSINESS_PROFILE_SESSION_KEY = "active_business_profile_id"
 
 
 def should_create_owned_main_business_profile_for_user(user: Any) -> bool:
@@ -76,6 +80,60 @@ def resolve_main_business_profile_for_user(user: Any) -> BusinessProfile | None:
     then fall back to profiles they own.
     """
     profile, _source = resolve_main_business_profile_for_user_with_source(user)
+    return profile
+
+
+def set_session_active_business_profile_for_user(request: HttpRequest, user: Any, profile_id: int | None) -> bool:
+    """
+    Store (or clear) the UI workspace selection in the session.
+
+    ``profile_id`` must be a profile the user may access, or None to clear the override.
+    Returns False if a non-None id is not accessible.
+    """
+    if not hasattr(request, "session"):
+        return False
+    if profile_id is None:
+        request.session.pop(ACTIVE_BUSINESS_PROFILE_SESSION_KEY, None)
+        request.session.modified = True
+        return True
+    prof = get_business_profile_for_user(user, int(profile_id))
+    if prof is None:
+        return False
+    request.session[ACTIVE_BUSINESS_PROFILE_SESSION_KEY] = int(prof.pk)
+    request.session.modified = True
+    return True
+
+
+def resolve_workspace_business_profile_for_request_with_source(request: HttpRequest) -> tuple[BusinessProfile | None, str]:
+    """
+    Active workspace for API handlers that have a request (session-aware).
+
+    If the session holds a valid accessible profile id, use it; otherwise fall back to
+    ``resolve_main_business_profile_for_user_with_source`` (team vs owned rules).
+    """
+    user = getattr(request, "user", None)
+    if user is None or isinstance(user, AnonymousUser) or not user.is_authenticated:
+        return None, "unauthenticated"
+
+    raw = request.session.get(ACTIVE_BUSINESS_PROFILE_SESSION_KEY)
+    if raw is not None:
+        try:
+            pk = int(raw)
+        except (TypeError, ValueError):
+            request.session.pop(ACTIVE_BUSINESS_PROFILE_SESSION_KEY, None)
+            request.session.modified = True
+        else:
+            prof = get_business_profile_for_user(user, pk)
+            if prof is not None:
+                return prof, "session_active"
+            request.session.pop(ACTIVE_BUSINESS_PROFILE_SESSION_KEY, None)
+            request.session.modified = True
+
+    return resolve_main_business_profile_for_user_with_source(user)
+
+
+def resolve_workspace_business_profile_for_request(request: HttpRequest) -> BusinessProfile | None:
+    profile, _src = resolve_workspace_business_profile_for_request_with_source(request)
     return profile
 
 

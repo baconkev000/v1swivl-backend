@@ -27,8 +27,10 @@ from .business_profile_access import (
     get_business_profile_for_user,
     get_membership,
     remove_organization_membership_for_main_team_leave,
-    resolve_main_business_profile_for_user,
     resolve_main_business_profile_for_user_with_source,
+    resolve_workspace_business_profile_for_request,
+    resolve_workspace_business_profile_for_request_with_source,
+    set_session_active_business_profile_for_user,
     should_create_owned_main_business_profile_for_user,
     sync_organization_membership_for_main_team_invite,
     viewer_team_access,
@@ -41,6 +43,7 @@ from .models import (
     AgentActivityLog,
     BusinessProfile,
     BusinessProfileMembership,
+    Organization,
     SEOOverviewSnapshot,
     AgentConversation,
     AgentMessage,
@@ -487,7 +490,7 @@ def auth_status(request: HttpRequest) -> Response:
     except Exception:
         logger.exception("[auth_status] business profile check failed")
         onboarding_complete = False
-    profile, resolution_source = resolve_main_business_profile_for_user_with_source(request.user)
+    profile, resolution_source = resolve_workspace_business_profile_for_request_with_source(request)
     logger.info(
         "[auth_status] user_id=%s onboarding_complete=%s resolved_profile_id=%s resolution_source=%s",
         request.user.id,
@@ -878,7 +881,7 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
                     status=404,
                 )
         else:
-            profile = resolve_main_business_profile_for_user(request.user)
+            profile = resolve_workspace_business_profile_for_request(request)
             if profile is None:
                 if not should_create_owned_main_business_profile_for_user(request.user):
                     return Response(
@@ -1348,7 +1351,7 @@ def seo_overview(request: HttpRequest) -> Response:
     cache_ttl = int(THIRD_PARTY_CACHE_TTL.total_seconds())
     force_refresh = request.GET.get("refresh") == "1"
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response(
             {"detail": "No active business profile."},
@@ -1566,7 +1569,7 @@ def seo_keywords(request: HttpRequest) -> Response:
     """
     force_refresh = request.GET.get("refresh") == "1"
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     data_user = workspace_data_user(profile) or request.user
     site_url = profile.website_url if profile and profile.website_url else ""
     if not site_url:
@@ -1695,7 +1698,7 @@ def seo_keyword_debug(request: HttpRequest) -> Response:
 
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"detail": "No active business profile."}, status=404)
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
@@ -1829,7 +1832,7 @@ def business_profile(request: HttpRequest) -> Response:
     to avoid paid API calls when only updating basic fields.
     """
     _reconcile_request_user_identity(request, reason="business_profile")
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if profile is None:
         if not should_create_owned_main_business_profile_for_user(request.user):
             return Response({"error": "No active business profile."}, status=404)
@@ -1913,11 +1916,55 @@ def business_profile(request: HttpRequest) -> Response:
 
 
 @csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def business_profile_set_active(request: HttpRequest) -> Response:
+    """
+    Choose which accessible BusinessProfile the app shell uses (session-scoped).
+
+    Org-wide team members can switch to any site in the org without mutating ``is_main``.
+
+    If the caller is ``Organization.owner_user`` for the profile's organization, we also
+    move ``is_main`` to that site so billing / ordering stay aligned with the dropdown.
+    """
+    _reconcile_request_user_identity(request, reason="business_profile_set_active")
+    body = getattr(request, "data", None) or {}
+    if not isinstance(body, dict):
+        body = {}
+    raw = body.get("business_profile_id", body.get("id"))
+    if raw is None:
+        return Response({"detail": "business_profile_id is required."}, status=400)
+    try:
+        pk = int(raw)
+    except (TypeError, ValueError):
+        return Response({"detail": "Invalid business_profile_id."}, status=400)
+
+    profile = get_business_profile_for_user(request.user, pk)
+    if profile is None:
+        return Response({"detail": "Not found."}, status=404)
+
+    oid = getattr(profile, "organization_id", None)
+    if oid:
+        org = Organization.objects.filter(pk=int(oid)).first()
+        if org is not None and int(org.owner_user_id) == int(request.user.id):
+            BusinessProfile.objects.filter(organization_id=int(oid)).exclude(pk=profile.pk).update(
+                is_main=False
+            )
+            BusinessProfile.objects.filter(pk=profile.pk).update(is_main=True)
+
+    if not set_session_active_business_profile_for_user(request, request.user, int(profile.pk)):
+        return Response({"detail": "Not found."}, status=404)
+
+    return Response({"ok": True, "business_profile_id": int(profile.pk)})
+
+
+@csrf_exempt
 @api_view(["GET", "POST"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def business_profile_team(request: HttpRequest) -> Response:
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
 
@@ -1991,7 +2038,7 @@ def business_profile_team(request: HttpRequest) -> Response:
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def business_profile_team_member(request: HttpRequest, user_id: int) -> Response:
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
     if not viewer_team_access(request.user, profile)["viewer_can_manage_team"]:
@@ -2016,7 +2063,7 @@ def business_profile_team_member(request: HttpRequest, user_id: int) -> Response
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def business_profile_checkout_identity(request: HttpRequest) -> Response:
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
     access = viewer_team_access(request.user, profile)
@@ -2040,7 +2087,7 @@ def billing_summary(request: HttpRequest) -> Response:
     """
     Stripe-backed billing summary for the authenticated user's main business profile.
     """
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
     access = viewer_team_access(request.user, profile)
@@ -2277,7 +2324,7 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
             return Response({"error": "Business profile not found."}, status=404)
         profile = target_profile
     else:
-        profile = resolve_main_business_profile_for_user(request.user)
+        profile = resolve_workspace_business_profile_for_request(request)
         if profile is None:
             return Response({"error": "No active business profile."}, status=404)
     access = viewer_team_access(request.user, profile)
@@ -2330,7 +2377,7 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def seo_profile_data(request: HttpRequest) -> Response:
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         if not should_create_owned_main_business_profile_for_user(request.user):
             return Response({"error": "No active business profile."}, status=404)
@@ -2386,7 +2433,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
     Return SEO score points (search_performance_score) from all matching
     SEOOverviewSnapshot rows for the authenticated user + current profile domain.
     """
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"points": []})
 
@@ -2457,7 +2504,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def aeo_profile_data(request: HttpRequest) -> Response:
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         if not should_create_owned_main_business_profile_for_user(request.user):
             return Response({"error": "No active business profile."}, status=404)
@@ -3221,7 +3268,7 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
     Cached-only prompt coverage read for AI Visibility UI.
     One row per unique prompt text; per-platform (OpenAI / Gemini / Perplexity) citation from latest snapshot each.
     """
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response(
             {
@@ -3288,7 +3335,7 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     from .models import AEODashboardBundleCache, AEOExecutionRun
     from .tasks import run_aeo_phase1_execution_task
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if profile is None:
         return Response({"error": "No active business profile."}, status=404)
     access = viewer_team_access(request.user, profile)
@@ -3463,7 +3510,7 @@ def aeo_mark_recommendation_complete(request: HttpRequest) -> Response:
     """
     from .models import AEORecommendationRun
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"error": "Business profile not found."}, status=404)
 
@@ -3530,7 +3577,7 @@ def actions_generate_page_preview(request: HttpRequest) -> Response:
     (keyword, assets, plan steps, business context lines, etc.) so previews refresh when
     card content changes.
     """
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"error": "Business profile not found."}, status=404)
 
@@ -3614,7 +3661,7 @@ def aeo_platform_visibility_data(request: HttpRequest) -> Response:
     OpenAI (ChatGPT), Gemini, and Perplexity are computed from stored snapshots when present.
     Other platforms return 0% until integrations exist (frontend still shows them).
     """
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"platforms": []})
 
@@ -3654,7 +3701,7 @@ def aeo_share_of_voice_data(request: HttpRequest) -> Response:
     """
     from .aeo.aeo_scoring_utils import aggregate_aeo_share_of_voice
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response(
             {
@@ -3691,7 +3738,7 @@ def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
         if profile is None:
             return Response({"has_data": False, "total_prompts": 0, "rows": []}, status=404)
     else:
-        profile = resolve_main_business_profile_for_user(request.user)
+        profile = resolve_workspace_business_profile_for_request(request)
         if not profile:
             return Response({"has_data": False, "total_prompts": 0, "rows": []})
     return Response(aeo_onboarding_competitors_visibility(profile))
@@ -3708,7 +3755,7 @@ def aeo_competitors_data(request: HttpRequest) -> Response:
     """
     from .aeo.competitor_snapshots import compute_and_save_competitor_snapshot
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if profile is not None:
         profile = (
             BusinessProfile.objects.filter(pk=profile.pk)
@@ -3839,7 +3886,7 @@ def aeo_pipeline_status_data(request: HttpRequest) -> Response:
     from .aeo.aeo_scoring_utils import composite_aeo_score_from_snapshot
     from .models import AEOExecutionRun, AEORecommendationRun, AEOScoreSnapshot
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response(
             {
@@ -3967,7 +4014,7 @@ def aeo_pass_count_analytics_data(request: HttpRequest) -> Response:
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def refresh_aeo_snapshot(request: HttpRequest) -> Response:
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
     logger.info(
@@ -4002,7 +4049,7 @@ def aeo_refresh_execution(request: HttpRequest) -> Response:
     from .models import AEOExecutionRun
     from .tasks import run_aeo_phase1_execution_task
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -4105,7 +4152,7 @@ def refresh_aeo_gemini(request: HttpRequest) -> Response:
     from .models import AEOExecutionRun
     from .tasks import run_aeo_gemini_refresh_task
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -4178,7 +4225,7 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
     from .models import AEOExecutionRun
     from .tasks import run_aeo_perplexity_refresh_task
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -4250,7 +4297,7 @@ def aeo_retry_prompt_expansion(request: HttpRequest) -> Response:
     """
     from .tasks import schedule_aeo_prompt_plan_expansion
 
-    profile = resolve_main_business_profile_for_user(request.user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         return Response({"detail": "No main business profile is configured."}, status=400)
 
@@ -4510,7 +4557,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
         if profile is None:
             return Response({"error": "Business profile not found for this account."}, status=404)
     else:
-        profile = resolve_main_business_profile_for_user(request.user)
+        profile = resolve_workspace_business_profile_for_request(request)
     if not profile:
         if not should_create_owned_main_business_profile_for_user(request.user):
             return Response({"error": "No active business profile."}, status=404)
@@ -4890,7 +4937,7 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
     start_current = today.replace(day=1)
     user = request.user
 
-    profile = resolve_main_business_profile_for_user(user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile or not profile.website_url:
         return Response(
             {"detail": "No main business profile with a website URL is configured."},
@@ -4988,7 +5035,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
     """
     user = request.user
 
-    profile = resolve_main_business_profile_for_user(user)
+    profile = resolve_workspace_business_profile_for_request(request)
     if not profile or not profile.website_url:
         return Response(
             {"detail": "No main business profile with a website URL is configured."},
@@ -5108,6 +5155,7 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
                 ).update(is_main=False)
             else:
                 BusinessProfile.objects.filter(user=request.user).exclude(pk=profile.pk).update(is_main=False)
+            set_session_active_business_profile_for_user(request, request.user, int(profile.pk))
 
         # If the website URL changed, refresh SEO snapshot for this site.
         new_site_url = profile.website_url

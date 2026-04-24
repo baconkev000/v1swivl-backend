@@ -61,6 +61,11 @@ urlpatterns += [
     ),
     # Business profile for settings page (main profile) + list/create/update profiles
     path("api/business-profile/", accounts_views.business_profile, name="business-profile"),
+    path(
+        "api/business-profile/set-active/",
+        accounts_views.business_profile_set_active,
+        name="business-profile-set-active",
+    ),
     path("api/business-profile/team/", accounts_views.business_profile_team, name="business-profile-team"),
     path(
         "api/business-profile/team/<int:user_id>/",
