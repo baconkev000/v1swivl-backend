@@ -317,10 +317,22 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "onboarding_complete",
         ]
 
-    def _viewer_access_dict(self) -> dict:
+    def _viewer_access_dict(self, obj: BusinessProfile | None = None) -> dict:
+        """
+        Resolve viewer flags for the row being serialized.
+
+        With ``many=True``, ``self.instance`` may be a queryset/list — always prefer the
+        ``obj`` passed into SerializerMethodField getters.
+        """
+        profile: BusinessProfile | None = obj if isinstance(obj, BusinessProfile) else None
+        if profile is None:
+            inst = getattr(self, "instance", None)
+            if isinstance(inst, BusinessProfile):
+                profile = inst
+
         resolver = self.context.get("viewer_access_resolver")
-        if callable(resolver) and getattr(self, "instance", None) is not None:
-            resolved = resolver(self.instance)
+        if callable(resolver) and profile is not None:
+            resolved = resolver(profile)
             if isinstance(resolved, dict) and resolved:
                 return resolved
         raw = self.context.get("viewer_access")
@@ -335,19 +347,19 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         }
 
     def get_viewer_team_role(self, obj: BusinessProfile) -> str:
-        return str(self._viewer_access_dict().get("viewer_team_role") or "owner")
+        return str(self._viewer_access_dict(obj).get("viewer_team_role") or "owner")
 
     def get_viewer_is_main_account_owner(self, obj: BusinessProfile) -> bool:
-        return bool(self._viewer_access_dict().get("viewer_is_main_account_owner"))
+        return bool(self._viewer_access_dict(obj).get("viewer_is_main_account_owner"))
 
     def get_viewer_can_edit_company_profile(self, obj: BusinessProfile) -> bool:
-        return bool(self._viewer_access_dict().get("viewer_can_edit_company_profile", True))
+        return bool(self._viewer_access_dict(obj).get("viewer_can_edit_company_profile", True))
 
     def get_viewer_can_access_billing(self, obj: BusinessProfile) -> bool:
-        return bool(self._viewer_access_dict().get("viewer_can_access_billing", True))
+        return bool(self._viewer_access_dict(obj).get("viewer_can_access_billing", True))
 
     def get_viewer_can_manage_team(self, obj: BusinessProfile) -> bool:
-        return bool(self._viewer_access_dict().get("viewer_can_manage_team", True))
+        return bool(self._viewer_access_dict(obj).get("viewer_can_manage_team", True))
 
     def get_viewer_email(self, obj: BusinessProfile) -> str:
         req = self.context.get("request")
