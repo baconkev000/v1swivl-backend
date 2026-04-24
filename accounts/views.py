@@ -3397,11 +3397,12 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
     if not prompt_raw or len(prompt_raw) > 2000:
         return Response({"error": "A non-empty prompt under 2000 characters is required."}, status=400)
 
-    cap = aeo_effective_monitored_target_for_profile(profile)
+    suggested_cap = aeo_effective_monitored_target_for_profile(profile)
     custom_cap = aeo_effective_custom_prompt_cap_for_profile(profile)
     current = list(profile.selected_aeo_prompts or [])
     keys = monitored_prompt_keys_in_order(current)
     custom_n = count_custom_prompts_in_selected(current)
+    suggested_n = len(keys) - custom_n
     new_match_key = normalize_aeo_prompt_for_match(prompt_raw)
     if new_match_key in {normalize_aeo_prompt_for_match(k) for k in keys}:
         return Response({"error": "That prompt is already on your monitored list."}, status=400)
@@ -3410,12 +3411,12 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
             {"error": f"You can add at most {custom_cap} custom prompts on your current plan."},
             status=400,
         )
-    if len(keys) >= cap:
+    if suggested_n > suggested_cap:
         return Response(
             {
                 "error": (
-                    f"You are tracking the maximum of {cap} prompts for your plan. "
-                    "Delete a suggested prompt to free a slot before adding a custom prompt."
+                    f"You have {suggested_n} suggested prompts but your plan allows at most {suggested_cap}. "
+                    "Remove suggested prompts before adding custom prompts."
                 ),
             },
             status=400,
@@ -3442,17 +3443,18 @@ def aeo_monitored_prompt_append(request: HttpRequest) -> Response:
             return Response({"error": "That prompt is already on your monitored list."}, status=400)
         cur_keys = monitored_prompt_keys_in_order(cur)
         cur_custom_n = count_custom_prompts_in_selected(cur)
+        cur_suggested_n = len(cur_keys) - cur_custom_n
         if cur_custom_n >= custom_cap:
             return Response(
                 {"error": f"You can add at most {custom_cap} custom prompts on your current plan."},
                 status=400,
             )
-        if len(cur_keys) >= cap:
+        if cur_suggested_n > suggested_cap:
             return Response(
                 {
                     "error": (
-                        f"You are tracking the maximum of {cap} prompts for your plan. "
-                        "Delete a suggested prompt to free a slot before adding a custom prompt."
+                        f"You have {cur_suggested_n} suggested prompts but your plan allows at most {suggested_cap}. "
+                        "Remove suggested prompts before adding custom prompts."
                     ),
                 },
                 status=400,

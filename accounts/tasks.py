@@ -2266,6 +2266,15 @@ def _clean_profile_prompts_for_expansion(profile) -> list[str]:
     return monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
 
 
+def _suggested_monitored_keys_for_profile(profile) -> list[str]:
+    """Unique suggested (non-custom) prompt texts — expansion cap applies to this pool only."""
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order, row_is_custom
+
+    raw = list(getattr(profile, "selected_aeo_prompts", None) or [])
+    suggested_only = [r for r in raw if not (isinstance(r, dict) and row_is_custom(r))]
+    return monitored_prompt_keys_in_order(suggested_only)
+
+
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def aeo_backfill_monitored_prompt_execution_task(
     self,
@@ -2514,6 +2523,7 @@ def schedule_aeo_prompt_plan_expansion(
     mode still short-circuits via ``aeo_should_run_post_payment_expansion``.
     """
     from .aeo.aeo_utils import aeo_business_input_from_onboarding_payload, build_full_aeo_prompt_plan
+    from .aeo.prompt_storage import row_is_custom
     from .dataforseo_utils import normalize_domain
     from .models import BusinessProfile, OnboardingOnPageCrawl
 
@@ -2552,7 +2562,7 @@ def schedule_aeo_prompt_plan_expansion(
         touch(
             aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
             aeo_prompt_expansion_target=cap_meta,
-            aeo_prompt_expansion_progress=len(_clean_profile_prompts_for_expansion(profile)),
+            aeo_prompt_expansion_progress=len(_suggested_monitored_keys_for_profile(profile)),
             aeo_prompt_expansion_last_error="",
             aeo_prompt_expansion_updated_at=now,
         )
@@ -2566,7 +2576,7 @@ def schedule_aeo_prompt_plan_expansion(
     if cap < 1:
         cap = aeo_effective_monitored_target_for_profile(profile)
 
-    existing = _clean_profile_prompts_for_expansion(profile)
+    existing = _suggested_monitored_keys_for_profile(profile)
     if len(existing) >= cap:
         touch(
             aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
@@ -2664,11 +2674,16 @@ def schedule_aeo_prompt_plan_expansion(
             ),
         )
 
+        profile.refresh_from_db()
+        raw_selected = list(profile.selected_aeo_prompts or [])
+        custom_rows = [r for r in raw_selected if isinstance(r, dict) and row_is_custom(r)]
+        merge_existing = _suggested_monitored_keys_for_profile(profile)
+
         logger.info(
             "[AEO expansion] openai_generate profile_id=%s cap=%s have=%s http_bounds=%s",
             pid,
             cap,
-            len(existing),
+            len(merge_existing),
             aeo_http_call_bounds_for_monitoring(cap),
         )
 
@@ -2680,10 +2695,10 @@ def schedule_aeo_prompt_plan_expansion(
             target_combined_count=cap,
         )
         combined = list(plan.get("combined") or [])
-        seen = {x.casefold() for x in existing}
-        merged = list(existing)
+        seen = {x.casefold() for x in merge_existing}
+        merged_suggested = list(merge_existing)
         for item in combined:
-            if len(merged) >= cap:
+            if len(merged_suggested) >= cap:
                 break
             t = str(item.get("prompt") or "").strip()
             if not t:
@@ -2691,34 +2706,35 @@ def schedule_aeo_prompt_plan_expansion(
             k = t.casefold()
             if k in seen:
                 continue
-            merged.append(t)
+            merged_suggested.append(t)
             seen.add(k)
 
-        profile.refresh_from_db()
-        profile.selected_aeo_prompts = merged[:cap]
+        merged_suggested = merged_suggested[:cap]
+        profile.selected_aeo_prompts = merged_suggested + custom_rows
         profile.save(update_fields=["selected_aeo_prompts", "updated_at"])
-        final_n = len(_clean_profile_prompts_for_expansion(profile))
+        suggested_final_n = len(_suggested_monitored_keys_for_profile(profile))
+        total_monitored_n = len(_clean_profile_prompts_for_expansion(profile))
         meta = plan.get("meta") if isinstance(plan.get("meta"), dict) else {}
         err_tail = ""
-        if final_n < cap:
+        if suggested_final_n < cap:
             err_tail = (
-                f"partial_expansion target={cap} got={final_n} openai_status={meta.get('openai_status')}"
+                f"partial_expansion target={cap} got={suggested_final_n} openai_status={meta.get('openai_status')}"
             )[:2000]
         touch(
             aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
             aeo_prompt_expansion_target=cap,
-            aeo_prompt_expansion_progress=final_n,
+            aeo_prompt_expansion_progress=suggested_final_n,
             aeo_prompt_expansion_last_error=err_tail,
             aeo_prompt_expansion_updated_at=django_tz.now(),
         )
-        logger.info("[AEO expansion] complete profile_id=%s final=%s target=%s", pid, final_n, cap)
+        logger.info("[AEO expansion] complete profile_id=%s final=%s target=%s", pid, suggested_final_n, cap)
 
-        before_key_set = {x.casefold() for x in existing}
-        after_key_set = {x.casefold() for x in _clean_profile_prompts_for_expansion(profile)}
+        before_key_set = {x.casefold() for x in merge_existing}
+        after_key_set = {x.casefold() for x in _suggested_monitored_keys_for_profile(profile)}
         added_keys = after_key_set - before_key_set
         if added_keys:
-            before_n = len(existing)
-            ac_after = final_n
+            before_n = len(merge_existing)
+            ac_after = total_monitored_n
 
             def _enqueue_backfill() -> None:
                 try:

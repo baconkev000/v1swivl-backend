@@ -11,8 +11,10 @@ from .domain_utils import normalize_tracked_competitor_domain
 from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot, TrackedCompetitor
 from .aeo.aeo_plan_targets import (
     aeo_effective_custom_prompt_cap_for_profile,
+    aeo_effective_custom_prompt_cap_for_validation,
     aeo_effective_cap_for_validation,
     aeo_effective_monitored_target_for_profile,
+    aeo_effective_total_selected_slots_for_validation,
     aeo_fallback_global_target_count,
     aeo_onboarding_min_for_validation,
 )
@@ -445,8 +447,8 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         except ValueError as exc:
             raise serializers.ValidationError(str(exc)) from exc
         attrs = getattr(self, "initial_data", None) if isinstance(getattr(self, "initial_data", None), dict) else {}
-        cap = aeo_effective_cap_for_validation(getattr(self, "instance", None), attrs or {})
-        return out[:cap]
+        total_cap = aeo_effective_total_selected_slots_for_validation(getattr(self, "instance", None), attrs or {})
+        return out[:total_cap]
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -485,14 +487,28 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if "selected_aeo_prompts" in attrs:
             sp = attrs.get("selected_aeo_prompts")
             if sp is not None:
+                from accounts.aeo.prompt_storage import count_custom_prompts_in_selected
+
                 n = len(sp)
-                cap = aeo_effective_cap_for_validation(getattr(self, "instance", None), attrs)
+                suggested_cap = aeo_effective_cap_for_validation(getattr(self, "instance", None), attrs)
+                custom_cap = aeo_effective_custom_prompt_cap_for_validation(getattr(self, "instance", None), attrs)
+                custom_n = count_custom_prompts_in_selected(sp)
+                suggested_n = n - custom_n
                 need_min = aeo_onboarding_min_for_validation(getattr(self, "instance", None), attrs)
-                if n > cap:
+                if suggested_n > suggested_cap:
                     raise serializers.ValidationError(
                         {
                             "selected_aeo_prompts": (
-                                f"At most {cap} monitored prompts for your plan; got {n}."
+                                f"At most {suggested_cap} suggested (non-custom) monitored prompts for your plan; "
+                                f"got {suggested_n}."
+                            )
+                        }
+                    )
+                if custom_n > custom_cap:
+                    raise serializers.ValidationError(
+                        {
+                            "selected_aeo_prompts": (
+                                f"At most {custom_cap} custom monitored prompts for your plan; got {custom_n}."
                             )
                         }
                     )

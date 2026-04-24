@@ -1,11 +1,15 @@
 """
 Plan-derived monitored AEO prompt targets (production).
 
-Total monitored prompts (generated + onboarding seed) per plan:
+**Suggested** (generated / onboarding / expansion) prompts per plan — own pool:
   Starter: 25 | Pro: 75 | Advanced: 150
 
-User-authored custom monitored prompt caps match those totals:
+**Custom** (user-authored ``is_custom``) prompts — separate pool with the same numeric caps:
   Starter: 25 | Pro: 75 | Advanced: 150
+
+A profile may therefore hold up to **twice** the plan number (e.g. Pro: 75 suggested + 75 custom).
+
+``aeo_custom_prompt_cap_bonus`` still stacks on the custom cap when suggested prompts are removed.
 
 Onboarding still delivers ``AEO_ONBOARDING_BASELINE_MONITORED_PROMPT_COUNT`` (10) prompts;
 completion gates use that baseline, not the full plan cap.
@@ -155,7 +159,7 @@ def aeo_onboarding_complete_min_prompts(profile: BusinessProfile) -> int:
 
 
 def aeo_effective_cap_for_validation(instance: BusinessProfile | None, attrs: dict[str, Any]) -> int:
-    """Cap for serializer validation (honors plan change in same PATCH when not in testing mode)."""
+    """Suggested (non-custom) cap for serializer validation (honors plan change in same PATCH)."""
     if aeo_testing_mode():
         return aeo_testing_target_count()
     plan = BusinessProfile.PLAN_NONE
@@ -164,6 +168,27 @@ def aeo_effective_cap_for_validation(instance: BusinessProfile | None, attrs: di
     else:
         plan = str(attrs.get("plan") or BusinessProfile.PLAN_NONE)
     return aeo_monitored_prompt_cap_for_plan_slug(plan)
+
+
+def aeo_effective_custom_prompt_cap_for_validation(instance: BusinessProfile | None, attrs: dict[str, Any]) -> int:
+    """Custom-pool cap for validation, including bonus; honors plan change in same PATCH."""
+    if aeo_testing_mode():
+        return aeo_testing_target_count()
+    plan = BusinessProfile.PLAN_NONE
+    if instance is not None:
+        plan = str(attrs.get("plan", instance.plan) or instance.plan or "")
+    else:
+        plan = str(attrs.get("plan") or BusinessProfile.PLAN_NONE)
+    base = aeo_custom_monitored_prompt_cap_for_plan_slug(plan)
+    bonus = int(getattr(instance, "aeo_custom_prompt_cap_bonus", 0) or 0) if instance is not None else 0
+    return max(0, base + max(0, bonus))
+
+
+def aeo_effective_total_selected_slots_for_validation(instance: BusinessProfile | None, attrs: dict[str, Any]) -> int:
+    """Max total stored monitored rows (suggested pool + custom pool)."""
+    return aeo_effective_cap_for_validation(instance, attrs) + aeo_effective_custom_prompt_cap_for_validation(
+        instance, attrs
+    )
 
 
 def aeo_onboarding_min_for_validation(instance: BusinessProfile | None, attrs: dict[str, Any]) -> int:
