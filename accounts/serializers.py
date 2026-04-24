@@ -318,6 +318,11 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         ]
 
     def _viewer_access_dict(self) -> dict:
+        resolver = self.context.get("viewer_access_resolver")
+        if callable(resolver) and getattr(self, "instance", None) is not None:
+            resolved = resolver(self.instance)
+            if isinstance(resolved, dict) and resolved:
+                return resolved
         raw = self.context.get("viewer_access")
         if isinstance(raw, dict) and raw:
             return raw

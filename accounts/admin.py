@@ -21,6 +21,8 @@ from .models import (
     AEOScoreSnapshot,
     BusinessProfile,
     BusinessProfileMembership,
+    Organization,
+    OrganizationMembership,
     TrackedCompetitor,
     ThirdPartyApiErrorLog,
     ThirdPartyApiRequestLog,
@@ -29,6 +31,21 @@ from .models import (
     AgentConversation,
     AgentMessage,
 )
+
+
+@admin.register(Organization)
+class OrganizationAdmin(admin.ModelAdmin):
+    list_display = ("id", "owner_user", "name", "created_at")
+    search_fields = ("name", "owner_user__email", "owner_user__username")
+    raw_id_fields = ("owner_user",)
+
+
+@admin.register(OrganizationMembership)
+class OrganizationMembershipAdmin(admin.ModelAdmin):
+    list_display = ("id", "organization", "user", "role", "is_owner", "hidden_from_team_ui", "created_at")
+    list_filter = ("role", "is_owner", "hidden_from_team_ui")
+    search_fields = ("user__email", "organization__name")
+    raw_id_fields = ("organization", "user")
 
 
 class CsvExportAdminMixin:

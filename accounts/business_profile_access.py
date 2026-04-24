@@ -1,14 +1,20 @@
 """
 Resolve which BusinessProfile a logged-in user operates on (owned vs team workspace)
 and derive UI / permission flags for viewers.
+
+Organizations group all sites (BusinessProfile rows) under one billing workspace.
+OrganizationMembership grants access to every site in the org (typically created when
+someone is invited on the main company profile). Site-only BusinessProfileMembership
+on a sub-site does not imply org-wide access.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from django.contrib.auth.models import AnonymousUser
+from django.db.models import Q
 
-from .models import BusinessProfile, BusinessProfileMembership
+from .models import BusinessProfile, BusinessProfileMembership, OrganizationMembership
 
 
 def should_create_owned_main_business_profile_for_user(user: Any) -> bool:
@@ -31,6 +37,39 @@ def user_has_external_workspace_membership(user: Any) -> bool:
     if user is None or isinstance(user, AnonymousUser) or not user.is_authenticated:
         return False
     return BusinessProfileMembership.objects.filter(user=user).exclude(business_profile__user=user).exists()
+
+
+def accessible_business_profiles_queryset(user: Any):
+    """
+    All BusinessProfile rows the user may operate on:
+
+    - profiles they own (``user`` FK),
+    - every profile in an organization they belong to (``OrganizationMembership``),
+    - profiles they were invited to explicitly (``BusinessProfileMembership``).
+    """
+    if user is None or isinstance(user, AnonymousUser) or not user.is_authenticated:
+        return BusinessProfile.objects.none()
+
+    org_ids = list(
+        OrganizationMembership.objects.filter(user=user, hidden_from_team_ui=False).values_list(
+            "organization_id",
+            flat=True,
+        )
+    )
+    q = Q(user=user)
+    if org_ids:
+        q |= Q(organization_id__in=org_ids)
+    site_ids = BusinessProfileMembership.objects.filter(user=user).values_list(
+        "business_profile_id",
+        flat=True,
+    )
+    if site_ids:
+        q |= Q(pk__in=site_ids)
+    return BusinessProfile.objects.filter(q).distinct().order_by("-is_main", "created_at", "id")
+
+
+def get_business_profile_for_user(user: Any, pk: int) -> BusinessProfile | None:
+    return accessible_business_profiles_queryset(user).filter(pk=int(pk)).first()
 
 
 def resolve_main_business_profile_for_user(user: Any) -> BusinessProfile | None:
@@ -73,6 +112,19 @@ def get_membership(user: Any, profile: BusinessProfile | None) -> BusinessProfil
     return BusinessProfileMembership.objects.filter(business_profile=profile, user=user).first()
 
 
+def get_organization_membership(user: Any, profile: BusinessProfile | None) -> OrganizationMembership | None:
+    if profile is None or user is None or not getattr(user, "is_authenticated", False):
+        return None
+    oid = getattr(profile, "organization_id", None)
+    if not oid:
+        return None
+    return OrganizationMembership.objects.filter(
+        organization_id=int(oid),
+        user=user,
+        hidden_from_team_ui=False,
+    ).first()
+
+
 def workspace_data_user(profile: BusinessProfile | None) -> Any:
     """User row used for SEO snapshots and other per-workspace caches keyed by profile owner."""
     if profile is None:
@@ -80,13 +132,40 @@ def workspace_data_user(profile: BusinessProfile | None) -> Any:
     return profile.user
 
 
+def _viewer_access_from_org_membership(om: OrganizationMembership) -> dict[str, Any]:
+    if om.is_owner:
+        return {
+            "viewer_team_role": "owner",
+            "viewer_is_main_account_owner": True,
+            "viewer_can_edit_company_profile": True,
+            "viewer_can_access_billing": True,
+            "viewer_can_manage_team": True,
+        }
+    if om.role == OrganizationMembership.ROLE_ADMIN:
+        return {
+            "viewer_team_role": "admin",
+            "viewer_is_main_account_owner": False,
+            "viewer_can_edit_company_profile": True,
+            "viewer_can_access_billing": True,
+            "viewer_can_manage_team": True,
+        }
+    return {
+        "viewer_team_role": "member",
+        "viewer_is_main_account_owner": False,
+        "viewer_can_edit_company_profile": False,
+        "viewer_can_access_billing": False,
+        "viewer_can_manage_team": False,
+    }
+
+
 def viewer_team_access(user: Any, profile: BusinessProfile | None) -> dict[str, Any]:
     """
     Flags for the authenticated viewer against the resolved BusinessProfile.
 
-    - owner: primary account holder (``is_owner`` on membership or legacy profile owner).
-    - admin: same product access as owner except we still expose ``viewer_is_main_account_owner``.
-    - member: read-only company settings, no billing.
+    Precedence:
+    1. Account holder for this site row (``profile.user``).
+    2. Organization-level membership (all sites in the org).
+    3. Per-profile team membership.
     """
     out = {
         "viewer_team_role": "owner",
@@ -98,12 +177,16 @@ def viewer_team_access(user: Any, profile: BusinessProfile | None) -> dict[str, 
     if profile is None or user is None or not getattr(user, "is_authenticated", False):
         return out
 
-    m = get_membership(user, profile)
     is_row_owner = int(profile.user_id) == int(user.id)
+    if is_row_owner:
+        return out
 
+    om = get_organization_membership(user, profile)
+    if om is not None:
+        return _viewer_access_from_org_membership(om)
+
+    m = get_membership(user, profile)
     if m is None:
-        if is_row_owner:
-            return out
         return {
             "viewer_team_role": "member",
             "viewer_is_main_account_owner": False,
@@ -116,10 +199,10 @@ def viewer_team_access(user: Any, profile: BusinessProfile | None) -> dict[str, 
     is_admin = m.role == BusinessProfileMembership.ROLE_ADMIN
     is_member = m.role == BusinessProfileMembership.ROLE_MEMBER
 
-    if is_main_account_owner or is_row_owner:
+    if is_main_account_owner:
         return {
             "viewer_team_role": "owner",
-            "viewer_is_main_account_owner": is_main_account_owner or is_row_owner,
+            "viewer_is_main_account_owner": True,
             "viewer_can_edit_company_profile": True,
             "viewer_can_access_billing": True,
             "viewer_can_manage_team": True,
@@ -144,3 +227,80 @@ def viewer_team_access(user: Any, profile: BusinessProfile | None) -> dict[str, 
         }
 
     return out
+
+
+def ensure_organization_for_first_owned_profile(profile: BusinessProfile) -> None:
+    """Create organization + owner membership when the first owned profile is saved."""
+    from .models import Organization
+
+    if getattr(profile, "organization_id", None):
+        return
+    uid = int(profile.user_id)
+    org = Organization.objects.create(
+        owner_user_id=uid,
+        name=str(getattr(profile, "business_name", "") or "")[:255],
+    )
+    BusinessProfile.objects.filter(pk=profile.pk).update(organization_id=org.id)
+    profile.organization_id = org.id
+    OrganizationMembership.objects.get_or_create(
+        organization_id=org.id,
+        user_id=uid,
+        defaults={
+            "role": OrganizationMembership.ROLE_ADMIN,
+            "is_owner": True,
+            "hidden_from_team_ui": False,
+        },
+    )
+
+
+def attach_organization_for_additional_profile(profile: BusinessProfile) -> None:
+    """Attach a newly created site to the account holder's existing organization."""
+    from .models import Organization
+
+    if getattr(profile, "organization_id", None):
+        return
+    uid = int(profile.user_id)
+    org = Organization.objects.filter(owner_user_id=uid).order_by("id").first()
+    if org is None:
+        ensure_organization_for_first_owned_profile(profile)
+        return
+    BusinessProfile.objects.filter(pk=profile.pk).update(organization_id=org.id)
+    profile.organization_id = org.id
+
+
+def sync_organization_membership_for_main_team_invite(
+    profile: BusinessProfile,
+    invited_user: Any,
+    role_raw: str,
+) -> None:
+    """When someone is invited on the *main* company profile, mirror access at org scope."""
+    oid = getattr(profile, "organization_id", None)
+    if not oid or not profile.is_main:
+        return
+    role_store = (
+        OrganizationMembership.ROLE_ADMIN
+        if role_raw == BusinessProfileMembership.ROLE_ADMIN
+        else OrganizationMembership.ROLE_MEMBER
+    )
+    OrganizationMembership.objects.update_or_create(
+        organization_id=int(oid),
+        user=invited_user,
+        defaults={
+            "role": role_store,
+            "is_owner": False,
+            "hidden_from_team_ui": False,
+        },
+    )
+
+
+def remove_organization_membership_for_main_team_leave(profile: BusinessProfile, removed_user_id: int) -> None:
+    """Removing a user from the main company team revokes org-wide access for that user."""
+    oid = getattr(profile, "organization_id", None)
+    if not oid or not profile.is_main:
+        return
+    if int(removed_user_id) == int(profile.user_id):
+        return
+    OrganizationMembership.objects.filter(
+        organization_id=int(oid),
+        user_id=int(removed_user_id),
+    ).delete()

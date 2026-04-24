@@ -116,6 +116,15 @@ class BusinessProfile(models.Model):
     # Whether this is the main / primary profile for the user.
     is_main = models.BooleanField(default=False)
 
+    organization = models.ForeignKey(
+        "Organization",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="business_profiles",
+        help_text="Workspace grouping; all sites under one billing org share this row.",
+    )
+
     # Optional: comma-separated competitor domains for SEO keyword gap analysis.
     # When provided, these are preferred over DataForSEO auto-competitors.
     # Example: "smilebright.com, nocavityclinic.com, oakdentalcare.com"
@@ -250,6 +259,82 @@ class BusinessProfileMembership(models.Model):
 
     def __str__(self) -> str:
         return f"BusinessProfileMembership(profile={self.business_profile_id}, user={self.user_id})"
+
+
+class Organization(models.Model):
+    """
+    Billing / workspace grouping for one or more BusinessProfile rows (sites).
+
+    Additional sites created under the same account holder attach to the same organization.
+    Team admins invited on the *main* site receive OrganizationMembership and can access every site.
+    Team admins invited only on a sub-site have BusinessProfileMembership on that site only.
+    """
+
+    owner_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="owned_organizations",
+        help_text="Primary Stripe/account holder for this workspace (same as first BusinessProfile.user).",
+    )
+    name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Display label; usually mirrors the main site business name.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Organization"
+        verbose_name_plural = "Organizations"
+        ordering = ("-created_at",)
+
+    def __str__(self) -> str:
+        return f"Organization(owner_user_id={self.owner_user_id}, name={self.name!r})"
+
+
+class OrganizationMembership(models.Model):
+    """Team access at organization scope (all sites under the org)."""
+
+    ROLE_ADMIN = "admin"
+    ROLE_MEMBER = "member"
+    ROLE_CHOICES = [
+        (ROLE_ADMIN, "Admin"),
+        (ROLE_MEMBER, "Member"),
+    ]
+
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="memberships",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="organization_memberships",
+    )
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES, default=ROLE_MEMBER)
+    is_owner = models.BooleanField(
+        default=False,
+        help_text="True for the primary account holder (same user as Organization.owner_user).",
+    )
+    hidden_from_team_ui = models.BooleanField(
+        default=False,
+        help_text="When true, keep membership for access control but hide from team lists.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("organization", "user")
+        indexes = [
+            models.Index(fields=["user"]),
+            models.Index(fields=["organization"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"OrganizationMembership(org={self.organization_id}, user={self.user_id})"
 
 
 class SEOOverviewSnapshot(models.Model):

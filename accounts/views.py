@@ -21,10 +21,16 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from .business_profile_access import (
+    accessible_business_profiles_queryset,
+    attach_organization_for_additional_profile,
+    ensure_organization_for_first_owned_profile,
+    get_business_profile_for_user,
     get_membership,
+    remove_organization_membership_for_main_team_leave,
     resolve_main_business_profile_for_user,
     resolve_main_business_profile_for_user_with_source,
     should_create_owned_main_business_profile_for_user,
+    sync_organization_membership_for_main_team_invite,
     viewer_team_access,
     workspace_data_user,
 )
@@ -1976,6 +1982,7 @@ def business_profile_team(request: HttpRequest) -> Response:
         ),
         is_owner=False,
     )
+    sync_organization_membership_for_main_team_invite(profile, invited, role_raw)
     return Response({"ok": True, "user_id": invited.id}, status=201)
 
 
@@ -1998,7 +2005,9 @@ def business_profile_team_member(request: HttpRequest, user_id: int) -> Response
         return Response({"error": "Not a team member."}, status=404)
     if row.is_owner:
         return Response({"error": "Cannot remove the primary account holder."}, status=400)
+    removed_uid = int(row.user_id)
     row.delete()
+    remove_organization_membership_for_main_team_leave(profile, removed_uid)
     return Response(status=204)
 
 
@@ -2052,9 +2061,15 @@ def billing_summary(request: HttpRequest) -> Response:
     subscription_id = str(getattr(billing_profile, "stripe_subscription_id", "") or "").strip()
     period_end = getattr(billing_profile, "stripe_current_period_end", None)
     if not customer_id:
+        if getattr(billing_profile, "organization_id", None):
+            owned_qs = BusinessProfile.objects.filter(
+                organization_id=billing_profile.organization_id,
+                user_id=billing_profile.user_id,
+            )
+        else:
+            owned_qs = BusinessProfile.objects.filter(user=request.user)
         owned_with_customer = (
-            BusinessProfile.objects.filter(user=request.user)
-            .exclude(pk=billing_profile.pk)
+            owned_qs.exclude(pk=billing_profile.pk)
             .exclude(stripe_customer_id__isnull=True)
             .exclude(stripe_customer_id="")
             .order_by("-is_main", "id")
@@ -2257,7 +2272,7 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
             pk = int(raw_profile_id)
         except (TypeError, ValueError):
             return Response({"error": "Invalid profile_id."}, status=400)
-        target_profile = BusinessProfile.objects.filter(pk=pk, user=request.user).first()
+        target_profile = get_business_profile_for_user(request.user, pk)
         if target_profile is None:
             return Response({"error": "Business profile not found."}, status=404)
         profile = target_profile
@@ -3672,7 +3687,7 @@ def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
             pk = int(pid_raw)
         except ValueError:
             return Response({"has_data": False, "total_prompts": 0, "rows": []}, status=400)
-        profile = BusinessProfile.objects.filter(pk=pk, user=request.user).first()
+        profile = get_business_profile_for_user(request.user, pk)
         if profile is None:
             return Response({"has_data": False, "total_prompts": 0, "rows": []}, status=404)
     else:
@@ -4491,7 +4506,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
             profile_id = int(profile_id_raw)
         except (TypeError, ValueError):
             return Response({"error": "profile_id must be an integer."}, status=400)
-        profile = BusinessProfile.objects.filter(id=profile_id, user=request.user).first()
+        profile = get_business_profile_for_user(request.user, profile_id)
         if profile is None:
             return Response({"error": "Business profile not found for this account."}, status=404)
     else:
@@ -4508,6 +4523,8 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                 "is_owner": True,
             },
         )
+        ensure_organization_for_first_owned_profile(profile)
+        profile.refresh_from_db()
 
     city_override = _first_nonempty_str(body.get("city"), request.GET.get("city"))
     industry_override = _first_nonempty_str(body.get("industry"), request.GET.get("industry"))
@@ -4743,7 +4760,7 @@ def business_profile_list(request: HttpRequest) -> Response:
     """
     if request.method == "GET":
         profiles = (
-            BusinessProfile.objects.filter(user=request.user)
+            accessible_business_profiles_queryset(request.user)
             .prefetch_related("tracked_competitors")
             .order_by("-is_main", "created_at", "id")
         )
@@ -4756,6 +4773,7 @@ def business_profile_list(request: HttpRequest) -> Response:
             context={
                 "request": request,
                 "skip_heavy_profile_metrics": True,
+                "viewer_access_resolver": lambda p: viewer_team_access(request.user, p),
             },
         )
         return Response(serializer.data)
@@ -4809,9 +4827,21 @@ def business_profile_list(request: HttpRequest) -> Response:
     serializer.is_valid(raise_exception=True)
     profile = serializer.save(user=request.user)
 
-    # If this profile is being set as main, unset others
+    if not getattr(profile, "organization_id", None):
+        if is_first:
+            ensure_organization_for_first_owned_profile(profile)
+        else:
+            attach_organization_for_additional_profile(profile)
+        profile.refresh_from_db()
+
+    # If this profile is being set as main, unset others in the same organization (or same owner legacy).
     if profile.is_main:
-        existing_qs.exclude(pk=profile.pk).update(is_main=False)
+        if profile.organization_id:
+            BusinessProfile.objects.filter(organization_id=profile.organization_id).exclude(pk=profile.pk).update(
+                is_main=False
+            )
+        else:
+            existing_qs.exclude(pk=profile.pk).update(is_main=False)
 
     # Bootstrap SEO snapshot when the profile already has a site URL (add-company flow sets URL on POST).
     # Without this, PATCH finalize only updates prompts and never hits the "website changed" refresh path.
@@ -5022,16 +5052,20 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
 @permission_classes([IsAuthenticated])
 def business_profile_detail(request: HttpRequest, pk: int) -> Response:
     """
-    Retrieve, update, or delete a single business profile owned by the authenticated user.
+    Retrieve, update, or delete a single business profile the authenticated user may access
+    (owned, org-wide team, or site-specific invite).
+
     Primarily used by the Settings page to update a specific profile or mark it as main.
     """
-    try:
-        profile = BusinessProfile.objects.prefetch_related("tracked_competitors").get(
-            id=pk,
-            user=request.user,
-        )
-    except BusinessProfile.DoesNotExist:
+    profile = get_business_profile_for_user(request.user, pk)
+    if profile is None:
         return Response({"detail": "Not found."}, status=404)
+    profile = (
+        BusinessProfile.objects.prefetch_related("tracked_competitors")
+        .filter(pk=profile.pk)
+        .first()
+        or profile
+    )
 
     if request.method == "GET":
         access = viewer_team_access(request.user, profile)
@@ -5066,9 +5100,14 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
         serializer.is_valid(raise_exception=True)
         profile = serializer.save()
 
-        # If is_main was set to True on this profile, unset main on all others.
+        # If is_main was set to True on this profile, unset main on all other sites in the org.
         if profile.is_main:
-            BusinessProfile.objects.filter(user=request.user).exclude(pk=profile.pk).update(is_main=False)
+            if profile.organization_id:
+                BusinessProfile.objects.filter(organization_id=profile.organization_id).exclude(
+                    pk=profile.pk
+                ).update(is_main=False)
+            else:
+                BusinessProfile.objects.filter(user=request.user).exclude(pk=profile.pk).update(is_main=False)
 
         # If the website URL changed, refresh SEO snapshot for this site.
         new_site_url = profile.website_url
