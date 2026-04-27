@@ -129,6 +129,11 @@ urlpatterns += [
     ),
     path("api/aeo/pipeline-status/", accounts_views.aeo_pipeline_status_data, name="aeo-pipeline-status-data"),
     path("api/staff/aeo-pass-counts/", accounts_views.aeo_pass_count_analytics_data, name="aeo-pass-count-analytics"),
+    path(
+        "api/staff/rate-limit-cooldowns/",
+        accounts_views.staff_rate_limit_cooldowns,
+        name="staff-rate-limit-cooldowns",
+    ),
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
     path("api/aeo/refresh-gemini/", accounts_views.refresh_aeo_gemini, name="refresh-aeo-gemini"),
     path(
