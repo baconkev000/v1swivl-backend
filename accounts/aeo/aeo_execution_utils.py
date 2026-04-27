@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import re
 import time
 import unicodedata
@@ -32,6 +33,7 @@ from typing import Any, Mapping, Sequence
 from uuid import UUID
 
 from django.conf import settings
+from django.core.cache import cache
 
 from ..models import AEOExecutionRun, AEOResponseSnapshot, BusinessProfile
 from ..openai_utils import _get_client, _get_model, chat_completion_create_logged
@@ -46,6 +48,7 @@ PLATFORM_GEMINI = "gemini"
 PLATFORM_PERPLEXITY = "perplexity"
 DEFAULT_PLATFORM = PLATFORM_OPENAI
 DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
+_OPENAI_RATE_LIMIT_UNTIL_CACHE_KEY = "aeo:openai:rate_limit_until_unix"
 
 
 def _execution_model() -> str:
@@ -135,6 +138,113 @@ def _is_retryable_openai_error(exc: BaseException) -> bool:
         return name in ("APITimeoutError", "APIConnectionError", "RateLimitError")
 
 
+def _openai_backoff_base_seconds() -> float:
+    v = getattr(settings, "AEO_OPENAI_BACKOFF_BASE_SECONDS", 1.0)
+    try:
+        return max(0.25, float(v))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _openai_backoff_cap_seconds() -> float:
+    v = getattr(settings, "AEO_OPENAI_BACKOFF_CAP_SECONDS", 60.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _openai_retry_after_cap_seconds() -> float:
+    v = getattr(settings, "AEO_OPENAI_RETRY_AFTER_CAP_SECONDS", 300.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _openai_max_pre_request_wait_seconds() -> float:
+    v = getattr(settings, "AEO_OPENAI_MAX_PRE_REQUEST_WAIT_SECONDS", 120.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _parse_retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        now = datetime.now(timezone.utc)
+        return max(0.0, (dt.astimezone(timezone.utc) - now).total_seconds())
+    except Exception:
+        return None
+
+
+def _openai_exception_retry_after_seconds(exc: BaseException) -> float | None:
+    try:
+        headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+        return _parse_retry_after_seconds(headers.get("Retry-After"))
+    except Exception:
+        return None
+
+
+def _openai_jittered_backoff_seconds(attempt_idx: int) -> float:
+    base = _openai_backoff_base_seconds()
+    cap = _openai_backoff_cap_seconds()
+    exp = min(cap, base * (2 ** max(0, attempt_idx)))
+    return random.uniform(0.0, exp)
+
+
+def _get_openai_global_wait_seconds() -> float:
+    try:
+        until = float(cache.get(_OPENAI_RATE_LIMIT_UNTIL_CACHE_KEY) or 0.0)
+    except Exception:
+        return 0.0
+    return max(0.0, until - time.time())
+
+
+def _set_openai_global_wait_seconds(wait_seconds: float) -> None:
+    delay = max(0.0, float(wait_seconds))
+    if delay <= 0.0:
+        return
+    delay = min(delay, _openai_retry_after_cap_seconds())
+    ttl = max(1, int(delay) + 5)
+    until = time.time() + delay
+    try:
+        cache.set(_OPENAI_RATE_LIMIT_UNTIL_CACHE_KEY, until, timeout=ttl)
+    except Exception:
+        logger.debug("OpenAI rate-limit cache set failed", exc_info=True)
+
+
+def _openai_retry_wait_seconds(exc: BaseException, attempt_idx: int) -> float:
+    retry_after = _openai_exception_retry_after_seconds(exc)
+    backoff = _openai_jittered_backoff_seconds(attempt_idx)
+    if retry_after is None:
+        return backoff
+    return max(backoff, min(retry_after, _openai_retry_after_cap_seconds()))
+
+
+def _wait_for_openai_global_cooldown() -> None:
+    wait = _get_openai_global_wait_seconds()
+    if wait <= 0.0:
+        return
+    bounded = min(wait, _openai_max_pre_request_wait_seconds())
+    logger.info("AEO OpenAI execution waiting %.2fs due to global cooldown", bounded)
+    time.sleep(bounded)
+
+
 def save_aeo_response(
     *,
     business_profile: BusinessProfile,
@@ -218,6 +328,7 @@ def run_single_aeo_prompt(
     attempts = _execution_max_attempts()
     for attempt in range(attempts):
         try:
+            _wait_for_openai_global_cooldown()
             completion = chat_completion_create_logged(
                 exec_client,
                 operation="openai.chat.aeo_prompt_execution",
@@ -248,7 +359,10 @@ def run_single_aeo_prompt(
                 err,
             )
             if attempt + 1 < attempts and _is_retryable_openai_error(exc):
-                time.sleep(1.0)
+                wait_s = _openai_retry_wait_seconds(exc, attempt)
+                if type(exc).__name__ == "RateLimitError":
+                    _set_openai_global_wait_seconds(wait_s)
+                time.sleep(wait_s)
                 continue
             break
 

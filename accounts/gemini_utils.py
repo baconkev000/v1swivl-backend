@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 
 from django.conf import settings
+from django.core.cache import cache
 
 from .models import BusinessProfile, ThirdPartyApiErrorLog, ThirdPartyApiProvider
 from .third_party_usage import record_gemini_request, record_third_party_api_error
 
 logger = logging.getLogger(__name__)
+_GEMINI_RATE_LIMIT_UNTIL_CACHE_KEY = "aeo:gemini:rate_limit_until_unix"
 
 
 def get_effective_gemini_api_key() -> str:
@@ -72,6 +75,98 @@ def _is_retryable_gemini_error(exc: BaseException) -> bool:
         return name in ("ResourceExhausted", "ServiceUnavailable", "DeadlineExceeded", "InternalServerError")
 
 
+def _gemini_backoff_base_seconds() -> float:
+    v = getattr(settings, "AEO_GEMINI_BACKOFF_BASE_SECONDS", 1.0)
+    try:
+        return max(0.25, float(v))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _gemini_backoff_cap_seconds() -> float:
+    v = getattr(settings, "AEO_GEMINI_BACKOFF_CAP_SECONDS", 60.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _gemini_retry_after_cap_seconds() -> float:
+    v = getattr(settings, "AEO_GEMINI_RETRY_AFTER_CAP_SECONDS", 300.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _gemini_max_pre_request_wait_seconds() -> float:
+    v = getattr(settings, "AEO_GEMINI_MAX_PRE_REQUEST_WAIT_SECONDS", 120.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _gemini_jittered_backoff_seconds(attempt_idx: int) -> float:
+    base = _gemini_backoff_base_seconds()
+    cap = _gemini_backoff_cap_seconds()
+    exp = min(cap, base * (2 ** max(0, attempt_idx)))
+    return random.uniform(0.0, exp)
+
+
+def _gemini_retry_after_seconds(exc: BaseException) -> float | None:
+    # google.api_core exceptions may expose retry_delay (Duration-like / timedelta / seconds).
+    rd = getattr(exc, "retry_delay", None)
+    if rd is None:
+        return None
+    try:
+        seconds = float(getattr(rd, "total_seconds", lambda: rd)())
+    except Exception:
+        try:
+            seconds = float(rd)
+        except Exception:
+            return None
+    return max(0.0, seconds)
+
+
+def _get_gemini_global_wait_seconds() -> float:
+    try:
+        until = float(cache.get(_GEMINI_RATE_LIMIT_UNTIL_CACHE_KEY) or 0.0)
+    except Exception:
+        return 0.0
+    return max(0.0, until - time.time())
+
+
+def _set_gemini_global_wait_seconds(wait_seconds: float) -> None:
+    delay = max(0.0, float(wait_seconds))
+    if delay <= 0.0:
+        return
+    delay = min(delay, _gemini_retry_after_cap_seconds())
+    ttl = max(1, int(delay) + 5)
+    until = time.time() + delay
+    try:
+        cache.set(_GEMINI_RATE_LIMIT_UNTIL_CACHE_KEY, until, timeout=ttl)
+    except Exception:
+        logger.debug("Gemini rate-limit cache set failed", exc_info=True)
+
+
+def _gemini_retry_wait_seconds(exc: BaseException, attempt_idx: int) -> float:
+    retry_after = _gemini_retry_after_seconds(exc)
+    backoff = _gemini_jittered_backoff_seconds(attempt_idx)
+    if retry_after is None:
+        return backoff
+    return max(backoff, min(retry_after, _gemini_retry_after_cap_seconds()))
+
+
+def _wait_for_gemini_global_cooldown() -> None:
+    wait = _get_gemini_global_wait_seconds()
+    if wait <= 0.0:
+        return
+    bounded = min(wait, _gemini_max_pre_request_wait_seconds())
+    logger.info("Gemini execution waiting %.2fs due to global cooldown", bounded)
+    time.sleep(bounded)
+
+
 def generate_gemini_execution_text(
     *,
     system_instruction: str,
@@ -106,6 +201,7 @@ def generate_gemini_execution_text(
 
     for attempt in range(attempts):
         try:
+            _wait_for_gemini_global_cooldown()
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(
                 model_name,
@@ -151,7 +247,10 @@ def generate_gemini_execution_text(
                 err,
             )
             if attempt + 1 < attempts and _is_retryable_gemini_error(exc):
-                time.sleep(1.0)
+                wait_s = _gemini_retry_wait_seconds(exc, attempt)
+                if type(exc).__name__ in ("ResourceExhausted",):
+                    _set_gemini_global_wait_seconds(wait_s)
+                time.sleep(wait_s)
                 continue
             break
 
