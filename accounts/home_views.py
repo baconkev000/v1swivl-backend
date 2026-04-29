@@ -228,8 +228,9 @@ def aeo_pass_count_staff_page(request):
                         cap = int(aeo_monitored_prompt_cap_for_plan_slug(slug))
                         schedule_aeo_prompt_plan_expansion.delay(
                             profile.id,
-                            expected_plan_slug=slug,
+                            expected_plan_slug=None,
                             expansion_cap=cap,
+                            force=True,
                         )
                         messages.success(
                             request,

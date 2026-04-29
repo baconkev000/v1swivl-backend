@@ -437,10 +437,10 @@ def test_staff_seo_snapshot_refresh_skips_without_website(monkeypatch):
 
 @pytest.mark.django_db
 def test_staff_prompt_top_up_post_queues_expansion(monkeypatch):
-    queued: list[tuple[int, str, int]] = []
+    queued: list[tuple[int, str | None, int, bool]] = []
 
-    def capture_delay(profile_id, expected_plan_slug=None, expansion_cap=None):
-        queued.append((int(profile_id), str(expected_plan_slug or ""), int(expansion_cap or 0)))
+    def capture_delay(profile_id, expected_plan_slug=None, expansion_cap=None, force=False):
+        queued.append((int(profile_id), expected_plan_slug, int(expansion_cap or 0), bool(force)))
 
     monkeypatch.setattr("accounts.home_views.schedule_aeo_prompt_plan_expansion.delay", capture_delay)
 
@@ -470,7 +470,7 @@ def test_staff_prompt_top_up_post_queues_expansion(monkeypatch):
         },
     )
     assert resp.status_code == 302
-    assert queued == [(profile.id, BusinessProfile.PLAN_ADVANCED, 150)]
+    assert queued == [(profile.id, None, 150, True)]
 
 
 @pytest.mark.django_db

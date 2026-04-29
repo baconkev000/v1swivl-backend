@@ -128,6 +128,7 @@
       <p class="small text-muted mb-2">
         Admin-only maintenance action. Preserves existing suggested and custom prompts, and adds only missing
         suggested prompts to reach the current plan standard (Starter 25, Pro 75, Advanced 150).
+        Queued with a staff-only flag so expansion runs even when AEO testing mode is on or the profile has no active Stripe subscription.
       </p>
       {% if selected_profile_id == "all" %}
         <p class="small text-warning mb-2 mb-md-0"><strong>Choose a specific business profile</strong> in the filter above (not &ldquo;All profiles&rdquo;) to enable the button.</p>

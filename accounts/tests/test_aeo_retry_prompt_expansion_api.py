@@ -24,12 +24,13 @@ def test_retry_prompt_expansion_pro_enqueues(monkeypatch):
         is_main=True,
         business_name="Biz",
         plan=BusinessProfile.PLAN_PRO,
+        stripe_subscription_status="active",
         selected_aeo_prompts=["a", "b"],
     )
 
     captured: dict = {}
 
-    def fake_delay(pid, expected_plan_slug=None, expansion_cap=None):
+    def fake_delay(pid, expected_plan_slug=None, expansion_cap=None, **kwargs):
         captured["profile_id"] = pid
         captured["expected_plan_slug"] = expected_plan_slug
         captured["expansion_cap"] = expansion_cap
@@ -62,7 +63,7 @@ def test_retry_prompt_expansion_starter_enqueues(monkeypatch):
     )
     captured: dict = {}
 
-    def fake_delay(pid, expected_plan_slug=None, expansion_cap=None):
+    def fake_delay(pid, expected_plan_slug=None, expansion_cap=None, **kwargs):
         captured["profile_id"] = pid
         captured["expected_plan_slug"] = expected_plan_slug
         captured["expansion_cap"] = expansion_cap
@@ -90,6 +91,7 @@ def test_retry_prompt_expansion_rate_limited(monkeypatch):
         is_main=True,
         business_name="Biz",
         plan=BusinessProfile.PLAN_ADVANCED,
+        stripe_subscription_status="active",
         selected_aeo_prompts=["a"],
     )
 
