@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 import re
 import random
@@ -43,6 +44,7 @@ COMPETITOR_LOOKUP_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 # domain_intersection/live: cache full merged gap list (stable key over sorted competitors + loc/lang/limit).
 DOMAIN_INTERSECTION_CACHE_VERSION = "v1"
+_DATAFORSEO_RATE_LIMIT_UNTIL_CACHE_KEY = "seo:dataforseo:rate_limit_until_unix"
 
 # Lazy import to avoid circular dependency (openai_utils imports get_or_refresh_seo_score_for_user)
 def _get_llm_keyword_candidates(profile: Optional[BusinessProfile], homepage_meta: Optional[str]) -> List[str]:
@@ -710,14 +712,115 @@ def _post(
         return None
 
     url = f"{BASE_URL}{path}"
-    try:
-        resp = requests.post(
-            url,
-            json=payload,
-            auth=auth,
-            timeout=30,
-        )
-    except Exception as exc:  # pragma: no cover - network failure
+    attempts = max(1, min(5, int(getattr(settings, "DATAFORSEO_MAX_ATTEMPTS", 3) or 3)))
+    backoff_base = max(0.25, float(getattr(settings, "DATAFORSEO_BACKOFF_BASE_SECONDS", 1.0) or 1.0))
+    backoff_cap = max(1.0, float(getattr(settings, "DATAFORSEO_BACKOFF_CAP_SECONDS", 60.0) or 60.0))
+    retry_after_cap = max(1.0, float(getattr(settings, "DATAFORSEO_RETRY_AFTER_CAP_SECONDS", 300.0) or 300.0))
+    max_pre_wait = max(1.0, float(getattr(settings, "DATAFORSEO_MAX_PRE_REQUEST_WAIT_SECONDS", 120.0) or 120.0))
+
+    def _is_retryable_http(status_code: int) -> bool:
+        return status_code in (408, 429) or (500 <= status_code <= 599)
+
+    def _parse_retry_after_seconds(value: str | None) -> float | None:
+        if not value:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt is None:
+                return None
+            now = datetime.now(timezone.utc)
+            return max(0.0, (dt.astimezone(timezone.utc) - now).total_seconds())
+        except Exception:
+            return None
+
+    def _jittered_backoff_seconds(attempt_idx: int) -> float:
+        exp = min(backoff_cap, backoff_base * (2 ** max(0, attempt_idx)))
+        return random.uniform(0.0, exp)
+
+    def _get_global_wait_seconds() -> float:
+        try:
+            until = float(cache.get(_DATAFORSEO_RATE_LIMIT_UNTIL_CACHE_KEY) or 0.0)
+        except Exception:
+            return 0.0
+        return max(0.0, until - time.time())
+
+    def _set_global_wait_seconds(wait_seconds: float) -> None:
+        delay = max(0.0, float(wait_seconds))
+        if delay <= 0.0:
+            return
+        delay = min(delay, retry_after_cap)
+        ttl = max(1, int(delay) + 5)
+        until = time.time() + delay
+        try:
+            cache.set(_DATAFORSEO_RATE_LIMIT_UNTIL_CACHE_KEY, until, timeout=ttl)
+        except Exception:
+            logger.debug("DataForSEO rate-limit cache set failed", exc_info=True)
+
+    def _wait_for_global_cooldown() -> None:
+        wait = _get_global_wait_seconds()
+        if wait <= 0.0:
+            return
+        bounded = min(wait, max_pre_wait)
+        logger.info("[DataForSEO] waiting %.2fs due to global cooldown path=%s", bounded, path)
+        time.sleep(bounded)
+
+    resp = None
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            _wait_for_global_cooldown()
+            resp = requests.post(
+                url,
+                json=payload,
+                auth=auth,
+                timeout=30,
+            )
+        except Exception as exc:  # pragma: no cover - network failure
+            last_exc = exc
+            logger.warning("[DataForSEO] POST %s attempt %s/%s failed: %s", path, attempt + 1, attempts, exc)
+            if attempt + 1 < attempts:
+                time.sleep(_jittered_backoff_seconds(attempt))
+                continue
+            break
+
+        if resp.status_code == 429 and attempt + 1 < attempts:
+            headers = getattr(resp, "headers", {}) or {}
+            retry_after = _parse_retry_after_seconds(headers.get("Retry-After"))
+            wait_s = max(_jittered_backoff_seconds(attempt), min(retry_after or 0.0, retry_after_cap))
+            _set_global_wait_seconds(wait_s)
+            logger.warning(
+                "[DataForSEO] POST %s hit 429 (attempt %s/%s), sleeping %.2fs",
+                path,
+                attempt + 1,
+                attempts,
+                wait_s,
+            )
+            time.sleep(wait_s)
+            continue
+
+        if _is_retryable_http(resp.status_code) and attempt + 1 < attempts:
+            wait_s = _jittered_backoff_seconds(attempt)
+            logger.warning(
+                "[DataForSEO] POST %s retryable HTTP %s (attempt %s/%s), sleeping %.2fs",
+                path,
+                resp.status_code,
+                attempt + 1,
+                attempts,
+                wait_s,
+            )
+            time.sleep(wait_s)
+            continue
+        break
+
+    if resp is None:
+        exc = last_exc or RuntimeError("unknown DataForSEO transport failure")
         logger.exception("[DataForSEO] POST %s failed: %s", path, exc)
         from accounts.models import ThirdPartyApiErrorLog, ThirdPartyApiProvider
         from accounts.third_party_usage import record_third_party_api_error
@@ -731,21 +834,6 @@ def _post(
             http_status=None,
             business_profile=business_profile,
         )
-        # #region agent log
-        try:
-            with open(DEBUG_LOG_PATH, "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "098bfd",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H1",
-                    "location": "accounts/dataforseo_utils.py:_post",
-                    "message": "HTTP error when calling DataForSEO",
-                    "data": {"path": path, "error": str(exc)},
-                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
         return None
 
     parsed_json: Optional[Dict[str, Any]] = None

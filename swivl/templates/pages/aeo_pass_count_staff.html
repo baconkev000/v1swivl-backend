@@ -1,13 +1,28 @@
 {% extends "base.html" %}
 
-{% block title %}AEO Pass Count Analytics{% endblock title %}
+{% block title %}AEO Operations Console{% endblock title %}
 
 {% block content %}
 <div class="mt-3">
-  <h2>AEO Pass Count Analytics</h2>
+  <h2>AEO Operations Console</h2>
+  <p class="text-muted mb-3">
+    One place for staff to run AEO/SEO operational actions, monitor provider pass stability, and inspect rate-limit cooldown state.
+  </p>
+
+  <div class="card border mb-3 shadow-sm">
+    <div class="card-header py-2 fw-semibold bg-white">Recommended flow</div>
+    <div class="card-body py-3">
+      <ol class="mb-0 ps-3">
+        <li><strong>Pick a profile and optional run filter</strong> using the controls below.</li>
+        <li><strong>Run the action you need</strong> (full AEO rerun, recommendations-only, or SEO snapshot refresh).</li>
+        <li><strong>Validate outcomes</strong> in the pass-stability and run summary sections.</li>
+      </ol>
+    </div>
+  </div>
+
   <form method="get" class="row g-2 mb-3 align-items-end">
     <div class="col-md-4">
-      <label class="form-label">Run</label>
+      <label class="form-label">Execution run filter</label>
       <select name="run_id" class="form-select form-select-sm">
         <option value="all" {% if selected_run_id == "all" %}selected{% endif %}>All runs</option>
         {% for r in aeo_runs_for_filter %}
@@ -18,7 +33,7 @@
       </select>
     </div>
     <div class="col-md-4">
-      <label class="form-label">Profile</label>
+      <label class="form-label">Business profile</label>
       <select name="profile_id" class="form-select form-select-sm">
         <option value="all" {% if selected_profile_id == "all" %}selected{% endif %}>All profiles</option>
         {% for p in business_profiles_for_usage %}
@@ -29,14 +44,27 @@
       </select>
     </div>
     <div class="col-md-auto">
-      <button class="btn btn-primary btn-sm" type="submit">Apply filters</button>
+      <button class="btn btn-primary btn-sm" type="submit">Apply</button>
     </div>
   </form>
 
   <div class="card border mb-4 shadow-sm">
-    <div class="card-header py-2 fw-semibold bg-white">Full AEO pipeline re-run (staff)</div>
+    <div class="card-header py-2 fw-semibold bg-white">Provider cooldown visibility</div>
     <div class="card-body py-3">
-      <p class="small text-muted mb-2">Re-executes all monitored prompts on the selected profile (Phase 1→5, <code>force_refresh</code>). Skipped if a run is already pending or running.</p>
+      <p class="small text-muted mb-2">
+        Use this to quickly confirm whether OpenAI, Gemini, Perplexity, or DataForSEO are currently in a rate-limit cooldown window.
+      </p>
+      <a class="btn btn-outline-secondary btn-sm" href="{% url 'staff-rate-limit-cooldowns' %}" target="_blank" rel="noopener">
+        Open cooldown status JSON
+      </a>
+    </div>
+  </div>
+
+  <h5 class="mt-2 mb-2">Actions</h5>
+  <div class="card border mb-4 shadow-sm">
+    <div class="card-header py-2 fw-semibold bg-white">Full AEO pipeline rerun</div>
+    <div class="card-body py-3">
+      <p class="small text-muted mb-2">Re-executes all monitored prompts on the selected profile (Phase 1→5 with <code>force_refresh</code>). Skips when another run is already pending/running.</p>
       {% if selected_profile_id == "all" %}
         <p class="small text-warning mb-2 mb-md-0"><strong>Choose a specific business profile</strong> in the filter above (not &ldquo;All profiles&rdquo;) to enable the button.</p>
       {% endif %}
@@ -47,14 +75,14 @@
         <input type="hidden" name="redirect_run_id" value="{{ selected_run_id }}" />
         <input type="hidden" name="redirect_profile_id" value="{{ selected_profile_id }}" />
         <button type="submit" class="btn btn-danger" {% if selected_profile_id == "all" %}disabled aria-disabled="true"{% endif %}>
-          Run full monitored-pipeline for this profile
+          Run full AEO pipeline
         </button>
       </form>
     </div>
   </div>
 
   <div class="card border mb-4 shadow-sm">
-    <div class="card-header py-2 fw-semibold bg-white">Recommendations only (Phase 5)</div>
+    <div class="card-header py-2 fw-semibold bg-white">Recommendations only</div>
     <div class="card-body py-3">
       <p class="small text-muted mb-2">Does not fetch new LLM answers or change monitored prompts. Regenerates recommendation strategies from the current visibility and extraction state for the latest completed, scored execution run.</p>
       {% if selected_profile_id == "all" %}
@@ -67,7 +95,7 @@
         <input type="hidden" name="redirect_run_id" value="{{ selected_run_id }}" />
         <input type="hidden" name="redirect_profile_id" value="{{ selected_profile_id }}" />
         <button type="submit" class="btn btn-outline-danger" {% if selected_profile_id == "all" %}disabled aria-disabled="true"{% endif %}>
-          Re-run recommendations for this profile
+          Rebuild recommendations (Phase 5)
         </button>
       </form>
       <p class="small text-muted mt-2 mb-0">After Phase 5 finishes, the AEO dashboard may take a moment to reflect updates while the bundle cache refreshes.</p>
@@ -75,7 +103,7 @@
   </div>
 
   <div class="card border mb-4 shadow-sm">
-    <div class="card-header py-2 fw-semibold bg-white">SEO snapshot refresh (staff)</div>
+    <div class="card-header py-2 fw-semibold bg-white">SEO snapshot refresh</div>
     <div class="card-body py-3">
       <p class="small text-muted mb-2">Runs the Search/SEO DataForSEO pipeline for this profile’s website (not AEO). May incur API cost and take a short while. Snapshot rows update immediately; structured SEO issues fill after background next-steps / keyword tasks complete.</p>
       {% if selected_profile_id == "all" %}
@@ -88,12 +116,37 @@
         <input type="hidden" name="redirect_run_id" value="{{ selected_run_id }}" />
         <input type="hidden" name="redirect_profile_id" value="{{ selected_profile_id }}" />
         <button type="submit" class="btn btn-outline-primary" {% if selected_profile_id == "all" %}disabled aria-disabled="true"{% endif %}>
-          Run SEO snapshot + issues for this profile
+          Run SEO snapshot + issues
         </button>
       </form>
     </div>
   </div>
 
+  <div class="card border mb-4 shadow-sm">
+    <div class="card-header py-2 fw-semibold bg-white">Prompt top-up to current plan target</div>
+    <div class="card-body py-3">
+      <p class="small text-muted mb-2">
+        Admin-only maintenance action. Preserves existing suggested and custom prompts, and adds only missing
+        suggested prompts to reach the current plan standard (Starter 25, Pro 75, Advanced 150).
+        Queued with a staff-only flag so expansion runs even when AEO testing mode is on or the profile has no active Stripe subscription.
+      </p>
+      {% if selected_profile_id == "all" %}
+        <p class="small text-warning mb-2 mb-md-0"><strong>Choose a specific business profile</strong> in the filter above (not &ldquo;All profiles&rdquo;) to enable the button.</p>
+      {% endif %}
+      <form method="post" class="d-inline-block">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="prompt_top_up_to_plan_cap" />
+        <input type="hidden" name="aeo_prompt_top_up_profile_id" value="{{ selected_profile_id }}" />
+        <input type="hidden" name="redirect_run_id" value="{{ selected_run_id }}" />
+        <input type="hidden" name="redirect_profile_id" value="{{ selected_profile_id }}" />
+        <button type="submit" class="btn btn-outline-dark" {% if selected_profile_id == "all" %}disabled aria-disabled="true"{% endif %}>
+          Queue prompt top-up
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <h5 class="mt-3 mb-2">Pass stability diagnostics</h5>
   <div class="row">
     <div class="col-md-6">
       <ul class="list-group mb-3">
@@ -118,7 +171,7 @@
     </div>
   </div>
 
-  <h5 class="mt-3">Grouped by run</h5>
+  <h5 class="mt-3">Run-level diagnostics</h5>
   <pre class="bg-light p-2">{{ analytics.grouped_by_run|safe }}</pre>
 </div>
 {% endblock content %}

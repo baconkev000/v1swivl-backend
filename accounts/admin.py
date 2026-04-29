@@ -550,7 +550,7 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
             "AEO prompt expansion (plan-based monitored prompt growth)",
             {
                 "description": (
-                    "Updated by the post-payment Celery task when Pro/Advanced adds prompts. "
+                    "Updated by the plan-target prompt expansion task (Starter/Pro/Advanced). "
                     "last_error is set on partial runs or failures."
                 ),
                 "fields": (

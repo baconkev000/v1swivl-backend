@@ -433,3 +433,71 @@ def test_staff_seo_snapshot_refresh_skips_without_website(monkeypatch):
     )
     assert resp.status_code == 302
     assert called == []
+
+
+@pytest.mark.django_db
+def test_staff_prompt_top_up_post_queues_expansion(monkeypatch):
+    queued: list[tuple[int, str | None, int, bool]] = []
+
+    def capture_delay(profile_id, expected_plan_slug=None, expansion_cap=None, force=False):
+        queued.append((int(profile_id), expected_plan_slug, int(expansion_cap or 0), bool(force)))
+
+    monkeypatch.setattr("accounts.home_views.schedule_aeo_prompt_plan_expansion.delay", capture_delay)
+
+    client = Client()
+    staff = User.objects.create_user(
+        username="topupstaff",
+        email="topupstaff@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    owner = User.objects.create_user(username="topupowner", email="topupowner@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=owner,
+        is_main=True,
+        business_name="Top Up Co",
+        plan=BusinessProfile.PLAN_ADVANCED,
+        selected_aeo_prompts=["a"],
+    )
+    client.force_login(staff)
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "prompt_top_up_to_plan_cap",
+            "aeo_prompt_top_up_profile_id": str(profile.id),
+            "redirect_run_id": "all",
+            "redirect_profile_id": str(profile.id),
+        },
+    )
+    assert resp.status_code == 302
+    assert queued == [(profile.id, None, 150, True)]
+
+
+@pytest.mark.django_db
+def test_staff_prompt_top_up_post_all_profiles_does_not_queue(monkeypatch):
+    calls: list[bool] = []
+
+    def capture_delay(*_args, **_kwargs):
+        calls.append(True)
+
+    monkeypatch.setattr("accounts.home_views.schedule_aeo_prompt_plan_expansion.delay", capture_delay)
+
+    client = Client()
+    staff = User.objects.create_user(
+        username="topupall",
+        email="topupall@example.com",
+        password="pw",
+        is_staff=True,
+    )
+    client.force_login(staff)
+    resp = client.post(
+        reverse("staff-aeo-pass-counts"),
+        data={
+            "action": "prompt_top_up_to_plan_cap",
+            "aeo_prompt_top_up_profile_id": "all",
+            "redirect_run_id": "all",
+            "redirect_profile_id": "all",
+        },
+    )
+    assert resp.status_code == 302
+    assert calls == []

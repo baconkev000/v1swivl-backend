@@ -40,6 +40,7 @@ def test_expansion_schedules_backfill_when_new_prompt_strings(settings, monkeypa
         business_name="B",
         plan=BusinessProfile.PLAN_PRO,
         website_url="https://example.com",
+        stripe_subscription_status="active",
         selected_aeo_prompts=[f"keep{i}" for i in range(10)],
     )
 
@@ -47,7 +48,7 @@ def test_expansion_schedules_backfill_when_new_prompt_strings(settings, monkeypa
     assert len(calls) == 1
     assert calls[0][0][0] == profile.id
     assert calls[0][1]["before_prompt_count"] == 10
-    assert calls[0][1]["after_prompt_count"] == 50
+    assert calls[0][1]["after_prompt_count"] == 75
 
 
 @pytest.mark.django_db
@@ -63,13 +64,14 @@ def test_expansion_no_backfill_when_already_at_cap(settings, monkeypatch):
     )
 
     user = User.objects.create_user(username="bf2@example.com", email="bf2@example.com", password="x")
-    prompts = [f"p{i}" for i in range(50)]
+    prompts = [f"p{i}" for i in range(75)]
     profile = BusinessProfile.objects.create(
         user=user,
         is_main=True,
         business_name="B",
         plan=BusinessProfile.PLAN_PRO,
         website_url="https://example.com",
+        stripe_subscription_status="active",
         selected_aeo_prompts=prompts,
     )
 
@@ -129,3 +131,30 @@ def test_backfill_enqueues_phase1_with_missing_prompts_only(settings, monkeypatc
     assert payload is not None
     texts = [str(p.get("prompt") or "") for p in payload]
     assert texts == ["needs_work"]
+
+
+@pytest.mark.django_db
+def test_backfill_force_bypasses_local_gates(settings, monkeypatch):
+    settings.AEO_TESTING_MODE = True
+
+    from accounts.tasks import aeo_backfill_monitored_prompt_execution_task
+
+    phase1_calls: list[tuple] = []
+
+    def capture_phase1(*args, **kwargs):
+        phase1_calls.append((args, kwargs))
+
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase1_execution_task.delay", capture_phase1)
+
+    user = User.objects.create_user(username="bf4@example.com", email="bf4@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="B4",
+        plan=BusinessProfile.PLAN_STARTER,
+        website_url="https://example.com",
+        selected_aeo_prompts=["needs_work"],
+    )
+
+    aeo_backfill_monitored_prompt_execution_task.run(profile.id, force=True)
+    assert len(phase1_calls) == 1

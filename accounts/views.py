@@ -4012,6 +4012,47 @@ def aeo_pass_count_analytics_data(request: HttpRequest) -> Response:
 
 
 @csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def staff_rate_limit_cooldowns(request: HttpRequest) -> Response:
+    """Staff-only snapshot of provider cooldown timers used by backend retry logic."""
+    if not bool(getattr(request.user, "is_staff", False)):
+        return Response({"detail": "Forbidden"}, status=403)
+
+    now_unix = datetime.now(timezone.utc).timestamp()
+    provider_keys = {
+        "openai": "aeo:openai:rate_limit_until_unix",
+        "gemini": "aeo:gemini:rate_limit_until_unix",
+        "perplexity": "aeo:perplexity:rate_limit_until_unix",
+        "dataforseo": "seo:dataforseo:rate_limit_until_unix",
+    }
+    providers: dict[str, dict[str, object]] = {}
+    for provider, key in provider_keys.items():
+        raw = cache.get(key)
+        until_unix: float | None
+        try:
+            until_unix = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            until_unix = None
+        remaining = 0.0 if until_unix is None else max(0.0, float(until_unix - now_unix))
+        providers[provider] = {
+            "cache_key": key,
+            "cooldown_until_unix": until_unix,
+            "cooldown_seconds_remaining": round(remaining, 3),
+            "active": remaining > 0.0,
+        }
+
+    return Response(
+        {
+            "ok": True,
+            "generated_at_unix": round(now_unix, 3),
+            "providers": providers,
+        }
+    )
+
+
+@csrf_exempt
 @api_view(["POST"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -4295,7 +4336,7 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
 def aeo_retry_prompt_expansion(request: HttpRequest) -> Response:
     """
     Enqueue ``schedule_aeo_prompt_plan_expansion`` toward the plan cap (same kwargs pattern as Stripe).
-    Pro/Advanced only; rate-limited per user to reduce abuse.
+    Starter/Pro/Advanced only; rate-limited per user to reduce abuse.
     """
     from .tasks import schedule_aeo_prompt_plan_expansion
 
@@ -4306,7 +4347,7 @@ def aeo_retry_prompt_expansion(request: HttpRequest) -> Response:
     if not aeo_should_run_post_payment_expansion(profile):
         return Response(
             {
-                "detail": "Finish getting prompts is available on Pro and Advanced plans.",
+                "detail": "Finish getting prompts is available on paid Starter, Pro, and Advanced plans.",
             },
             status=400,
         )

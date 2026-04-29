@@ -2,6 +2,7 @@
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 
 from accounts.models import BusinessProfile, ThirdPartyApiErrorLog, ThirdPartyApiProvider
 from accounts.third_party_usage import (
@@ -74,6 +75,103 @@ def test_perplexity_http_error_writes_one_error_row(settings, monkeypatch):
     assert len(rows) == 1
     assert rows[0].http_status == 404
     assert rows[0].error_kind == ThirdPartyApiErrorLog.ErrorKind.HTTP_ERROR
+
+
+@pytest.mark.django_db
+def test_perplexity_retry_after_header_controls_backoff(settings, monkeypatch):
+    settings.PERPLEXITY_API_KEY = "test-key"
+    settings.PERPLEXITY_AEO_MODEL = "sonar"
+    settings.PERPLEXITY_MAX_ATTEMPTS = 3
+    user = User.objects.create_user(username="e2", email="e2@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+
+    from accounts.aeo.perplexity_execution_utils import _PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY
+
+    cache.delete(_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY)
+
+    class FakeResp429:
+        status_code = 429
+        content = b"{}"
+        text = '{"error":"rate_limited"}'
+        headers = {"Retry-After": "3"}
+
+        def json(self):
+            return {"error": "rate_limited"}
+
+    class FakeResp200:
+        status_code = 200
+        content = b"{}"
+        text = ""
+        headers = {}
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    seq = [FakeResp429(), FakeResp200()]
+
+    def fake_post(**kwargs):
+        return seq.pop(0)
+
+    slept: list[float] = []
+
+    def fake_sleep(seconds):
+        slept.append(float(seconds))
+
+    monkeypatch.setattr("accounts.aeo.perplexity_execution_utils.requests.post", fake_post)
+    monkeypatch.setattr("accounts.aeo.perplexity_execution_utils.time.sleep", fake_sleep)
+    monkeypatch.setattr("accounts.aeo.perplexity_execution_utils.random.uniform", lambda a, b: 0.1)
+    monkeypatch.setattr("accounts.aeo.perplexity_execution_utils.record_perplexity_request", lambda **kw: None)
+
+    from accounts.aeo.perplexity_execution_utils import run_single_aeo_prompt_perplexity
+
+    out = run_single_aeo_prompt_perplexity({"prompt": "hello"}, profile, save=False)
+    assert out["success"] is True
+    assert len(slept) >= 1
+    assert slept[0] >= 3.0
+    cache.delete(_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY)
+
+
+@pytest.mark.django_db
+def test_perplexity_global_cooldown_waits_before_request(settings, monkeypatch):
+    settings.PERPLEXITY_API_KEY = "test-key"
+    settings.PERPLEXITY_AEO_MODEL = "sonar"
+    user = User.objects.create_user(username="e3", email="e3@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+
+    from accounts.aeo.perplexity_execution_utils import _PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY
+    import time
+
+    cache.delete(_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY)
+    cache.set(_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY, time.time() + 4.0, timeout=60)
+
+    class FakeResp200:
+        status_code = 200
+        content = b"{}"
+        text = ""
+        headers = {}
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    slept: list[float] = []
+
+    def fake_sleep(seconds):
+        slept.append(float(seconds))
+
+    monkeypatch.setattr(
+        "accounts.aeo.perplexity_execution_utils.requests.post",
+        lambda **kw: FakeResp200(),
+    )
+    monkeypatch.setattr("accounts.aeo.perplexity_execution_utils.time.sleep", fake_sleep)
+    monkeypatch.setattr("accounts.aeo.perplexity_execution_utils.record_perplexity_request", lambda **kw: None)
+
+    from accounts.aeo.perplexity_execution_utils import run_single_aeo_prompt_perplexity
+
+    out = run_single_aeo_prompt_perplexity({"prompt": "hello"}, profile, save=False)
+    assert out["success"] is True
+    assert slept, "expected pre-request cooldown sleep"
+    assert slept[0] >= 3.5
+    cache.delete(_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY)
 
 
 @pytest.mark.django_db

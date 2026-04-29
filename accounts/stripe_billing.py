@@ -18,8 +18,8 @@ Cancellation policy: when Stripe reports a terminal subscription status (cancele
 incomplete_expired), we set BusinessProfile.plan to PLAN_NONE (empty string). Onboarding and paid
 access remain gated on stripe_subscription_status (see accounts.onboarding_completion).
 
-AEO monitored-prompt expansion toward the Pro/Advanced cap is scheduled only from
-``apply_subscription_payload_to_profile`` when a webhook applies ``plan`` = pro or advanced
+AEO monitored-prompt expansion toward the paid plan cap is scheduled only from
+``apply_subscription_payload_to_profile`` when a webhook applies ``plan`` = starter/pro/advanced
 (``transaction.on_commit``), with ``expected_plan_slug`` / ``expansion_cap`` tied to that
 resolution—not from onboarding, checkout-return-only flows, or generic profile saves.
 
@@ -50,7 +50,7 @@ TERMINAL_PLAN_CLEAR_STATUSES = frozenset({"canceled", "unpaid", "incomplete_expi
 
 # Dedupe Stripe webhook replays: skip re-enqueueing post_payment_seo_snapshot_task within this window.
 POST_PAYMENT_SEO_WEBHOOK_ENQUEUE_TTL_SECONDS = 300
-# Defer Pro/Advanced AEO prompt expansion so SEO snapshot + follow-on tasks claim workers first
+# Defer plan-target AEO prompt expansion so SEO snapshot + follow-on tasks claim workers first
 # (Celery does not guarantee ordering between two immediate .delay() calls).
 AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS = 120
 
@@ -575,14 +575,18 @@ def apply_subscription_payload_to_profile(
     website_url = str(profile.website_url or "").strip()
     should_post_payment_seo = bool(website_url) and paid_status_in_updates
 
-    pro_or_adv = plan_written in {BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}
+    eligible_for_expansion = plan_written in {
+        BusinessProfile.PLAN_STARTER,
+        BusinessProfile.PLAN_PRO,
+        BusinessProfile.PLAN_ADVANCED,
+    }
 
-    if should_post_payment_seo or pro_or_adv:
+    if should_post_payment_seo or eligible_for_expansion:
 
         def _enqueue_post_payment_async_work() -> None:
             if should_post_payment_seo:
                 _try_enqueue_post_payment_seo_snapshot(profile.id)
-            if pro_or_adv:
+            if eligible_for_expansion:
                 slug = str(plan_written)
                 cap = int(aeo_monitored_prompt_cap_for_plan_slug(slug))
                 try:

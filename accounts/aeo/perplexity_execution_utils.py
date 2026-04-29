@@ -5,6 +5,7 @@ AEO Phase 2 execution via Perplexity Sonar (OpenAI-compatible Chat Completions A
 from __future__ import annotations
 
 import logging
+import random
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -12,6 +13,7 @@ from uuid import UUID
 
 import requests
 from django.conf import settings
+from django.core.cache import cache
 
 from ..models import AEOExecutionRun, BusinessProfile, ThirdPartyApiErrorLog, ThirdPartyApiProvider
 from ..third_party_usage import record_perplexity_request, record_third_party_api_error
@@ -29,6 +31,7 @@ from .perplexity_prompts import AEO_PERPLEXITY_EXECUTION_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 PERPLEXITY_CHAT_COMPLETIONS_URL = "https://api.perplexity.ai/v1/sonar"
+_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY = "aeo:perplexity:rate_limit_until_unix"
 
 
 def perplexity_execution_enabled() -> bool:
@@ -61,6 +64,113 @@ def _perplexity_max_attempts() -> int:
 
 def _is_retryable_perplexity_http(status_code: int) -> bool:
     return status_code in (408, 429) or (500 <= status_code <= 599)
+
+
+def _perplexity_backoff_base_seconds() -> float:
+    v = getattr(settings, "PERPLEXITY_BACKOFF_BASE_SECONDS", 1.0)
+    try:
+        return max(0.25, float(v))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _perplexity_backoff_cap_seconds() -> float:
+    v = getattr(settings, "PERPLEXITY_BACKOFF_CAP_SECONDS", 60.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _perplexity_retry_after_cap_seconds() -> float:
+    v = getattr(settings, "PERPLEXITY_RETRY_AFTER_CAP_SECONDS", 300.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _perplexity_max_pre_request_wait_seconds() -> float:
+    v = getattr(settings, "PERPLEXITY_MAX_PRE_REQUEST_WAIT_SECONDS", 120.0)
+    try:
+        return max(1.0, float(v))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _parse_retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        # Retry-After may be an HTTP-date.
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        now = datetime.now(timezone.utc)
+        return max(0.0, (dt.astimezone(timezone.utc) - now).total_seconds())
+    except Exception:
+        return None
+
+
+def _jittered_backoff_seconds(attempt_idx: int) -> float:
+    base = _perplexity_backoff_base_seconds()
+    cap = _perplexity_backoff_cap_seconds()
+    exp = min(cap, base * (2 ** max(0, attempt_idx)))
+    # Full jitter to avoid synchronized retries across workers.
+    return random.uniform(0.0, exp)
+
+
+def _get_global_rate_limit_wait_seconds() -> float:
+    try:
+        until = float(cache.get(_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY) or 0.0)
+    except Exception:
+        return 0.0
+    return max(0.0, until - time.time())
+
+
+def _set_global_rate_limit_wait_seconds(wait_seconds: float) -> None:
+    delay = max(0.0, float(wait_seconds))
+    if delay <= 0.0:
+        return
+    # Keep bounded so stale cooldown cannot persist too long.
+    delay = min(delay, _perplexity_retry_after_cap_seconds())
+    ttl = max(1, int(delay) + 5)
+    until = time.time() + delay
+    try:
+        cache.set(_PERPLEXITY_RATE_LIMIT_UNTIL_CACHE_KEY, until, timeout=ttl)
+    except Exception:
+        logger.debug("Perplexity rate-limit cache set failed", exc_info=True)
+
+
+def _compute_retry_wait_seconds(resp: requests.Response, attempt_idx: int) -> float:
+    headers = getattr(resp, "headers", {}) or {}
+    retry_after = _parse_retry_after_seconds(headers.get("Retry-After"))
+    backoff = _jittered_backoff_seconds(attempt_idx)
+    if retry_after is None:
+        return backoff
+    return max(backoff, min(retry_after, _perplexity_retry_after_cap_seconds()))
+
+
+def _maybe_wait_for_global_rate_limit(prefix: str) -> None:
+    wait = _get_global_rate_limit_wait_seconds()
+    if wait <= 0:
+        return
+    bounded = min(wait, _perplexity_max_pre_request_wait_seconds())
+    logger.info(
+        "%s waiting %.2fs due to global Perplexity cooldown",
+        prefix,
+        bounded,
+    )
+    time.sleep(bounded)
 
 
 def run_single_aeo_prompt_perplexity(
@@ -139,6 +249,7 @@ def run_single_aeo_prompt_perplexity(
 
     for attempt in range(attempts):
         try:
+            _maybe_wait_for_global_rate_limit("AEO Perplexity execution")
             resp = requests.post(
                 PERPLEXITY_CHAT_COMPLETIONS_URL,
                 json=payload,
@@ -195,7 +306,10 @@ def run_single_aeo_prompt_perplexity(
                     err,
                 )
                 if attempt + 1 < attempts and _is_retryable_perplexity_http(resp.status_code):
-                    time.sleep(1.0)
+                    wait_s = _compute_retry_wait_seconds(resp, attempt)
+                    if resp.status_code == 429:
+                        _set_global_rate_limit_wait_seconds(wait_s)
+                    time.sleep(wait_s)
                     continue
                 break
 
@@ -228,7 +342,7 @@ def run_single_aeo_prompt_perplexity(
                 err,
             )
             if attempt + 1 < attempts:
-                time.sleep(1.0)
+                time.sleep(_jittered_backoff_seconds(attempt))
                 continue
             break
         except Exception as exc:
@@ -335,6 +449,7 @@ def perplexity_chat_completion_raw(
 
     for attempt in range(attempts):
         try:
+            _maybe_wait_for_global_rate_limit("Perplexity chat completion")
             resp = requests.post(
                 PERPLEXITY_CHAT_COMPLETIONS_URL,
                 json=payload,
@@ -391,7 +506,10 @@ def perplexity_chat_completion_raw(
                     err,
                 )
                 if attempt + 1 < attempts and _is_retryable_perplexity_http(resp.status_code):
-                    time.sleep(1.0)
+                    wait_s = _compute_retry_wait_seconds(resp, attempt)
+                    if resp.status_code == 429:
+                        _set_global_rate_limit_wait_seconds(wait_s)
+                    time.sleep(wait_s)
                     continue
                 break
 
@@ -421,7 +539,7 @@ def perplexity_chat_completion_raw(
                 err,
             )
             if attempt + 1 < attempts:
-                time.sleep(1.0)
+                time.sleep(_jittered_backoff_seconds(attempt))
                 continue
             break
         except Exception as exc:

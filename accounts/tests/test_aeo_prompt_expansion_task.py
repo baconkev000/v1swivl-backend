@@ -38,12 +38,13 @@ def test_expansion_merges_delta(monkeypatch, settings):
         business_name="E",
         plan=BusinessProfile.PLAN_PRO,
         website_url="https://example.com",
+        stripe_subscription_status="active",
         selected_aeo_prompts=list(existing),
     )
 
     schedule_aeo_prompt_plan_expansion.run(profile.id)
     profile.refresh_from_db()
-    assert len(profile.selected_aeo_prompts) == 50
+    assert len(profile.selected_aeo_prompts) == 75
     assert profile.aeo_prompt_expansion_status == BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE
     for k in range(10):
         assert f"keep{k}" in profile.selected_aeo_prompts
@@ -63,6 +64,70 @@ def test_expansion_skipped_in_testing_mode(settings):
     schedule_aeo_prompt_plan_expansion.run(profile.id)
     profile.refresh_from_db()
     assert len(profile.selected_aeo_prompts) == 1
+
+
+@pytest.mark.django_db
+def test_expansion_runs_in_testing_mode_when_forced(monkeypatch, settings):
+    settings.AEO_TESTING_MODE = True
+    settings.AEO_TEST_PROMPT_COUNT = 10
+
+    def fake_build(profile, **kwargs):
+        target = int(kwargs.get("target_combined_count") or 0)
+        return {
+            "combined": [{"prompt": f"p{i}"} for i in range(target)],
+            "meta": {"openai_status": "ok", "combined_shortfall": 0},
+        }
+
+    monkeypatch.setattr("accounts.aeo.aeo_utils.build_full_aeo_prompt_plan", fake_build)
+
+    user = User.objects.create_user(username="exf@example.com", email="exf@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Ef",
+        plan=BusinessProfile.PLAN_PRO,
+        website_url="https://example.com",
+        selected_aeo_prompts=["keep0"],
+    )
+    schedule_aeo_prompt_plan_expansion.run(profile.id, force=True)
+    profile.refresh_from_db()
+    assert len(profile.selected_aeo_prompts) == 10
+    assert "keep0" in profile.selected_aeo_prompts
+
+
+@pytest.mark.django_db
+def test_expansion_forced_enqueues_backfill_with_force(monkeypatch, settings):
+    settings.AEO_TESTING_MODE = True
+    settings.AEO_TEST_PROMPT_COUNT = 10
+
+    def fake_build(profile, **kwargs):
+        target = int(kwargs.get("target_combined_count") or 0)
+        return {
+            "combined": [{"prompt": f"p{i}"} for i in range(target)],
+            "meta": {"openai_status": "ok", "combined_shortfall": 0},
+        }
+
+    monkeypatch.setattr("accounts.aeo.aeo_utils.build_full_aeo_prompt_plan", fake_build)
+    queued: list[dict] = []
+
+    def capture_backfill(*args, **kwargs):
+        queued.append({"args": args, "kwargs": dict(kwargs)})
+
+    monkeypatch.setattr("accounts.tasks.aeo_backfill_monitored_prompt_execution_task.delay", capture_backfill)
+
+    user = User.objects.create_user(username="exfb@example.com", email="exfb@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Efb",
+        plan=BusinessProfile.PLAN_PRO,
+        website_url="https://example.com",
+        selected_aeo_prompts=["keep0"],
+    )
+    schedule_aeo_prompt_plan_expansion.run(profile.id, force=True)
+    assert len(queued) == 1
+    assert queued[0]["args"][0] == profile.id
+    assert queued[0]["kwargs"].get("force") is True
 
 
 @pytest.mark.django_db
@@ -107,6 +172,7 @@ def test_expansion_uses_webhook_expansion_cap_kwarg(monkeypatch, settings):
         business_name="Cap",
         plan=BusinessProfile.PLAN_ADVANCED,
         website_url="https://example.com",
+        stripe_subscription_status="active",
         selected_aeo_prompts=[f"keep{i}" for i in range(10)],
     )
     schedule_aeo_prompt_plan_expansion.run(

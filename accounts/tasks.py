@@ -2283,6 +2283,7 @@ def aeo_backfill_monitored_prompt_execution_task(
     after_prompt_count: int | None = None,
     *,
     repair: bool = False,
+    force: bool = False,
 ) -> None:
     """
     Run Phase 1 for monitored prompts missing full OpenAI + Gemini + Perplexity extractions.
@@ -2292,8 +2293,10 @@ def aeo_backfill_monitored_prompt_execution_task(
     execution for prompts that were not in the original onboarding run.
 
     Pro/Advanced: Phase 1 → Phase 3 extraction → Phase 4 scoring → Phase 5 recommendations
-    (when ``AEO_ENABLE_RECOMMENDATION_STAGE``), same as the full pipeline. Starter-scale
-    profiles are skipped (expansion does not run for them).
+    (when ``AEO_ENABLE_RECOMMENDATION_STAGE``), same as the full pipeline.
+
+    ``force=True`` is a staff-maintenance escape hatch so local/test and legacy billing states
+    can still execute missing prompt coverage after expansion top-up.
     """
     from .aeo.aeo_utils import plan_items_from_saved_prompt_strings
     from .aeo.prompt_scan_progress import monitored_prompt_keys_missing_full_coverage
@@ -2304,10 +2307,10 @@ def aeo_backfill_monitored_prompt_execution_task(
     if profile is None:
         logger.warning("[AEO backfill] profile not found profile_id=%s", pid)
         return
-    if _is_onboarding_sample_size_profile(profile):
+    if not force and _is_onboarding_sample_size_profile(profile):
         logger.info("[AEO backfill] skip starter-scale profile profile_id=%s", pid)
         return
-    if not repair and not aeo_should_run_post_payment_expansion(profile):
+    if not force and not repair and not aeo_should_run_post_payment_expansion(profile):
         logger.info("[AEO backfill] skip plan not expansion-eligible profile_id=%s", pid)
         return
 
@@ -2510,9 +2513,10 @@ def schedule_aeo_prompt_plan_expansion(
     profile_id: int,
     expected_plan_slug: str | None = None,
     expansion_cap: int | None = None,
+    force: bool = False,
 ) -> None:
     """
-    After Pro/Advanced billing, grow selected_aeo_prompts toward the plan cap (idempotent).
+    After paid-plan billing, grow selected_aeo_prompts toward the plan cap (idempotent).
 
     **Enqueue only from** ``apply_subscription_payload_to_profile`` (Stripe webhooks), on commit, with
     ``expected_plan_slug`` and ``expansion_cap`` from the same price/link resolution used to set
@@ -2520,7 +2524,8 @@ def schedule_aeo_prompt_plan_expansion(
     profile's plan differs (race with another update), the task logs and exits without mutating
     prompts. When ``expansion_cap`` is set, it is used as the target count (production caps from
     the webhook); otherwise the cap is derived from the current profile plan. Starter / testing
-    mode still short-circuits via ``aeo_should_run_post_payment_expansion``.
+    mode short-circuits via ``aeo_should_run_post_payment_expansion`` unless ``force`` is true
+    (staff maintenance top-up only).
     """
     from .aeo.aeo_utils import aeo_business_input_from_onboarding_payload, build_full_aeo_prompt_plan
     from .aeo.prompt_storage import row_is_custom
@@ -2534,10 +2539,11 @@ def schedule_aeo_prompt_plan_expansion(
 
     db_plan = str(getattr(profile, "plan", "") or "")
     logger.info(
-        "[AEO expansion] start profile_id=%s expected_plan_slug=%s expansion_cap=%s profile.plan=%s",
+        "[AEO expansion] start profile_id=%s expected_plan_slug=%s expansion_cap=%s force=%s profile.plan=%s",
         pid,
         expected_plan_slug,
         expansion_cap,
+        bool(force),
         db_plan,
     )
     if expected_plan_slug is not None:
@@ -2557,7 +2563,7 @@ def schedule_aeo_prompt_plan_expansion(
         kwargs.setdefault("updated_at", django_tz.now())
         BusinessProfile.objects.filter(pk=pid).update(**kwargs)
 
-    if not aeo_should_run_post_payment_expansion(profile):
+    if not force and not aeo_should_run_post_payment_expansion(profile):
         cap_meta = aeo_effective_monitored_target_for_profile(profile)
         touch(
             aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
@@ -2742,6 +2748,7 @@ def schedule_aeo_prompt_plan_expansion(
                         pid,
                         before_prompt_count=before_n,
                         after_prompt_count=ac_after,
+                        force=bool(force),
                     )
                 except Exception:
                     logger.exception("[AEO expansion] backfill enqueue failed profile_id=%s", pid)

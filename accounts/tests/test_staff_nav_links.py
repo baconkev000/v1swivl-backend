@@ -19,8 +19,10 @@ def test_staff_user_sees_staff_analytics_links():
     r = c.get("/")
     body = r.content.decode("utf-8")
     assert "API Usage" in body
-    assert "AEO Pass Counts" in body
+    assert "AEO Ops Console" in body
     assert "/staff/aeo-pass-counts/" in body
+    assert "Staff Analytics" not in body
+    assert ">About<" not in body
 
 
 def test_non_staff_user_does_not_see_staff_analytics_links():
@@ -35,6 +37,7 @@ def test_non_staff_user_does_not_see_staff_analytics_links():
     r = c.get("/")
     body = r.content.decode("utf-8")
     assert "API Usage" not in body
-    assert "AEO Pass Counts" not in body
+    assert "AEO Ops Console" not in body
     assert "/staff/aeo-pass-counts/" not in body
+    assert ">About<" not in body
 
