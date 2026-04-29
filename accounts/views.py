@@ -4336,7 +4336,7 @@ def refresh_aeo_perplexity(request: HttpRequest) -> Response:
 def aeo_retry_prompt_expansion(request: HttpRequest) -> Response:
     """
     Enqueue ``schedule_aeo_prompt_plan_expansion`` toward the plan cap (same kwargs pattern as Stripe).
-    Pro/Advanced only; rate-limited per user to reduce abuse.
+    Starter/Pro/Advanced only; rate-limited per user to reduce abuse.
     """
     from .tasks import schedule_aeo_prompt_plan_expansion
 
@@ -4347,7 +4347,7 @@ def aeo_retry_prompt_expansion(request: HttpRequest) -> Response:
     if not aeo_should_run_post_payment_expansion(profile):
         return Response(
             {
-                "detail": "Finish getting prompts is available on Pro and Advanced plans.",
+                "detail": "Finish getting prompts is available on paid Starter, Pro, and Advanced plans.",
             },
             status=400,
         )

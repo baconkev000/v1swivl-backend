@@ -81,9 +81,11 @@ def aeo_pass_count_staff_page(request):
 
     if request.method == "POST":
         from accounts.tasks import (
+            schedule_aeo_prompt_plan_expansion,
             try_enqueue_aeo_full_monitored_pipeline,
             try_enqueue_aeo_phase5_recommendations_only,
         )
+        from accounts.aeo.aeo_plan_targets import aeo_monitored_prompt_cap_for_plan_slug
 
         action = request.POST.get("action")
         if action == "full_rerun":
@@ -201,6 +203,39 @@ def aeo_pass_count_staff_page(request):
                                     "will run in the background (usually a few minutes). Refresh Keywords or Actions "
                                     "after it completes.",
                                 )
+        elif action == "prompt_top_up_to_plan_cap":
+            pid_str = (request.POST.get("aeo_prompt_top_up_profile_id") or "").strip()
+            if pid_str in ("", "all"):
+                messages.warning(
+                    request,
+                    "Select a specific business profile (not All) to top up prompts to the plan target.",
+                )
+            else:
+                try:
+                    pid = int(pid_str)
+                except (TypeError, ValueError):
+                    messages.error(request, "Invalid profile id.")
+                else:
+                    profile = (
+                        BusinessProfile.objects.filter(pk=pid)
+                        .select_related("user")
+                        .first()
+                    )
+                    if profile is None:
+                        messages.error(request, "Business profile not found.")
+                    else:
+                        slug = str(getattr(profile, "plan", "") or "")
+                        cap = int(aeo_monitored_prompt_cap_for_plan_slug(slug))
+                        schedule_aeo_prompt_plan_expansion.delay(
+                            profile.id,
+                            expected_plan_slug=slug,
+                            expansion_cap=cap,
+                        )
+                        messages.success(
+                            request,
+                            "Prompt top-up queued. Existing suggested/custom prompts are preserved; "
+                            f"missing suggested prompts will be added up to plan target ({cap}).",
+                        )
         else:
             messages.error(request, "Unknown action.")
 

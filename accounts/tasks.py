@@ -2512,7 +2512,7 @@ def schedule_aeo_prompt_plan_expansion(
     expansion_cap: int | None = None,
 ) -> None:
     """
-    After Pro/Advanced billing, grow selected_aeo_prompts toward the plan cap (idempotent).
+    After paid-plan billing, grow selected_aeo_prompts toward the plan cap (idempotent).
 
     **Enqueue only from** ``apply_subscription_payload_to_profile`` (Stripe webhooks), on commit, with
     ``expected_plan_slug`` and ``expansion_cap`` from the same price/link resolution used to set

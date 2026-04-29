@@ -44,26 +44,40 @@ def test_retry_prompt_expansion_pro_enqueues(monkeypatch):
     assert res.json()["enqueued"] is True
     assert captured["profile_id"] == profile.id
     assert captured["expected_plan_slug"] == BusinessProfile.PLAN_PRO
-    assert captured["expansion_cap"] == 50
+    assert captured["expansion_cap"] == 75
 
 
 @pytest.mark.django_db
-def test_retry_prompt_expansion_starter_rejected():
+def test_retry_prompt_expansion_starter_enqueues(monkeypatch):
     cache.clear()
 
     user = User.objects.create_user(username="rpe2", email="rpe2@example.com", password="pw")
-    BusinessProfile.objects.create(
+    profile = BusinessProfile.objects.create(
         user=user,
         is_main=True,
         business_name="Biz",
-        plan=BusinessProfile.PLAN_NONE,
+        plan=BusinessProfile.PLAN_STARTER,
+        stripe_subscription_status="active",
         selected_aeo_prompts=["a"],
     )
+    captured: dict = {}
+
+    def fake_delay(pid, expected_plan_slug=None, expansion_cap=None):
+        captured["profile_id"] = pid
+        captured["expected_plan_slug"] = expected_plan_slug
+        captured["expansion_cap"] = expansion_cap
+
+    monkeypatch.setattr("accounts.tasks.schedule_aeo_prompt_plan_expansion.delay", fake_delay)
+    monkeypatch.setattr("accounts.views.transaction.on_commit", lambda fn: fn())
 
     client = APIClient()
     client.force_authenticate(user=user)
     res = client.post("/api/aeo/retry-prompt-expansion/", {}, format="json")
-    assert res.status_code == 400
+    assert res.status_code == 200
+    assert res.json()["enqueued"] is True
+    assert captured["profile_id"] == profile.id
+    assert captured["expected_plan_slug"] == BusinessProfile.PLAN_STARTER
+    assert captured["expansion_cap"] == 25
 
 
 @pytest.mark.django_db

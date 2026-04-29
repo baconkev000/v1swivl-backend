@@ -205,6 +205,7 @@ def aeo_should_run_post_payment_expansion(profile: BusinessProfile) -> bool:
     if status not in _ACTIVE_SUBSCRIPTION_STATUSES:
         return False
     return _effective_plan_slug_for_profile(profile) in {
+        BusinessProfile.PLAN_STARTER,
         BusinessProfile.PLAN_PRO,
         BusinessProfile.PLAN_ADVANCED,
     }
