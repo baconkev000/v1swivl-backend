@@ -241,11 +241,12 @@ def _seo_snapshot_corpus_newer_than_keyword_suggestions(snapshot: Any) -> bool:
 
 
 def _is_onboarding_sample_size_profile(profile) -> bool:
-    """Starter / unpaid: lighter monitored set. Pro+ get full pipeline staging."""
+    """Unpaid/no-plan profiles use lighter monitored set; paid plans use full pipeline staging."""
     from .models import BusinessProfile
 
     slug = str(getattr(profile, "plan", "") or "").strip().lower()
     if slug in (
+        BusinessProfile.PLAN_STARTER,
         BusinessProfile.PLAN_PRO,
         "professional",
         BusinessProfile.PLAN_ADVANCED,
@@ -2292,8 +2293,8 @@ def aeo_backfill_monitored_prompt_execution_task(
     ``force_refresh=True`` on Phase 1 so the 30-day "skip cached" path does not block
     execution for prompts that were not in the original onboarding run.
 
-    Pro/Advanced: Phase 1 → Phase 3 extraction → Phase 4 scoring → Phase 5 recommendations
-    (when ``AEO_ENABLE_RECOMMENDATION_STAGE``), same as the full pipeline.
+    Paid plans (Starter/Pro/Advanced): Phase 1 → Phase 3 extraction → Phase 4 scoring → Phase 5
+    recommendations (when ``AEO_ENABLE_RECOMMENDATION_STAGE``), same as the full pipeline.
 
     ``force=True`` is a staff-maintenance escape hatch so local/test and legacy billing states
     can still execute missing prompt coverage after expansion top-up.

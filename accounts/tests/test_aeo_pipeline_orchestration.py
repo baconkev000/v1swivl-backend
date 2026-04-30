@@ -367,14 +367,14 @@ def test_phase4_creates_score_snapshot_with_expected_fields(monkeypatch, setting
 
 @pytest.mark.django_db
 def test_phase1_sample_profile_enqueues_phase2_only_not_phase4_from_phase1(monkeypatch, settings):
-    """Onboarding-sized profiles: Phase 1 must not schedule Phase 4 (Phase 2 owns that enqueue)."""
+    """No-plan onboarding-sized profiles: Phase 1 must not schedule Phase 4 (Phase 2 owns that enqueue)."""
     settings.AEO_TESTING_MODE = False
     user = User.objects.create_user(username="p1smp", email="p1smp@example.com", password="pw")
     profile = BusinessProfile.objects.create(
         user=user,
         is_main=True,
         business_name="Biz",
-        plan=BusinessProfile.PLAN_STARTER,
+        plan=BusinessProfile.PLAN_NONE,
     )
     run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_PENDING)
     prompt_item = {"prompt": "q1", "type": "transactional", "dynamic": True, "weight": 1.0}
@@ -434,6 +434,83 @@ def test_phase1_sample_profile_enqueues_phase2_only_not_phase4_from_phase1(monke
     assert len(phase2_calls) == 1
     assert phase2_calls[0][0] == run.id
     assert phase4_calls == []
+
+
+@pytest.mark.django_db
+def test_phase1_starter_profile_enqueues_phase3_not_sample_phase2(monkeypatch, settings):
+    """Starter should follow the paid full-path (same staging as Pro/Advanced)."""
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="p1str", email="p1str@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        plan=BusinessProfile.PLAN_STARTER,
+    )
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_PENDING)
+    prompt_item = {"prompt": "q1", "type": "transactional", "dynamic": True, "weight": 1.0}
+
+    def fake_batch(selected, profile, save=True, execution_run=None, providers=None, on_result=None, **kwargs):
+        results = []
+        for item in selected:
+            prov = (providers or ["openai"])[0]
+            snap = AEOResponseSnapshot.objects.create(
+                profile=profile,
+                execution_run=execution_run,
+                prompt_text=str(item.get("prompt") or ""),
+                prompt_hash=f"h-{prov}",
+                raw_response="r",
+                platform=prov,
+            )
+            one = {"success": True, "snapshot_id": snap.id}
+            results.append(one)
+            if on_result is not None:
+                cat_item = dict(item)
+                from accounts.aeo.progressive_onboarding import classify_prompt_category
+
+                cat_item["_aeo_category"] = classify_prompt_category(item)
+                on_result(one, {"prompt_obj": cat_item})
+        return {"executed": len(results), "failed": 0, "results": results}
+
+    monkeypatch.setattr("accounts.aeo.aeo_execution_utils.run_aeo_prompt_batch", fake_batch)
+
+    def fake_single_extraction(snapshot, save=True, competitor_hints=None):
+        row = AEOExtractionSnapshot.objects.create(
+            response_snapshot=snapshot,
+            brand_mentioned=True,
+            mention_position="top",
+            mention_count=1,
+            competitors_json=[],
+            citations_json=[],
+            sentiment="neutral",
+            confidence_score=0.9,
+            extraction_model="fake",
+            extraction_parse_failed=False,
+        )
+        return {"extraction_snapshot_id": row.id}
+
+    monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+
+    phase2_calls: list[tuple] = []
+    phase3_calls: list[tuple] = []
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase2_confidence_task.delay",
+        lambda rid, ps=None: phase2_calls.append((rid, ps)),
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase3_extraction_task.delay",
+        lambda rid, snapshot_ids=None, response_platform=None: phase3_calls.append(
+            (rid, list(snapshot_ids or []), response_platform)
+        ),
+    )
+
+    run_aeo_phase1_execution_task(run.id, [prompt_item])
+    run.refresh_from_db()
+    assert run.status == AEOExecutionRun.STATUS_COMPLETED
+    assert phase2_calls == []
+    assert len(phase3_calls) == 1
+    assert phase3_calls[0][0] == run.id
+    assert phase3_calls[0][1]
 
 
 @pytest.mark.django_db
