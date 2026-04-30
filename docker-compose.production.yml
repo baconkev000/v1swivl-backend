@@ -16,7 +16,7 @@ services:
       - postgres
       - redis
     env_file:
-      - /home/deploy/app/swivl-backend/.env
+      - /home/deploy/app/swivl-backend/.envs/.production/.env
     command: /start
 
   celery:
@@ -28,7 +28,7 @@ services:
       - postgres
       - redis
     env_file:
-      - /home/deploy/app/swivl-backend/.env
+      - /home/deploy/app/swivl-backend/.envs/.production/.env
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.production
     # Celery worker for async tasks (e.g. SEO enrichment)
