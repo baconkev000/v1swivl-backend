@@ -43,7 +43,7 @@ services:
       - production_postgres_data:/var/lib/postgresql/18/docker
       - production_postgres_data_backups:/backups
     env_file:
-      - /home/deploy/app/swivl-backend/.env
+      - /home/deploy/app/swivl-backend/.envs/.production/.env
 
   traefik:
     build:
