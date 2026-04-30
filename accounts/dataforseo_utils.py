@@ -123,6 +123,13 @@ _EXCLUDED_COMPETITOR_DOMAIN_ROOTS = frozenset({
     "pinterest.com",
     "linkedin.com",
     "youtube.com",
+    # UGC / forums (Labs often returns these; domain_intersection vs them is noisy and can 50000)
+    "reddit.com",
+    "quora.com",
+    "medium.com",
+    "tumblr.com",
+    "wikipedia.org",
+    "wikimedia.org",
     # Directories / review aggregators
     "yelp.com",
     "thumbtack.com",
@@ -364,7 +371,8 @@ def get_competitors_for_domain_intersection(
     industry_lower = ((_profile.industry or "").strip()).lower() if _profile else ""
     business_address = ((_profile.business_address or "").strip()).lower() if _profile else ""
 
-    override_domains = _parse_domain_csv(getattr(_profile, "seo_competitor_domains_override", "") or "")
+    override_raw = _parse_domain_csv(getattr(_profile, "seo_competitor_domains_override", "") or "")
+    override_domains = [d for d in override_raw if not _is_excluded_competitor_domain(d)]
 
     raw_competitor_candidates: List[str] = []
     if not override_domains:
@@ -2550,7 +2558,13 @@ def get_keyword_gap_keywords(
     does not re-bill DataForSEO per competitor. Use ``force_refresh=True`` or settings
     ``DATAFORSEO_DOMAIN_INTERSECTION_FORCE_REFRESH`` to bypass.
     """
-    cleaned_competitors = sorted({c.strip().lower() for c in competitor_domains if c.strip()})
+    cleaned_competitors = sorted(
+        {
+            c.strip().lower()
+            for c in competitor_domains
+            if c.strip() and not _is_excluded_competitor_domain(c.strip().lower())
+        }
+    )
     if not cleaned_competitors:
         logger.info(
             "[DataForSEO] domain_intersection skipped for %s: no competitors configured",
@@ -2629,6 +2643,21 @@ def get_keyword_gap_keywords(
                 continue
 
             for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                try:
+                    task_sc = int(task.get("status_code") or 0)
+                except (TypeError, ValueError):
+                    task_sc = 0
+                if task_sc >= 40000:
+                    logger.warning(
+                        "[DataForSEO] domain_intersection: task error for %s vs %s status_code=%s status_message=%s",
+                        target_domain,
+                        competitor,
+                        task_sc,
+                        (task.get("status_message") or "")[:200],
+                    )
+                    continue
                 results = task.get("result") or []
                 if not results:
                     logger.warning(
@@ -2639,6 +2668,8 @@ def get_keyword_gap_keywords(
                     continue
 
                 for result in results:
+                    if not isinstance(result, dict):
+                        continue
                     items = result.get("items") or []
                     for item in items:
                         keyword_data = item.get("keyword_data") or {}
