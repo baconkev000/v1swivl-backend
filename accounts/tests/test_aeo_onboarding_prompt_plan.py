@@ -394,3 +394,81 @@ def test_aeo_onboarding_step2_reuses_sibling_profile_prompts_same_domain_no_open
     pbt = body["prompts_by_topic"]
     assert set(pbt.keys()) == {"Alpha", "Beta"}
     assert len(pbt["Alpha"]) + len(pbt["Beta"]) == 10
+
+
+@pytest.mark.django_db
+def test_aeo_onboarding_step2_supersedes_inflight_and_enqueues_fresh_run(monkeypatch, settings):
+    settings.AEO_TESTING_MODE = True
+    settings.AEO_TEST_PROMPT_COUNT = 10
+    user = User.objects.create_user(
+        username="u-aeo-step2-supersede",
+        email="u-aeo-step2-supersede@example.com",
+        password="pw",
+    )
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Switch Co",
+        business_address="US",
+        website_url="https://old-site.example",
+    )
+    stale = AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_RUNNING,
+        extraction_status=AEOExecutionRun.STAGE_RUNNING,
+        scoring_status=AEOExecutionRun.STAGE_PENDING,
+        recommendation_status=AEOExecutionRun.STAGE_PENDING,
+        background_status=AEOExecutionRun.STAGE_PENDING,
+    )
+
+    callbacks = []
+    delayed_calls = []
+
+    monkeypatch.setattr("accounts.views.transaction.on_commit", lambda cb: callbacks.append(cb))
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase1_execution_task.delay",
+        lambda run_id, prompt_payload: delayed_calls.append((run_id, prompt_payload)),
+    )
+    monkeypatch.setattr(
+        "accounts.views.build_full_aeo_prompt_plan",
+        lambda *args, **kwargs: {
+            "combined": [
+                {"prompt": f"fresh prompt {i}", "type": "transactional", "weight": 1.0, "dynamic": True}
+                for i in range(10)
+            ],
+            "prompts_by_topic": {"Alpha": [f"fresh prompt {i}" for i in range(5)], "Beta": [f"fresh prompt {i}" for i in range(5, 10)]},
+            "meta": {"openai_status": "ok", "combined_target": 10, "combined_shortfall": 0},
+            "business": {},
+        },
+    )
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    resp = client.post(
+        "/api/aeo/onboarding-prompt-plan/",
+        {
+            "onboarding_step2_prompt_plan": True,
+            "selected_topics": ["Alpha", "Beta"],
+            "onboarding_context": {
+                "business_name": "Switch Co",
+                "website_url": "https://new-site.example",
+                "location": "US",
+                "language": "English",
+            },
+        },
+        format="json",
+    )
+
+    assert resp.status_code == 200
+    stale.refresh_from_db()
+    assert stale.status == AEOExecutionRun.STATUS_FAILED
+    assert stale.error_message == "superseded_onboarding_step2_refresh"
+    assert len(callbacks) == 1
+    assert delayed_calls == []
+
+    callbacks[0]()
+    assert len(delayed_calls) == 1
+    run_id, payload = delayed_calls[0]
+    assert isinstance(run_id, int)
+    assert run_id != stale.id
+    assert len(payload) == 10

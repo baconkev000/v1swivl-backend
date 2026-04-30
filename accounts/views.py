@@ -1891,7 +1891,7 @@ def business_profile(request: HttpRequest) -> Response:
     # If the website URL changed, proactively refresh the SEO score snapshot
     # so that the frontend (and SEO agent) immediately see metrics for the new site.
     new_site_url = serializer.instance.website_url
-    if new_site_url and new_site_url != old_site_url:
+    if not skip_heavy and new_site_url and new_site_url != old_site_url:
         try:
             inst = serializer.instance
             data_user = workspace_data_user(inst) or request.user
@@ -4798,11 +4798,33 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
             from .models import AEOExecutionRun
             from .tasks import run_aeo_phase1_execution_task
 
-            inflight = AEOExecutionRun.objects.filter(
+            inflight_qs = AEOExecutionRun.objects.filter(
                 profile=profile,
                 status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
-            ).exists()
-            if not inflight:
+            )
+            # On onboarding step-2 retries (especially after URL edits), always run the
+            # freshest prompt payload and mark any in-flight run as superseded.
+            should_enqueue = False
+            if onboarding_step2 and inflight_qs.exists():
+                now = django_timezone.now()
+                inflight_qs.update(
+                    status=AEOExecutionRun.STATUS_FAILED,
+                    extraction_status=AEOExecutionRun.STAGE_FAILED,
+                    scoring_status=AEOExecutionRun.STAGE_FAILED,
+                    recommendation_status=AEOExecutionRun.STAGE_FAILED,
+                    background_status=AEOExecutionRun.STAGE_FAILED,
+                    error_message="superseded_onboarding_step2_refresh",
+                    finished_at=now,
+                    updated_at=now,
+                )
+                should_enqueue = True
+            elif onboarding_step2:
+                should_enqueue = True
+            else:
+                # Non-onboarding requests preserve existing dedupe behavior.
+                should_enqueue = not inflight_qs.exists()
+
+            if should_enqueue:
                 run = AEOExecutionRun.objects.create(
                     profile=profile,
                     prompt_count_requested=min(len(combined), target_prompt_count),
@@ -5180,6 +5202,7 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
                 {"detail": "You do not have permission to edit company settings."},
                 status=403,
             )
+        skip_heavy = str(request.GET.get("skip_heavy", "")).strip().lower() in {"1", "true", "yes"}
         old_site_url = profile.website_url
         serializer = BusinessProfileSerializer(
             profile,
@@ -5202,7 +5225,7 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
 
         # If the website URL changed, refresh SEO snapshot for this site.
         new_site_url = profile.website_url
-        if new_site_url and new_site_url != old_site_url:
+        if not skip_heavy and new_site_url and new_site_url != old_site_url:
             try:
                 data_user = workspace_data_user(profile) or request.user
                 run_full_seo_snapshot_for_profile(
@@ -5216,14 +5239,14 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
         # Default PATCH/PUT response to lightweight metrics so profile saves never block on
         # live DataForSEO calls (can exceed worker timeout during external crawl requests).
         skip_heavy_raw = str(request.GET.get("skip_heavy", "")).strip().lower()
-        skip_heavy = True if skip_heavy_raw == "" else skip_heavy_raw in {"1", "true", "yes"}
+        skip_heavy_for_response = True if skip_heavy_raw == "" else skip_heavy
         out = BusinessProfileSerializer(
             profile,
             context={
                 "request": request,
                 "viewer_access": access,
                 "disable_seo_context_for_aeo": True,
-                "skip_heavy_profile_metrics": skip_heavy,
+                "skip_heavy_profile_metrics": skip_heavy_for_response,
             },
         )
         return Response(out.data)
