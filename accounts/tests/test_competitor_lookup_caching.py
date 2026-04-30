@@ -127,3 +127,46 @@ def test_kill_switch_skips_competitor_post_calls(monkeypatch):
     assert domains == []
     assert avg == 0.0
     assert calls["n"] == 0
+
+
+@pytest.mark.django_db
+def test_reddit_dropped_from_labs_competitors_and_from_profile_override(monkeypatch):
+    """reddit.com is excluded so it is not passed to domain_intersection."""
+
+    def fake_get_competitor_domains(*_args, **_kwargs):
+        return ["reddit.com", "real-competitor.example", "other-competitor.example"]
+
+    monkeypatch.setattr(d, "_get_competitor_domains", fake_get_competitor_domains)
+
+    class NoOverride:
+        industry = "cookies"
+        business_address = ""
+        seo_competitor_domains_override = ""
+
+    auto = d.get_competitors_for_domain_intersection(
+        domain="cravecookies.com",
+        location_code=2840,
+        language_code="en",
+        profile=NoOverride(),
+        limit=5,
+        min_competitors=2,
+    )
+    assert "reddit.com" in auto["raw_competitors"]
+    assert "reddit.com" not in auto["filtered_competitors_used"]
+    assert auto["competitor_source"] == "filtered_auto"
+
+    class WithOverride:
+        industry = ""
+        business_address = ""
+        seo_competitor_domains_override = "reddit.com,override-only.example"
+
+    over = d.get_competitors_for_domain_intersection(
+        domain="example.com",
+        location_code=2840,
+        language_code="en",
+        profile=WithOverride(),
+        limit=5,
+        min_competitors=2,
+    )
+    assert over["competitor_source"] == "profile_override"
+    assert over["filtered_competitors_used"] == ["override-only.example"]
