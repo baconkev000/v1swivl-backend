@@ -24,7 +24,9 @@ AEO monitored-prompt expansion toward the paid plan cap is scheduled only from
 resolution—not from onboarding, checkout-return-only flows, or generic profile saves.
 
 Post-payment SEO overview refresh (``post_payment_seo_snapshot_task``) is enqueued from the same
-place when billing shows a paid signal and ``website_url`` is set. AEO expansion is staggered
+place when billing shows a paid signal and ``website_url`` is set. If checkout completed before the
+URL existed, ``enqueue_post_payment_seo_after_website_if_eligible`` runs after ``website_url`` is
+saved on the profile. AEO expansion is staggered
 ``AEO_PROMPT_PLAN_EXPANSION_POST_PAYMENT_COUNTDOWN_SECONDS`` behind that task so workers prioritize
 SEO snapshot work without relying on Celery ``.delay()`` call order.
 """
@@ -60,7 +62,7 @@ def _try_enqueue_post_payment_seo_snapshot(profile_id: int) -> None:
 
     key = f"post_payment_seo_webhook_enqueued:{profile_id}"
     if not cache.add(key, 1, POST_PAYMENT_SEO_WEBHOOK_ENQUEUE_TTL_SECONDS):
-        logger.info(
+        logger.debug(
             "[stripe->SEO] skip_duplicate_enqueue profile_id=%s ttl_s=%s",
             profile_id,
             POST_PAYMENT_SEO_WEBHOOK_ENQUEUE_TTL_SECONDS,
@@ -70,10 +72,51 @@ def _try_enqueue_post_payment_seo_snapshot(profile_id: int) -> None:
         from .tasks import post_payment_seo_snapshot_task
 
         post_payment_seo_snapshot_task.delay(profile_id)
-        logger.info("[stripe->SEO] enqueued post_payment_seo_snapshot_task profile_id=%s", profile_id)
+        logger.debug("[stripe->SEO] enqueued post_payment_seo_snapshot_task profile_id=%s", profile_id)
     except Exception:
         cache.delete(key)
         logger.exception("[stripe->SEO] enqueue_failed profile_id=%s", profile_id)
+
+
+def business_profile_eligible_for_post_payment_seo(profile: BusinessProfile) -> bool:
+    """
+    Paid workspace that should receive an SEO overview snapshot — aligns with webhook gating
+    (active Stripe subscription or starter/pro/advanced plan on profile).
+    """
+    st = str(getattr(profile, "stripe_subscription_status", "") or "").strip().lower()
+    if st in ACTIVE_STRIPE_STATUSES:
+        return True
+    plan = str(getattr(profile, "plan", "") or "").strip().lower()
+    return plan in {
+        BusinessProfile.PLAN_STARTER,
+        BusinessProfile.PLAN_PRO,
+        BusinessProfile.PLAN_ADVANCED,
+        "enterprise",
+        "scale",
+    }
+
+
+def enqueue_post_payment_seo_after_website_if_eligible(profile_id: int) -> None:
+    """
+    If the user paid before ``website_url`` existed, the Stripe webhook skipped SEO enqueue.
+    Call this after ``website_url`` is saved so ``post_payment_seo_snapshot_task`` can run.
+    """
+    p = BusinessProfile.objects.filter(pk=int(profile_id)).select_related("user").first()
+    if p is None:
+        logger.warning("[stripe->SEO] after_website_save profile_not_found profile_id=%s", profile_id)
+        return
+    site = str(getattr(p, "website_url", "") or "").strip()
+    if not site:
+        return
+    if not business_profile_eligible_for_post_payment_seo(p):
+        logger.debug(
+            "[stripe->SEO] after_website_save skip_not_eligible profile_id=%s plan=%s stripe_status=%s",
+            profile_id,
+            getattr(p, "plan", None),
+            getattr(p, "stripe_subscription_status", None),
+        )
+        return
+    _try_enqueue_post_payment_seo_snapshot(p.id)
 
 
 @dataclass(frozen=True)

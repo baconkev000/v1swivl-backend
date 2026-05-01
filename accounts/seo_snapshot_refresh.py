@@ -177,7 +177,7 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
     ranked_after = int(rank_stats.get("non_null_after") or 0)
     coverage = (ranked_after / total) if total > 0 else 0.0
     min_coverage = float(getattr(settings, "SEO_RANK_ENRICHMENT_MIN_COVERAGE", 0.05))
-    logger.info(
+    logger.debug(
         "[SEO sync enrich] rank enrichment coverage user_id=%s total=%s ranked_after=%s coverage=%.2f%% filled_ranked=%s filled_gap=%s",
         getattr(user, "id", None),
         total,
@@ -253,7 +253,7 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
     outranking_competitor_pct = (
         keywords_with_outranking_competitor / total_keywords * 100.0 if total_keywords > 0 else 0.0
     )
-    logger.info(
+    logger.debug(
         "[SEO sync enrich] keyword coverage user_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f outranking_competitor_pct=%.2f",
         getattr(user, "id", None),
         total_keywords,
@@ -271,7 +271,7 @@ def sync_enrich_current_period_seo_snapshot_for_profile(
             business_profile=profile,
         )
     )
-    logger.info(
+    logger.debug(
         "[SEO sync enrich] recompute user_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
         getattr(user, "id", None),
         keywords_with_rank,

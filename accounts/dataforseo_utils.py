@@ -74,7 +74,7 @@ def _dbg_ba84ae_log(
 ) -> None:
     """Write a single NDJSON debug log line for this debug session."""
     try:
-        logger.info(
+        logger.debug(
             "[ba84ae_debug] %s %s: %s",
             hypothesisId,
             runId,
@@ -497,7 +497,7 @@ def get_competitors_for_domain_intersection(
 
     # Debug logs: raw vs filtered.
     try:
-        logger.info(
+        logger.debug(
             "[SEO competitors] domain=%s raw_competitors=%s filtered_auto=%s used=%s source=%s",
             domain,
             raw_competitor_candidates,
@@ -826,7 +826,7 @@ def _post(
         if wait <= 0.0:
             return
         bounded = min(wait, max_pre_wait)
-        logger.info("[DataForSEO] waiting %.2fs due to global cooldown path=%s", bounded, path)
+        logger.debug("[DataForSEO] waiting %.2fs due to global cooldown path=%s", bounded, path)
         time.sleep(bounded)
 
     resp = None
@@ -1000,7 +1000,7 @@ def _post(
                 task_statuses.append(int(t.get("status_code") or 0))
             except (TypeError, ValueError):
                 task_statuses.append(0)
-    logger.info(
+    logger.debug(
         "[DataForSEO] response path=%s http_status=%s top_status_code=%s top_status_message=%s tasks_count=%s tasks_error=%s task_statuses=%s body=%s%s",
         path,
         resp.status_code,
@@ -1136,7 +1136,7 @@ def _get_competitor_average_traffic(
     of the top competitors for the given domain.
     """
     if bool(getattr(settings, "DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS", False)):
-        logger.info(
+        logger.warning(
             "[DataForSEO] competitor lookup bypassed (kill switch) path=_get_competitor_average_traffic domain=%s",
             target_domain,
         )
@@ -1232,7 +1232,7 @@ def _get_competitor_domains(
     high-intent opportunity keywords.
     """
     if bool(getattr(settings, "DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS", False)):
-        logger.info(
+        logger.warning(
             "[DataForSEO] competitor lookup bypassed (kill switch) path=_get_competitor_domains domain=%s",
             target_domain,
         )
@@ -1289,7 +1289,7 @@ def _get_competitor_domains(
             domains.append(domain)
             if len(domains) >= limit:
                 break
-        logger.info(
+        logger.debug(
             "[DataForSEO] competitors_domain domains for target=%s -> %s",
             target_domain,
             domains[:limit],
@@ -1391,7 +1391,7 @@ def get_ranked_keywords_visibility(
             for item in items
         )
 
-        logger.info(
+        logger.debug(
             "[DataForSEO] ranked_keywords target=%s visibility=%.2f keywords_count=%s top3=%s",
             target_domain,
             visibility,
@@ -1674,7 +1674,7 @@ def _crawl_pages_for_aeo(
         "H3",
     )
     # #endregion
-    logger.info(
+    logger.debug(
         "[AEO debug eb0539] H3 crawl entry target_domain=%s normalized_domain=%s max_pages=%s",
         target_domain,
         normalized_domain,
@@ -1689,7 +1689,7 @@ def _crawl_pages_for_aeo(
             "H3",
         )
         # #endregion
-        logger.info("[AEO debug eb0539] H3 crawl early return: no normalized domain")
+        logger.warning("[AEO debug eb0539] H3 crawl early return: no normalized domain (crawl cannot proceed)")
         return {"pages": [], "aeo_status": "error", "exit_reason": "no_domain", "task_id": None}
 
     resolved_location_code = int(
@@ -1730,7 +1730,7 @@ def _crawl_pages_for_aeo(
         cached_task_id = cache.get(task_key)
         if isinstance(cached_task_id, str) and cached_task_id.strip():
             task_id = cached_task_id.strip()
-            logger.info("[AEO crawl] Reusing existing task domain=%s task_id=%s", normalized_domain, task_id)
+            logger.debug("[AEO crawl] Reusing existing task domain=%s task_id=%s", normalized_domain, task_id)
         else:
             return {"pages": [], "aeo_status": "processing", "exit_reason": "lock_in_progress", "task_id": None}
 
@@ -1774,7 +1774,7 @@ def _crawl_pages_for_aeo(
             return {"pages": [], "aeo_status": "error", "exit_reason": "parse_error", "task_id": task_id}
 
         if pages:
-            logger.info(
+            logger.debug(
                 "[AEO crawl] attempt=%s elapsed=%.2fs next_sleep=0.00 status=%s pages=%s exit_reason=finished_with_pages",
                 attempt,
                 elapsed,
@@ -1786,7 +1786,7 @@ def _crawl_pages_for_aeo(
         if task_status_code >= 40000:
             homepage_page = _fetch_homepage_page_for_aeo(normalized_domain)
             if homepage_page:
-                logger.info(
+                logger.debug(
                     "[AEO crawl] attempt=%s elapsed=%.2fs next_sleep=0.00 status=%s pages=1 exit_reason=fallback_used",
                     attempt,
                     elapsed,
@@ -1803,7 +1803,7 @@ def _crawl_pages_for_aeo(
             return {"pages": [], "aeo_status": "error", "exit_reason": "api_error", "task_id": task_id}
 
         next_sleep = min(15.0, sleep_seconds * random.uniform(0.8, 1.2))
-        logger.info(
+        logger.debug(
             "[AEO crawl] attempt=%s elapsed=%.2fs next_sleep=%.2fs status=%s pages=%s exit_reason=processing",
             attempt,
             elapsed,
@@ -1895,7 +1895,7 @@ def crawl_pages_for_onboarding(
         cached_task_id = cache.get(task_key)
         if isinstance(cached_task_id, str) and cached_task_id.strip():
             task_id = cached_task_id.strip()
-            logger.info(
+            logger.debug(
                 "[onboarding onpage] Reusing task domain=%s task_id=%s",
                 normalized_domain,
                 task_id,
@@ -1953,7 +1953,7 @@ def crawl_pages_for_onboarding(
             return out_base
 
         if pages:
-            logger.info(
+            logger.debug(
                 "[onboarding onpage] done domain=%s pages=%s task_id=%s",
                 normalized_domain,
                 len(pages[:cap]),
@@ -2125,7 +2125,7 @@ def compute_faq_readiness_for_pages(pages: List[Dict[str, Any]]) -> Dict[str, An
         "H7",
     )
     # #endregion
-    logger.info(
+    logger.debug(
         "[AEO debug eb0539] H7 faq summary pages=%s faq_blocks=%s faq_schema=%s score=%s",
         len(pages),
         int(faq_blocks_found),
@@ -2208,7 +2208,7 @@ def compute_snippet_readiness_for_pages(pages: List[Dict[str, Any]]) -> Dict[str
         "H8",
     )
     # #endregion
-    logger.info(
+    logger.debug(
         "[AEO debug eb0539] H8 snippet summary pages=%s answer_blocks=%s near_target=%s score=%s",
         len(pages),
         int(answer_blocks_found),
@@ -2283,7 +2283,7 @@ def get_question_coverage_for_site(
             "H9",
         )
         # #endregion
-        logger.info(
+        logger.debug(
             "[AEO debug eb0539] H9 keywords count=%s sample=%s",
             len(weighted_keywords),
             [kw for kw, _sv in weighted_keywords[:5]],
@@ -2328,7 +2328,7 @@ def get_question_coverage_for_site(
             "H9",
         )
         # #endregion
-        logger.info(
+        logger.debug(
             "[AEO debug eb0539] H9 page text length=%s fragments=%s contains_faq=%s",
             len(page_text),
             len(text_fragments),
@@ -2363,7 +2363,7 @@ def get_question_coverage_for_site(
             "H9",
         )
         # #endregion
-        logger.info(
+        logger.debug(
             "[AEO debug eb0539] H9 match summary found=%s missing=%s score=%s",
             len(questions_found),
             len(questions_missing),
@@ -2438,7 +2438,7 @@ def get_aeo_content_readiness_for_site(
                     "H2",
                 )
                 # #endregion
-                logger.info(
+                logger.debug(
                     "[AEO debug eb0539] H2 cache hit domain=%s niche=%s key=%s",
                     normalized_domain,
                     normalized_niche,
@@ -2502,7 +2502,7 @@ def get_aeo_content_readiness_for_site(
                     "snippet_readiness_score": int(snapshot.snippet_readiness_score or 0),
                     "answer_blocks_found": int(snapshot.answer_blocks_found or 0),
                 }
-                logger.info(
+                logger.debug(
                     "[AEO crawl] status=%s exit_reason=%s using_snapshot profile_id=%s domain=%s",
                     aeo_status,
                     exit_reason,
@@ -2566,7 +2566,7 @@ def get_aeo_content_readiness_for_site(
             "H5",
         )
         # #endregion
-        logger.info(
+        logger.debug(
             "[AEO debug eb0539] H5 computed domain=%s pages=%s q=%s faq=%s snip=%s found=%s missing=%s",
             normalized_domain,
             len(pages or []),
@@ -2613,14 +2613,14 @@ def get_keyword_gap_keywords(
         target_domain=target_domain,
     )
     if dropped_inputs:
-        logger.info(
+        logger.debug(
             "[DataForSEO] domain_intersection sanitized dropped=%s target=%s examples=%s",
             len(dropped_inputs),
             target_domain,
             dropped_inputs[:15],
         )
     if not cleaned_competitors:
-        logger.info(
+        logger.warning(
             "[DataForSEO] domain_intersection skipped for %s: no competitors configured",
             target_domain,
         )
@@ -2640,7 +2640,7 @@ def get_keyword_gap_keywords(
     if not force_refresh and not global_force:
         cached = cache.get(cache_key)
         if cached is not None:
-            logger.info(
+            logger.debug(
                 "[DataForSEO] domain_intersection cache_hit key_suffix=%s target=%s competitors_n=%s limit=%s",
                 cache_key[-12:],
                 norm_target,
@@ -2649,7 +2649,7 @@ def get_keyword_gap_keywords(
             )
             return list(cached)
 
-    logger.info(
+    logger.debug(
         "[DataForSEO] domain_intersection cache_miss key_suffix=%s target=%s competitors_n=%s limit=%s force_refresh=%s",
         cache_key[-12:],
         norm_target,
@@ -2867,7 +2867,7 @@ def get_keyword_gap_keywords(
 
     gap_keywords = list(aggregated.values())
 
-    logger.info(
+    logger.debug(
         "[DataForSEO] domain_intersection target=%s competitors=%s keyword_count=%s",
         target_domain,
         ",".join(cleaned_competitors),
@@ -3097,7 +3097,7 @@ def fetch_ranked_keyword_items(
             "limit": int(limit),
         },
     ]
-    logger.info(
+    logger.debug(
         "[SEO score] ranked_keywords request user_id=%s domain=%s payload=%s",
         getattr(user, "id", None),
         domain,
@@ -3190,7 +3190,7 @@ def fetch_ranked_keyword_items(
             "S3",
         )
         # #endregion
-        logger.info(
+        logger.debug(
             "[SEO score] ranked_keywords parsed user_id=%s domain=%s task_status=%s items=%s",
             getattr(user, "id", None),
             domain,
@@ -3209,7 +3209,7 @@ def fetch_ranked_keyword_items(
                 ),
                 "keyword": (first_item.get("keyword_data") or {}).get("keyword") or first_item.get("keyword"),
             }
-            logger.info(
+            logger.debug(
                 "[SEO score] ranked_keywords first_item_preview user_id=%s domain=%s preview=%s",
                 getattr(user, "id", None),
                 domain,
@@ -3601,7 +3601,7 @@ def enrich_with_gap_keywords(
             )
         except Exception:
             pass
-        logger.info(
+        logger.debug(
             "[SEO score] Gap enrichment rank non-null coverage domain=%s before=%s after=%s",
             domain,
             rank_non_null_before,
@@ -3977,7 +3977,7 @@ def enrich_keyword_ranks_from_labs(
                 # Keep baseline `rank` intact in step 1, but expose source metadata.
                 row["rank_source"] = "local_verified"
         else:
-            logger.info(
+            logger.warning(
                 "[SEO local verify] local mode enabled but no city/state resolved; baseline retained domain=%s",
                 domain,
             )
