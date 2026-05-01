@@ -56,7 +56,10 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
         return
     site = str(getattr(profile, "website_url", "") or "").strip()
     if not site:
-        logger.info("[stripe->SEO] skip_no_website profile_id=%s", pid)
+        logger.warning(
+            "[stripe->SEO] skip_no_website post_payment_seo_snapshot_task (snapshot never ran; URL missing) profile_id=%s",
+            pid,
+        )
         return
     data_user = workspace_data_user(profile) or profile.user
     if data_user is None:
@@ -68,7 +71,7 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
             data_user_fallback=data_user,
             abort_on_low_coverage=True,
         )
-        logger.info(
+        logger.debug(
             "[stripe->SEO] refresh_done profile_id=%s user_id=%s persisted=%s",
             pid,
             getattr(data_user, "id", None),
@@ -82,13 +85,13 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
                 sync_result.get("detail"),
             )
         elif sync_result.get("persisted"):
-            logger.info(
+            logger.debug(
                 "[stripe->SEO] sync_enrich_persisted profile_id=%s snapshot_id=%s",
                 pid,
                 sync_result.get("snapshot_id"),
             )
         elif sync_result.get("detail"):
-            logger.info(
+            logger.warning(
                 "[stripe->SEO] sync_enrich_skipped profile_id=%s detail=%s",
                 pid,
                 sync_result.get("detail"),
@@ -133,13 +136,13 @@ def sync_enrich_seo_snapshot_for_profile_task(self, profile_id: int) -> None:
                 sync_result.get("detail"),
             )
         elif sync_result.get("persisted"):
-            logger.info(
+            logger.debug(
                 "[SEO sync enrich task] persisted profile_id=%s snapshot_id=%s",
                 pid,
                 sync_result.get("snapshot_id"),
             )
         elif sync_result.get("detail"):
-            logger.info(
+            logger.warning(
                 "[SEO sync enrich task] skipped profile_id=%s detail=%s",
                 pid,
                 sync_result.get("detail"),
@@ -430,7 +433,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         total = int(rank_stats.get("total") or 0)
         ranked_after = int(rank_stats.get("non_null_after") or 0)
         coverage = (ranked_after / total) if total > 0 else 0.0
-        logger.info(
+        logger.debug(
             "[SEO async] rank enrichment coverage snapshot_id=%s total=%s ranked_after=%s coverage=%.2f%% filled_ranked=%s filled_gap=%s",
             snapshot_id,
             total,
@@ -503,7 +506,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         if total_keywords > 0
         else 0.0
     )
-    logger.info(
+    logger.debug(
         "[SEO async] keyword coverage snapshot_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f outranking_competitor_pct=%.2f",
         snapshot_id,
         total_keywords,
@@ -537,7 +540,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
                 business_profile=profile_for_metrics,
             )
         )
-        logger.info(
+        logger.debug(
             "[SEO async] recompute snapshot_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
             snapshot_id,
             keywords_with_rank,
@@ -670,7 +673,7 @@ def generate_snapshot_next_steps_task(self, snapshot_id: int) -> None:
 
     kws = list(getattr(snapshot, "top_keywords", None) or [])
     if not kws:
-        logger.info(
+        logger.warning(
             "[SEO async] generate_snapshot_next_steps_task skip empty top_keywords snapshot_id=%s",
             snapshot_id,
         )

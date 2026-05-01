@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -27,6 +28,7 @@ from .dataforseo_utils import (
 )
 from .openai_utils import generate_aeo_recommendations
 from .onboarding_completion import business_profile_fully_onboarded
+from .stripe_billing import enqueue_post_payment_seo_after_website_if_eligible
 from . import debug_log as _debug
 
 
@@ -555,6 +557,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         user_data = validated_data.pop("user", {}) or {}
         full_name = validated_data.get("full_name", None)
         user = getattr(instance, "user", None)
+        old_website = str(getattr(instance, "website_url", "") or "").strip()
 
         if user is not None:
             email = user_data.get("email", None)
@@ -581,6 +584,16 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         instance = super().update(instance, validated_data)
         if tc is not None:
             self._apply_tracked_competitors(instance, tc)
+
+        new_website = str(getattr(instance, "website_url", "") or "").strip()
+        if not old_website and new_website and instance.pk:
+            pid = int(instance.pk)
+
+            def _enqueue_seo() -> None:
+                enqueue_post_payment_seo_after_website_if_eligible(pid)
+
+            transaction.on_commit(_enqueue_seo)
+
         return instance
 
     def to_representation(self, instance: BusinessProfile) -> dict:
@@ -619,7 +632,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             return cache_map[pid]
 
         try:
-            logger.info(
+            logger.debug(
                 "[BusinessProfileSerializer] get_seo_score: user_id=%s site_url=%s",
                 getattr(user, "id", None),
                 site_url,
@@ -635,13 +648,13 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 cache_map[pid] = data
                 setattr(self, cache_attr, cache_map)
             if not data:
-                logger.info(
+                logger.debug(
                     "[BusinessProfileSerializer] get_seo_score: no data returned for user_id=%s",
                     getattr(user, "id", None),
                 )
                 return None
 
-            logger.info(
+            logger.debug(
                 "[BusinessProfileSerializer] get_seo_score: resolved seo_bundle=%s for user_id=%s",
                 {k: data.get(k) for k in ["seo_score", "search_performance_score"]},
                 getattr(user, "id", None),
@@ -807,7 +820,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "H1",
         )
         # #endregion
-        logger.info(
+        logger.debug(
             "[AEO debug eb0539] H1 serializer entry profile_id=%s user_id=%s domain=%s force_refresh=%s industry=%s",
             getattr(obj, "id", None),
             getattr(getattr(obj, "user", None), "id", None),
@@ -840,7 +853,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                     "H1",
                 )
                 # #endregion
-                logger.info(
+                logger.debug(
                     "[AEO debug 442421] snapshot cache hit profile_id=%s domain=%s refreshed_at=%s aeo=%s q=%s faq=%s snip=%s found=%s missing=%s",
                     getattr(obj, "id", None),
                     domain or "",
@@ -905,7 +918,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "H2",
         )
         # #endregion
-        logger.info(
+        logger.debug(
             "[AEO debug eb0539] H2 serializer result profile_id=%s q=%s faq=%s snip=%s found=%s missing=%s",
             getattr(obj, "id", None),
             int(data.get("question_coverage_score") or 0),
