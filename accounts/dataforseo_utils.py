@@ -263,6 +263,46 @@ def _is_excluded_competitor_domain(domain: str) -> bool:
     return False
 
 
+def _normalize_competitor_host(raw: str) -> str:
+    """Normalize URL or bare hostname to root host (no www), lowercase."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    urlish = s if "://" in s else f"https://{s}"
+    return (normalize_domain(urlish) or "").strip().lower()
+
+
+def sanitize_competitors_for_domain_intersection(
+    competitor_domains: List[str],
+    *,
+    target_domain: str,
+) -> tuple[List[str], List[str]]:
+    """
+    Normalize hosts, drop excluded UGC/aggregator domains and the target domain.
+    Returns (sorted unique usable hosts, raw inputs dropped for logging).
+    """
+    norm_target = _normalize_competitor_host(target_domain)
+    seen: set[str] = set()
+    usable: List[str] = []
+    dropped_raw: List[str] = []
+    for raw in competitor_domains:
+        host = _normalize_competitor_host(raw)
+        if not host:
+            continue
+        if norm_target and host == norm_target:
+            dropped_raw.append(raw)
+            continue
+        if _is_excluded_competitor_domain(host):
+            dropped_raw.append(raw)
+            continue
+        if host in seen:
+            continue
+        seen.add(host)
+        usable.append(host)
+    usable.sort()
+    return usable, dropped_raw
+
+
 def _extract_tokens_from_text(text: str, *, min_len: int = 3, max_tokens: int = 20) -> List[str]:
     """
     Extract lowercase word tokens usable for heuristic domain scoring.
@@ -372,7 +412,11 @@ def get_competitors_for_domain_intersection(
     business_address = ((_profile.business_address or "").strip()).lower() if _profile else ""
 
     override_raw = _parse_domain_csv(getattr(_profile, "seo_competitor_domains_override", "") or "")
-    override_domains = [d for d in override_raw if not _is_excluded_competitor_domain(d)]
+    override_domains: List[str] = []
+    for d in override_raw:
+        nd = _normalize_competitor_host(d)
+        if nd and not _is_excluded_competitor_domain(nd):
+            override_domains.append(nd)
 
     raw_competitor_candidates: List[str] = []
     if not override_domains:
@@ -387,15 +431,17 @@ def get_competitors_for_domain_intersection(
         )
 
     # Filter out generic aggregators/social/map/listing domains.
+    norm_target_domain = _normalize_competitor_host(domain)
     filtered_auto: List[str] = []
     for c in raw_competitor_candidates:
-        if not c:
+        norm_c = _normalize_competitor_host(c)
+        if not norm_c:
             continue
-        if c.lower().strip() == domain.lower().strip():
+        if norm_target_domain and norm_c == norm_target_domain:
             continue
-        if _is_excluded_competitor_domain(c):
+        if _is_excluded_competitor_domain(norm_c):
             continue
-        filtered_auto.append(c.lower().strip())
+        filtered_auto.append(norm_c)
 
     # Heuristic prioritization: same niche + possible geo hints inside the domain.
     niche_tokens = _extract_tokens_from_text(industry_lower, min_len=3, max_tokens=20)
@@ -424,8 +470,12 @@ def get_competitors_for_domain_intersection(
     filtered_auto_prioritized = [c for _i, c, _s in scored_auto][:limit]
 
     manual_raw = getattr(settings, "DATAFORSEO_MANUAL_COMPETITORS", "") or ""
-    manual_competitors = _parse_domain_csv(manual_raw)
-    manual_competitors = [c for c in manual_competitors if not _is_excluded_competitor_domain(c)][:limit]
+    manual_competitors: List[str] = []
+    for c in _parse_domain_csv(manual_raw):
+        nc = _normalize_competitor_host(c)
+        if nc and not _is_excluded_competitor_domain(nc):
+            manual_competitors.append(nc)
+    manual_competitors = manual_competitors[:limit]
 
     competitor_domains_used: List[str] = []
     competitor_source = "none"
@@ -2558,13 +2608,17 @@ def get_keyword_gap_keywords(
     does not re-bill DataForSEO per competitor. Use ``force_refresh=True`` or settings
     ``DATAFORSEO_DOMAIN_INTERSECTION_FORCE_REFRESH`` to bypass.
     """
-    cleaned_competitors = sorted(
-        {
-            c.strip().lower()
-            for c in competitor_domains
-            if c.strip() and not _is_excluded_competitor_domain(c.strip().lower())
-        }
+    cleaned_competitors, dropped_inputs = sanitize_competitors_for_domain_intersection(
+        competitor_domains,
+        target_domain=target_domain,
     )
+    if dropped_inputs:
+        logger.info(
+            "[DataForSEO] domain_intersection sanitized dropped=%s target=%s examples=%s",
+            len(dropped_inputs),
+            target_domain,
+            dropped_inputs[:15],
+        )
     if not cleaned_competitors:
         logger.info(
             "[DataForSEO] domain_intersection skipped for %s: no competitors configured",

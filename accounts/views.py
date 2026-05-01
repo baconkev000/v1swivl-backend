@@ -95,6 +95,7 @@ from .aeo.aeo_plan_targets import (
     aeo_onboarding_complete_min_prompts,
     aeo_should_run_post_payment_expansion,
 )
+from .stripe_billing import _plan_from_price
 from .aeo.aeo_utils import (
     aeo_business_input_from_onboarding_payload,
     aeo_business_input_from_profile,
@@ -1362,7 +1363,11 @@ def seo_overview(request: HttpRequest) -> Response:
     data_user = workspace_data_user(profile) or request.user
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile_for_context)
 
-    # Serve from cache if we have a snapshot for this period fetched within the last hour (unless refresh=1).
+    site_url_for_cache = str(profile.website_url or "").strip()
+    parsed_domain_for_cache = normalize_domain(site_url_for_cache) if site_url_for_cache else ""
+
+    # Serve from cache when snapshot matches get_cached_seo_snapshot freshness (refreshed_at or
+    # last_fetched_at) and cached_domain matches the profile website (unless refresh=1).
     if not force_refresh:
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
@@ -1371,7 +1376,14 @@ def seo_overview(request: HttpRequest) -> Response:
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
             )
-            if snapshot.last_fetched_at >= cutoff:
+            fresh_ts = snapshot.refreshed_at or snapshot.last_fetched_at
+            snap_dom = (snapshot.cached_domain or "").strip().lower()
+            domain_ok = (
+                not parsed_domain_for_cache
+                or not snap_dom
+                or snap_dom == parsed_domain_for_cache
+            )
+            if fresh_ts is not None and fresh_ts >= cutoff and domain_ok:
                 prev_clicks = snapshot.prev_organic_visitors or 0
                 organic_visitors = snapshot.organic_visitors or 0
                 if prev_clicks == 0:
@@ -1388,7 +1400,16 @@ def seo_overview(request: HttpRequest) -> Response:
                     competitor_avg_traffic=0.0,
                 )
                 # #region agent log
-                _debug.log("views.py:seo_overview:cache_hit", "returning from snapshot cache", {"organic_visitors": organic_visitors, "last_fetched_at": str(snapshot.last_fetched_at), "cutoff": str(cutoff)}, "H2")
+                _debug.log(
+                    "views.py:seo_overview:cache_hit",
+                    "returning from snapshot cache",
+                    {
+                        "organic_visitors": organic_visitors,
+                        "fresh_ts": str(fresh_ts),
+                        "cutoff": str(cutoff),
+                    },
+                    "H2",
+                )
                 # #endregion
                 return Response(
                     {
@@ -1530,6 +1551,8 @@ def seo_overview(request: HttpRequest) -> Response:
         snapshot.prev_organic_visitors = prev_vis
         snapshot.keywords_ranking = keywords_ranking
         snapshot.top3_positions = top3_positions
+        snapshot.refreshed_at = now
+        snapshot.cached_domain = domain
         snapshot.save()
 
         seo_score = compute_professional_seo_score(
@@ -2224,6 +2247,16 @@ def billing_summary(request: HttpRequest) -> Response:
             monthly_price, _monthly_minor = _monthly_price_from_price_obj(price_obj)
             out["price_month"] = monthly_price
             out["currency"] = str(price_obj.get("currency") or "usd").lower()
+            # Prefer Stripe price → plan mapping so the label matches the subscription even when
+            # BusinessProfile.plan was never updated or is out of sync with Stripe.
+            stripe_price_id = str(price_obj.get("id") or "").strip()
+            slug_from_stripe = _plan_from_price(stripe_price_id) if stripe_price_id else None
+            if slug_from_stripe in {
+                BusinessProfile.PLAN_STARTER,
+                BusinessProfile.PLAN_PRO,
+                BusinessProfile.PLAN_ADVANCED,
+            }:
+                out["plan_label"] = _plan_label_from_slug(slug_from_stripe)
         sub_period_end = subscription_dict.get("current_period_end")
         if isinstance(sub_period_end, int):
             dt = _safe_dt_from_unix(sub_period_end)
@@ -3782,6 +3815,11 @@ def _aeo_competitors_mutate_post(request: HttpRequest, profile: BusinessProfile 
     nd = normalize_tracked_competitor_domain(domain_raw)
     if not nd:
         return Response({"detail": "Invalid domain."}, status=400)
+    # Reload from DB so we never merge against a stale M2M prefetch from earlier in the request.
+    fresh_profile = BusinessProfile.objects.filter(pk=profile.pk).first()
+    if fresh_profile is None:
+        return Response({"detail": "No active business profile."}, status=404)
+    profile = fresh_profile
     own = (normalize_domain(profile.website_url or "") or "").strip().lower()
     if own and nd == own:
         return Response({"detail": "You cannot track your own website as a competitor."}, status=400)

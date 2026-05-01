@@ -1,3 +1,5 @@
+from urllib.parse import urlparse
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -207,7 +209,28 @@ class BusinessProfile(models.Model):
         verbose_name_plural = "Business profiles"
 
     def __str__(self) -> str:
-        return f"BusinessProfile(user={self.user!s})"
+        """Human-readable label for admin, logs, and relation dropdowns (not the Python repr)."""
+        name = (self.business_name or "").strip()
+        if name:
+            return name
+        contact = (self.full_name or "").strip()
+        if contact:
+            return contact
+        raw_url = (self.website_url or "").strip()
+        if raw_url:
+            try:
+                parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+                host = (parsed.netloc or parsed.path or "").strip().lower()
+                if host.startswith("www."):
+                    host = host[4:]
+                if host:
+                    return host
+            except Exception:
+                pass
+        pk = getattr(self, "pk", None)
+        if pk:
+            return f"Business profile #{pk}"
+        return "Business profile"
 
 
 class BusinessProfileMembership(models.Model):

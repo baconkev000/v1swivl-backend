@@ -170,3 +170,27 @@ def test_reddit_dropped_from_labs_competitors_and_from_profile_override(monkeypa
     )
     assert over["competitor_source"] == "profile_override"
     assert over["filtered_competitors_used"] == ["override-only.example"]
+
+
+@pytest.mark.django_db
+def test_keyword_gap_keywords_normalizes_urls_and_drops_reddit(monkeypatch):
+    """URLs and reddit must never reach domain_intersection/live as target2."""
+    captured: list[dict] = []
+
+    def fake_post(endpoint, payload, **_kwargs):
+        captured.extend(payload)
+        return {"tasks": [{"status_code": 20000, "result": []}]}
+
+    monkeypatch.setattr(d, "_post", fake_post)
+
+    d.get_keyword_gap_keywords(
+        "pieholeutah.com",
+        ["https://www.reddit.com/r/foo", "https://partner.example/page?q=1"],
+        location_code=2840,
+        language_code="en",
+    )
+
+    target2s = [row.get("target2") for row in captured]
+    assert "reddit.com" not in target2s
+    assert "www.reddit.com" not in target2s
+    assert any(t == "partner.example" for t in target2s)
