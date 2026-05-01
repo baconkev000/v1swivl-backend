@@ -19,6 +19,7 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.serializers import ValidationError as DRFValidationError
 
 from .business_profile_access import (
     accessible_business_profiles_queryset,
@@ -1816,6 +1817,26 @@ def me(request: HttpRequest) -> JsonResponse:
     )
 
 
+def _strip_website_url_if_locked(profile: BusinessProfile, data: object) -> dict:
+    """
+    Once a profile has a stored website, ignore ``website_url`` in PATCH payloads so
+    the domain cannot be changed via the company settings API (onboarding may still set
+    it when the field is currently empty).
+    """
+    if isinstance(data, dict):
+        out = {**data}
+    elif hasattr(data, "dict"):
+        out = data.dict()  # type: ignore[assignment]
+    else:
+        try:
+            out = dict(data)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return {}
+    if str(getattr(profile, "website_url", "") or "").strip():
+        out.pop("website_url", None)
+    return out
+
+
 @csrf_exempt
 @api_view(["GET", "PATCH", "PUT"])
 @authentication_classes([CsrfExemptSessionAuthentication])
@@ -1879,9 +1900,10 @@ def business_profile(request: HttpRequest) -> Response:
 
     skip_heavy = str(request.GET.get("skip_heavy", "")).strip().lower() in {"1", "true", "yes"}
     old_site_url = profile.website_url
+    patch_data = _strip_website_url_if_locked(profile, request.data)
     serializer = BusinessProfileSerializer(
         profile,
-        data=request.data,
+        data=patch_data,
         partial=True,
         context=base_ctx,
     )
@@ -3746,14 +3768,67 @@ def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
     return Response(aeo_onboarding_competitors_visibility(profile))
 
 
+# Tracked AEO competitors (UI cap); keep in sync with frontend CompetitorsView.
+AEO_TRACKED_COMPETITOR_CAP = 5
+
+
+def _aeo_competitors_mutate_post(request: HttpRequest, profile: BusinessProfile | None) -> Response:
+    """Append one tracked competitor (used by Competitors page POST /api/aeo/competitors/)."""
+    if profile is None:
+        return Response({"detail": "No active business profile."}, status=404)
+    body = request.data if isinstance(request.data, dict) else {}
+    domain_raw = str(body.get("domain") or "").strip()
+    name_raw = str(body.get("name") or "").strip()
+    nd = normalize_tracked_competitor_domain(domain_raw)
+    if not nd:
+        return Response({"detail": "Invalid domain."}, status=400)
+    own = (normalize_domain(profile.website_url or "") or "").strip().lower()
+    if own and nd == own:
+        return Response({"detail": "You cannot track your own website as a competitor."}, status=400)
+    if not name_raw:
+        name_raw = nd.split(".")[0].title() if nd else "Competitor"
+    current_rows = [
+        {"name": c.name, "domain": c.domain}
+        for c in profile.tracked_competitors.order_by("domain").all()
+    ]
+    if any(str(x.get("domain") or "").strip().lower() == nd for x in current_rows):
+        return Response({"ok": True, "detail": "Already tracking this domain."})
+    if len(current_rows) >= AEO_TRACKED_COMPETITOR_CAP:
+        return Response(
+            {"detail": f"You can track at most {AEO_TRACKED_COMPETITOR_CAP} competitors."},
+            status=400,
+        )
+    try:
+        merged = BusinessProfileSerializer._normalize_tracked_competitors_input(
+            current_rows + [{"name": name_raw, "domain": nd}]
+        )
+    except DRFValidationError as exc:
+        det = exc.detail
+        return Response(det if isinstance(det, dict) else {"detail": str(det)}, status=400)
+    BusinessProfileSerializer._apply_tracked_competitors(profile, merged)
+    return Response({"ok": True})
+
+
+def _aeo_competitors_mutate_delete(request: HttpRequest, profile: BusinessProfile | None) -> Response:
+    """Removing tracked competitors is disabled (UI hides Remove; API returns 403)."""
+    del request, profile
+    return Response(
+        {"detail": "Removing tracked competitors is not available."},
+        status=403,
+    )
+
+
 @csrf_exempt
-@api_view(["GET"])
+@api_view(["GET", "POST", "DELETE"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def aeo_competitors_data(request: HttpRequest) -> Response:
     """
     Competitors page payload (tracked + suggested) using cached competitor snapshots.
     Lazy-computes the snapshot when absent for the requested scope.
+
+    POST JSON body: ``{"domain": "<host>", "name": "<label>"}`` — add tracked competitor (cap applies).
+    DELETE is not supported (returns 403); tracked competitors cannot be removed via this API.
     """
     from .aeo.competitor_snapshots import compute_and_save_competitor_snapshot
 
@@ -3765,6 +3840,11 @@ def aeo_competitors_data(request: HttpRequest) -> Response:
             .first()
             or profile
         )
+    if request.method == "POST":
+        return _aeo_competitors_mutate_post(request, profile)
+    if request.method == "DELETE":
+        return _aeo_competitors_mutate_delete(request, profile)
+
     if not profile:
         return Response(
             {
@@ -5204,9 +5284,10 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
             )
         skip_heavy = str(request.GET.get("skip_heavy", "")).strip().lower() in {"1", "true", "yes"}
         old_site_url = profile.website_url
+        patch_data = _strip_website_url_if_locked(profile, request.data)
         serializer = BusinessProfileSerializer(
             profile,
-            data=request.data,
+            data=patch_data,
             partial=(request.method == "PATCH"),
             context={"request": request, "viewer_access": access},
         )

@@ -4,6 +4,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from accounts.aeo.competitor_snapshots import calculate_competitor_visibility
 from accounts.models import (
@@ -181,3 +182,55 @@ def test_competitors_api_hides_suggested_when_more_than_three_tracked(client) ->
     payload = res.json()
     assert len(payload["tracked_competitors"]) == 4
     assert payload["suggested_competitors"] == []
+
+
+@pytest.mark.django_db
+def test_competitors_api_post_adds_tracked_competitor() -> None:
+    user = User.objects.create_user(username="c-post@example.com", email="c-post@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Self",
+        website_url="https://mysite.com",
+    )
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.post("/api/aeo/competitors/", {"domain": "rival.com", "name": "Rival Co"}, format="json")
+    assert res.status_code == 200
+    assert res.json().get("ok") is True
+    profile.refresh_from_db()
+    assert profile.tracked_competitors.filter(domain="rival.com").exists()
+
+
+@pytest.mark.django_db
+def test_competitors_api_post_rejects_own_domain() -> None:
+    user = User.objects.create_user(username="c-own@example.com", email="c-own@example.com", password="x")
+    BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Self",
+        website_url="https://www.mysite.com/about",
+    )
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.post("/api/aeo/competitors/", {"domain": "mysite.com", "name": "Me"}, format="json")
+    assert res.status_code == 400
+
+
+@pytest.mark.django_db
+def test_competitors_api_delete_is_disabled() -> None:
+    user = User.objects.create_user(username="c-del@example.com", email="c-del@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Self",
+        website_url="https://self.com",
+    )
+    tc = TrackedCompetitor.objects.create(name="Beta", domain="beta.com")
+    profile.tracked_competitors.add(tc)
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.delete("/api/aeo/competitors/", {"domain": "beta.com"}, format="json")
+    assert res.status_code == 403
+    profile.refresh_from_db()
+    assert profile.tracked_competitors.count() == 1
